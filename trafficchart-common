@@ -1,0 +1,199 @@
+#!/bin/sh
+# trafficchart-common - shared shaper/device detection (sourced, not executed)
+#
+# Install as /usr/libexec/trafficchart-common. Sourced by
+#   /usr/libexec/rpcd/luci.trafficchart   (page data)
+#   /usr/libexec/trafficchart-tc          (link counters for trafficchart-agg)
+# so both always look at the same devices (before: two copies "keep in sync").
+#
+# Usage:
+#   . /usr/libexec/trafficchart-common
+#   tc_resolve          # who is shaped, and where
+#   tc_read_counters    # post-shaping byte counters (needs tc_resolve first)
+#
+# tc_resolve sets:
+#   BACKEND        nss | generic
+#                    nss     NSS hardware offload: nsstbl/nssfq_codel, download
+#                            shaper on nssifb
+#                    generic stock kernel shaper set up by sqm-scripts: cake or
+#                            htb+fq_codel, download shaper on ifb4<wan>
+#                  Auto: "nss" if the nssifb device exists, else "generic". To force one:
+#                    touch /etc/config/trafficchart
+#                    uci set trafficchart.global=trafficchart
+#                    uci set trafficchart.global.backend=generic     # or: nss / auto
+#                    uci commit trafficchart
+#   IFACE_LIST     all ENABLED sqm queue interfaces as configured (space
+#                  separated, first one first; several = multi-WAN)
+#   FOUND_IFACE    the first of them
+#   FOUND_UPLOAD / FOUND_DOWNLOAD   configured SQM rates in kbit/s, SUMMED over
+#                  all enabled queues
+#   TX_DEVS        devices carrying the upload shaper (NSS: VLAN suffix removed)
+#   RX_DEVS        devices carrying the download shaper (ifb / nssifb)
+#   RX_RAW         interfaces whose ifb does not exist (ingress shaping inactive):
+#                  their raw rx counter is used as the best available signal
+#   RX_DEV / TX_IFACE   first entry of RX_DEVS / TX_DEVS (used for the shaper
+#                  health line of the page, which shows one device per direction)
+#   QTXT SYSNOTE   wording for the counter source strings
+#
+# tc_read_counters sets:
+#   RX_BYTES TX_BYTES   sum over all devices; EMPTY if nothing could be read
+#   RX_SOURCE TX_SOURCE human readable origin of the numbers
+#
+# Testing only: TC_FUNCTIONS (OpenWrt functions.sh), TC_SYSNET (/sys/class/net)
+
+. "${TC_FUNCTIONS:-/lib/functions.sh}"
+SYSNET="${TC_SYSNET:-/sys/class/net}"
+
+tc_detect_backend() {
+    local b
+    b=$(uci -q get trafficchart.global.backend 2>/dev/null)
+    case "$b" in
+        nss|generic) echo "$b"; return ;;
+    esac
+    if [ -e "$SYSNET/nssifb" ]; then echo nss; else echo generic; fi
+}
+
+# ifb device that sqm-scripts created for a WAN device: ifb4<wan> (name
+# limited to 15 chars); else the only ifb4* device if there is exactly one.
+tc_find_ifb() {
+    local wan="$1" cand n found=""
+    [ -n "$wan" ] || return 1
+    for cand in "ifb4${wan}" "$(echo "ifb4${wan}" | cut -c1-15)"; do
+        [ -e "$SYSNET/${cand}" ] && { echo "$cand"; return 0; }
+    done
+    n=0
+    for cand in "$SYSNET"/ifb4*; do
+        [ -e "$cand" ] || continue
+        n=$((n + 1)); found="${cand##*/}"
+    done
+    [ "$n" = "1" ] && echo "$found"
+}
+
+# bytes of the ROOT qdisc: first "Sent <bytes> bytes ..." line of the PLAIN TEXT
+# "tc -s qdisc show" output (tc lists the root first). Deliberately NOT "tc -j":
+# JSON support depends on an optional libjson build flag many OpenWrt tc builds
+# lack, in which case "-j" silently returns nothing.
+tc_qdisc_bytes() {
+    local dev="$1" bytes
+    [ -n "$dev" ] && [ -e "$SYSNET/${dev}" ] || return 1
+    bytes=$(tc -s qdisc show dev "$dev" 2>/dev/null | awk '/^ *Sent /{print $2; exit}')
+    case "$bytes" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    echo "$bytes"
+}
+
+# list helpers: tc_in_list "<list>" item / tc_push LISTVAR item (no duplicates)
+tc_in_list() {
+    case " $1 " in *" $2 "*) return 0 ;; esac
+    return 1
+}
+tc_push() {
+    local var="$1" item="$2" cur
+    [ -n "$item" ] || return 0
+    eval "cur=\$$var"
+    tc_in_list "$cur" "$item" && return 0
+    eval "$var=\"\${cur:+\$cur }\$item\""
+}
+
+tc_num() {
+    case "$1" in ''|*[!0-9]*) echo 0 ;; *) echo "$1" ;; esac
+}
+
+# config_foreach callback: every enabled queue counts (multi-WAN)
+tc_add_queue() {
+    local cfg="$1" enabled iface upload download tx ifb
+    config_get enabled "$cfg" enabled 0
+    [ "$enabled" = "1" ] || return
+    config_get iface "$cfg" interface
+    [ -n "$iface" ] || return
+    config_get upload "$cfg" upload 0
+    config_get download "$cfg" download 0
+
+    tc_push IFACE_LIST "$iface"
+    [ -n "$FOUND_IFACE" ] || FOUND_IFACE="$iface"
+    FOUND_UPLOAD=$((FOUND_UPLOAD + $(tc_num "$upload")))
+    FOUND_DOWNLOAD=$((FOUND_DOWNLOAD + $(tc_num "$download")))
+
+    if [ "$BACKEND" = "nss" ]; then
+        # nss-rk.qos strips any VLAN suffix ("eth0.7" -> "eth0") before
+        # attaching the egress shaper, so read the qdisc from that same device
+        # - not from whatever name is configured in SQM. No-op for eth0, pppoe-wan ...
+        tx=$(echo "$iface" | sed 's/\.[0-9]*//g')
+        ifb=nssifb
+    else
+        tx="$iface"
+        ifb=$(tc_find_ifb "$iface")
+    fi
+    tc_push TX_DEVS "$tx"
+    if [ -n "$ifb" ] && [ -e "$SYSNET/$ifb" ]; then
+        tc_push RX_DEVS "$ifb"
+    else
+        tc_push RX_RAW "$iface"
+    fi
+}
+
+tc_resolve() {
+    BACKEND=$(tc_detect_backend)
+    IFACE_LIST=""; FOUND_IFACE=""; FOUND_UPLOAD=0; FOUND_DOWNLOAD=0
+    TX_DEVS=""; RX_DEVS=""; RX_RAW=""
+    config_load sqm
+    config_foreach tc_add_queue queue
+    RX_DEV="${RX_DEVS%% *}"
+    TX_IFACE="${TX_DEVS%% *}"
+    if [ "$BACKEND" = "nss" ]; then
+        QTXT="tc qdisc, hw stats"
+        # NSS hardware offload runs offloaded flows in the NSS firmware/hardware
+        # fastpath, bypassing the kernel netdev xmit path, so the generic sysfs
+        # counters stay near zero even under full load. The nsstbl/nssfq_codel
+        # qdisc counters DO get updated from the hardware, hence tc.
+        SYSNOTE=", unreliable under NSS offload"
+    else
+        QTXT="tc qdisc"
+        SYSNOTE=""
+    fi
+}
+
+# sums over all devices of each direction -> RX_BYTES/RX_SOURCE, TX_BYTES/TX_SOURCE
+tc_read_counters() {
+    local d b sum=0 n=0 src=""
+    # download/ingress: the shaper lives on the ifb. Packets only reach it AFTER
+    # being redirected from the WAN device, so its counters are the correct,
+    # already-shaped download rate.
+    for d in $RX_DEVS; do
+        b=$(tc_qdisc_bytes "$d")
+        if [ -n "$b" ]; then
+            src="${src:+$src, }${d} (${QTXT})"
+        else
+            b=$(cat "$SYSNET/${d}/statistics/tx_bytes" 2>/dev/null)
+            case "$b" in ''|*[!0-9]*) continue ;; esac
+            src="${src:+$src, }${d} (sysfs${SYSNOTE})"
+        fi
+        sum=$((sum + b)); n=$((n + 1))
+    done
+    # ingress shaping inactive: this IS the raw/unshaped rate, but it's the best
+    # available signal in that case
+    for d in $RX_RAW; do
+        b=$(cat "$SYSNET/${d}/statistics/rx_bytes" 2>/dev/null)
+        case "$b" in ''|*[!0-9]*) continue ;; esac
+        src="${src:+$src, }${d} (raw, ingress shaping inactive)"
+        sum=$((sum + b)); n=$((n + 1))
+    done
+    if [ "$n" -gt 0 ]; then RX_BYTES="$sum"; else RX_BYTES=""; fi
+    RX_SOURCE="$src"
+
+    sum=0; n=0; src=""
+    for d in $TX_DEVS; do
+        b=$(tc_qdisc_bytes "$d")
+        if [ -n "$b" ]; then
+            src="${src:+$src, }${d} (${QTXT})"
+        else
+            b=$(cat "$SYSNET/${d}/statistics/tx_bytes" 2>/dev/null)
+            case "$b" in ''|*[!0-9]*) continue ;; esac
+            src="${src:+$src, }${d} (sysfs${SYSNOTE})"
+        fi
+        sum=$((sum + b)); n=$((n + 1))
+    done
+    if [ "$n" -gt 0 ]; then TX_BYTES="$sum"; else TX_BYTES=""; fi
+    TX_SOURCE="$src"
+}

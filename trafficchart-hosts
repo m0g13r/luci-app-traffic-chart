@@ -1,0 +1,71 @@
+#!/bin/sh
+# trafficchart-hosts - LAN device identity for trafficchart-agg
+#
+# Prints tab separated lines:
+#   I <ip> <mac>     every neighbour (ARP / IPv6 ND) with a link-layer address;
+#                    IPv6 fully expanded like /proc/net/nf_conntrack prints it
+#   N <mac> <name>   best known host name for a MAC (DHCP leases first, static
+#                    "config host" entries from /etc/config/dhcp override)
+#
+#   R <ip>           every address owned by the router itself (all interfaces),
+#                    IPv6 fully expanded. Lets the aggregator tell router-
+#                    originated traffic (e.g. a stream proxy on the router)
+#                    and LAN->router traffic apart from ordinary forwarded flows.
+#
+# Devices are identified by MAC, not IP, so a host's IPv4 address and all its
+# (privacy) IPv6 addresses end up in ONE device.
+
+ip neigh show 2>/dev/null | awk '
+    function v6full(a,   n, h, lc, rc, lg, rg, i, g, out, miss) {
+        if (index(a, ":") == 0) return a
+        n = split(a, h, "::")
+        if (n == 1) { lc = split(h[1], lg, ":"); rc = 0; miss = 0 }
+        else {
+            lc = (h[1] == "") ? 0 : split(h[1], lg, ":")
+            rc = (h[2] == "") ? 0 : split(h[2], rg, ":")
+            miss = 8 - lc - rc
+        }
+        if (miss < 0) return a
+        out = ""
+        for (i = 1; i <= lc; i++) { g = tolower(lg[i]); while (length(g) < 4) g = "0" g; out = out (out == "" ? "" : ":") g }
+        for (i = 1; i <= miss; i++) out = out (out == "" ? "" : ":") "0000"
+        for (i = 1; i <= rc; i++)  { g = tolower(rg[i]); while (length(g) < 4) g = "0" g; out = out (out == "" ? "" : ":") g }
+        return out
+    }
+    {
+        mac = ""
+        for (i = 2; i < NF; i++) if ($i == "lladdr") mac = tolower($(i + 1))
+        if (mac != "") print "I\t" v6full($1) "\t" mac
+    }'
+
+# addresses of the router itself
+ip -o addr show 2>/dev/null | awk '
+    function v6full(a,   n, h, lc, rc, lg, rg, i, g, out, miss) {
+        if (index(a, ":") == 0) return a
+        n = split(a, h, "::")
+        if (n == 1) { lc = split(h[1], lg, ":"); rc = 0; miss = 0 }
+        else {
+            lc = (h[1] == "") ? 0 : split(h[1], lg, ":")
+            rc = (h[2] == "") ? 0 : split(h[2], rg, ":")
+            miss = 8 - lc - rc
+        }
+        if (miss < 0) return a
+        out = ""
+        for (i = 1; i <= lc; i++) { g = tolower(lg[i]); while (length(g) < 4) g = "0" g; out = out (out == "" ? "" : ":") g }
+        for (i = 1; i <= miss; i++) out = out (out == "" ? "" : ":") "0000"
+        for (i = 1; i <= rc; i++)  { g = tolower(rg[i]); while (length(g) < 4) g = "0" g; out = out (out == "" ? "" : ":") g }
+        return out
+    }
+    { for (i = 1; i < NF; i++) if ($i == "inet" || $i == "inet6") { a = $(i + 1); sub(/\/.*/, "", a); print "R\t" v6full(a) } }'
+
+# dnsmasq leases: <expiry> <mac> <ip> <hostname> <clientid>
+[ -r /tmp/dhcp.leases ] && awk '$4 != "" && $4 != "*" { print "N\t" tolower($2) "\t" $4 }' /tmp/dhcp.leases
+
+# static hosts (config host: option name + option mac / list mac)
+command -v uci >/dev/null 2>&1 && uci -q show dhcp 2>/dev/null | awk -F"[.=]" '
+    $1 == "dhcp" && $2 ~ /^@?host/ { sec = $2 }
+    { line = $0; sub(/^[^=]*=/, "", line); gsub(/\047/, "", line) }
+    $3 == "name" { name[$2] = line }
+    $3 == "mac"  { split(line, m, " "); mac[$2] = tolower(m[1]) }
+    END { for (s in mac) if (name[s] != "" && mac[s] != "") print "N\t" mac[s] "\t" name[s] }'
+exit 0

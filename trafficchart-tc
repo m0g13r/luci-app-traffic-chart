@@ -1,0 +1,23 @@
+#!/bin/sh
+# trafficchart-tc - post-shaping byte counters for trafficchart-agg
+#
+# Prints ONE line: "<rx_bytes> <tx_bytes>"  (download / upload, bytes since the
+# shaper qdiscs were created, summed over all enabled SQM queues), or "-" in
+# place of a value that cannot be determined.
+#
+# trafficchart-agg calls this in the same loop iteration in which it reads
+# /proc/net/nf_conntrack and timestamps both with its own clock, so the link
+# rate (tc) and the per-application / device / destination rates (conntrack)
+# refer to the same moment.
+#
+# Which devices are read (nss: download = nssifb, upload = WAN device without
+# VLAN suffix; generic: download = ifb4<wan>, upload = the SQM interface) is
+# decided in trafficchart-common, shared with luci.trafficchart.
+
+# TC_COMMON: testing only
+. "${TC_COMMON:-/usr/libexec/trafficchart-common}" || { echo "- -"; exit 0; }
+
+tc_resolve
+tc_read_counters
+echo "${RX_BYTES:--} ${TX_BYTES:--}"
+exit 0

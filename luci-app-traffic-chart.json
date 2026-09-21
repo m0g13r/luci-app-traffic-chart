@@ -1,0 +1,10 @@
+{
+    "luci-app-traffic-chart": {
+        "description": "Grant access to Traffic Chart rpcd",
+        "read": {
+            "ubus": {
+                "luci.trafficchart": [ "get_stats" ]
+            }
+        }
+    }
+}
