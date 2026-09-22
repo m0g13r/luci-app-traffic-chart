@@ -1,7 +1,7 @@
 ###############################################################################
 # nss-rk.qos - SQM shaper for NSS hardware offload (nsstbl + nssfq_codel)
 # with port based traffic classes (nftables packet marks + DSCP).
-# version 20260919
+# version 20260921
 #
 # Based on simple.qos / nss.qos by ricsc, modified by rickk
 #   https://github.com/rickkdotnet/sqm-scripts-nss
@@ -193,7 +193,11 @@ nft_setup() {
     # --- BULK: any TCP/UDP flow above this size is demoted to BULK ---
     # 300 MB, deliberately high: with a low value every longer video stream
     # flipped to BULK and the WEB/BULK split depended on connection age.
-    local BULK_BYTES=314572800
+    # Configurable: option bulk_bytes in /etc/config/trafficchart (the traffic
+    # chart daemon reads the same option, so both always agree).
+    local BULK_BYTES
+    BULK_BYTES=$(uci -q get trafficchart.global.bulk_bytes 2>/dev/null)
+    case "${BULK_BYTES}" in ''|*[!0-9]*) BULK_BYTES=314572800 ;; esac
 
     # Ports that are never demoted to BULK, because they are either
     #  - latency critical and may legitimately run for hours (PRIO, VOIP,

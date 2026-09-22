@@ -13,9 +13,12 @@
 # cache hit / SNI / QUIC initial), so the label arrives in time anyway.
 #
 # Needs: socat (opkg install socat), netifyd with a [socket] listen_path.
-# Environment: SOCK OUT_DIR AWK
+# Environment: SOCK OUT_DIR AWK SOCAT TC_COMMON
 
-SOCK="${SOCK:-/var/run/netifyd/netifyd.sock}"
+# Settings: /etc/config/trafficchart option "sock" (or the environment variable SOCK),
+# see trafficchart.config. Needs trafficchart-common (tc_cfg).
+. "${TC_COMMON:-/usr/libexec/trafficchart-common}" || exit 1
+tc_cfg SOCK /var/run/netifyd/netifyd.sock
 OUT_DIR="${OUT_DIR:-/tmp/trafficchart}"
 AWK="${AWK:-awk}"
 SOCAT="${SOCAT:-socat}"

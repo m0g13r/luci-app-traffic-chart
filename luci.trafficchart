@@ -17,7 +17,7 @@
 # a flow crossing BULK_BYTES moved its whole history from WEB to BULK in one
 # poll. Per-flow deltas fix both. See the header of trafficchart-agg.
 AGG_FILE="/tmp/trafficchart/classes.json"
-AGG_MAX_AGE=10   # seconds; older = daemon dead/hung
+# AGG_MAX_AGE (seconds; older = daemon dead/hung) is read from the config in "call"
 HIST_FILE="/tmp/trafficchart/history.json"
 
 
@@ -51,7 +51,9 @@ case "$1" in
         # collapses near-simultaneous multi-tab requests into one real run.
         CACHE_FILE="/tmp/luci_trafficchart_cache.json"
         CACHE_LOCK="/tmp/luci_trafficchart_cache.lock"
-        CACHE_TTL_SEC=1
+        # settings from /etc/config/trafficchart (options agg_max_age, cache_ttl_sec)
+        tc_cfg AGG_MAX_AGE 10 int
+        tc_cfg CACHE_TTL_SEC 1 int
 
         cache_is_fresh() {
             [ -f "$CACHE_FILE" ] || return 1

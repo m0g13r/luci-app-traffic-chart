@@ -39,10 +39,61 @@
 #   RX_BYTES TX_BYTES   sum over all devices; EMPTY if nothing could be read
 #   RX_SOURCE TX_SOURCE human readable origin of the numbers
 #
+# Settings (/etc/config/trafficchart, section "global"):
+#   tc_cfg VAR DEFAULT [TYPE]
+#     sets the shell variable VAR from, in this order of priority
+#       1. the environment (VAR already set - mainly for testing)
+#       2. the UCI option named like the variable in lower case
+#          (INTERVAL -> option interval, ATTR_PORTS -> option attr_ports)
+#       3. DEFAULT
+#     TYPE checks the UCI value; an invalid one is logged (logread -e trafficchart)
+#     and DEFAULT is used instead:
+#       int     digits only                     num    digits with an optional decimal point
+#       list    space separated integers (may be empty)
+#       l2      "auto" or an integer of up to 2 digits
+#       (none)  any text
+#
 # Testing only: TC_FUNCTIONS (OpenWrt functions.sh), TC_SYSNET (/sys/class/net)
 
-. "${TC_FUNCTIONS:-/lib/functions.sh}"
 SYSNET="${TC_SYSNET:-/sys/class/net}"
+
+# Reads the whole section with ONE uci call into CFG_<option> variables. List
+# options ("a" "b") are skipped, values are shell-quoted by uci itself.
+tc_load_config() {
+    [ -n "$TC_CFG_LOADED" ] && return 0
+    TC_CFG_LOADED=1
+    command -v uci >/dev/null 2>&1 || return 0
+    eval "$(uci -q show trafficchart.global 2>/dev/null | sed -n "/' '/d; s/^trafficchart\.global\.\([a-z0-9_]*\)='\(.*\)'\$/CFG_\1='\2'/p")"
+}
+
+tc_cfg_valid() {
+    local t
+    case "$2" in
+        int)  case "$3" in ''|*[!0-9]*) return 1 ;; esac ;;
+        num)  case "$3" in ''|*[!0-9.]*|.*|*.|*.*.*) return 1 ;; esac ;;
+        list) for t in $3; do case "$t" in ''|*[!0-9]*) return 1 ;; esac; done ;;
+        l2)   case "$3" in auto|[0-9]|[0-9][0-9]) ;; *) return 1 ;; esac ;;
+    esac
+    return 0
+}
+
+tc_cfg() {
+    local var="$1" def="$2" type="$3" key isset val
+    eval "isset=\${$var+x}"
+    [ -n "$isset" ] && return 0
+    tc_load_config
+    key=$(echo "$var" | tr 'A-Z' 'a-z')
+    eval "isset=\${CFG_$key+x}"
+    if [ -n "$isset" ]; then
+        eval "val=\$CFG_$key"
+        if tc_cfg_valid "$key" "$type" "$val"; then
+            eval "$var=\$val"
+            return 0
+        fi
+        logger -t trafficchart "config: invalid value '$val' for option $key - using default '$def'" 2>/dev/null
+    fi
+    eval "$var=\$def"
+}
 
 tc_detect_backend() {
     local b
@@ -134,6 +185,7 @@ tc_add_queue() {
 }
 
 tc_resolve() {
+    . "${TC_FUNCTIONS:-/lib/functions.sh}"
     BACKEND=$(tc_detect_backend)
     IFACE_LIST=""; FOUND_IFACE=""; FOUND_UPLOAD=0; FOUND_DOWNLOAD=0
     TX_DEVS=""; RX_DEVS=""; RX_RAW=""

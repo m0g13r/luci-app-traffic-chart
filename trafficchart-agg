@@ -117,43 +117,89 @@
 # apps.map: trafficchart-apps bumps apps.map.ver after every write; the map is only
 # re-read when that changed.
 #
-# Environment overrides (mainly for testing): CT_FILE OUT_DIR INTERVAL
-# BULK_BYTES V6HELPER AWK APP_HOLD HOSTS_HELPER HIST_SEC HIST_KEEP ATTR_WIN BIRTH_MAX GONE_GRACE
-# ATTR_PORTS ATTR_SKIP_PORTS ATTR_MIN ATTR_SHARE ATTR_TOL
-# L2_OVERHEAD L2_INIT L2_CANDIDATES CAL_WIN CAL_KEEP CAL_MIN CAL_PCTL CAL_TOL CAL_MAX_PKT
-# CAL_MIN_PKTS UN_WIN UN_WIN_RX APP_MAX MX_MAX PAIR_MAX TBL_IDLE_LONG TBL_IDLE_SHORT
-# TC_HELPER RATE_WIN
+# CPU load adaptation: this daemon runs on everything from a small home
+# router to a busy multi-client CPE/hotspot, so it does not assume a flow
+# count and instead measures its own processing time each poll:
+#   - ADAPT_INTERVAL (default on) stretches the sleep between polls
+#     (CUR_INTERVAL, floor INTERVAL, ceiling INTERVAL_MAX) once processing
+#     starts eating more than ADAPT_BUDGET of the cycle, and eases it back
+#     down again once load drops - see adapt_interval().
+#   - TOOLTIP_EVERY (0 = auto) throttles how often the tooltip top-K lists
+#     (mx_top, per-device top applications) are rebuilt, scaled to how big
+#     those tables currently are - see tooltip_due(). A handful of entries
+#     is rebuilt every poll; thousands are rebuilt less often, since the
+#     rebuild itself is an O(table size) scan and a couple of seconds of
+#     staleness on a hover tooltip is not noticeable.
+#   - HOSTS_REFRESH_SEC / GUA_REFRESH_SEC replace what used to be a fixed
+#     "every N polls" for refresh_hosts()/refresh_gua(): now real elapsed
+#     seconds, so they stay correct even while CUR_INTERVAL is adapting.
+#
+# Settings: /etc/config/trafficchart, section "global" - every tunable below is the
+# UCI option with the name of the variable in lower case (INTERVAL -> option
+# interval). An environment variable of the same name wins (testing). Invalid values
+# are logged and replaced by the default; see trafficchart.config for the list.
+# Environment only (paths / helpers, mainly for testing): CT_FILE OUT_DIR AWK
+# V6HELPER HOSTS_HELPER TC_HELPER TC_COMMON
+
+# tc_cfg() lives in the shared library (also used by the rpcd script and trafficchart-apps)
+. "${TC_COMMON:-/usr/libexec/trafficchart-common}" || exit 1
 
 CT_FILE="${CT_FILE:-/proc/net/nf_conntrack}"
 OUT_DIR="${OUT_DIR:-/tmp/trafficchart}"
-INTERVAL="${INTERVAL:-2}"
-BULK_BYTES="${BULK_BYTES:-314572800}"
 V6HELPER="${V6HELPER:-/usr/libexec/trafficchart-v6prefixes}"
 AWK="${AWK:-awk}"
-APP_HOLD="${APP_HOLD:-3}"
 HOSTS_HELPER="${HOSTS_HELPER:-/usr/libexec/trafficchart-hosts}"
-HIST_SEC="${HIST_SEC:-300}"
-HIST_KEEP="${HIST_KEEP:-288}"
-BIRTH_MAX="${BIRTH_MAX:-1073741824}"   # bytes: a flow first seen (or restarted) with more than this in ONE poll cannot be new - it is adopted as baseline instead of booked
-GONE_GRACE="${GONE_GRACE:-5}"          # polls a flow may be missing (short procfs read, mark flip) before its state is dropped
-ATTR_WIN="${ATTR_WIN:-60}"   # seconds: window in which router WAN volume and client delivery are matched
+TC_HELPER="${TC_HELPER:-/usr/libexec/trafficchart-tc}"   # prints "<rx_bytes> <tx_bytes>" of the shapers
+[ -x "$TC_HELPER" ] || TC_HELPER=""   # not installed: no link rate, no "not attributed" row
+
+tc_cfg INTERVAL 2 int                # seconds between two conntrack passes (base/minimum - see ADAPT_INTERVAL)
+[ "$INTERVAL" -ge 1 ] || INTERVAL=1
+# --- CPU load adaptation ---
+# The daemon does not know in advance whether it runs on a small home router
+# with a handful of flows or a busy CPE/hotspot with thousands of them, so
+# instead of a fixed poll rate it measures its OWN processing time each
+# cycle and stretches the interval automatically when that time grows into a
+# meaningful share of the cycle. INTERVAL above is the floor it starts from
+# and returns to when load drops again; it is never lowered below that floor.
+tc_cfg ADAPT_INTERVAL 1 int          # 1 = auto-stretch the interval under load, 0 = always use INTERVAL as configured
+tc_cfg INTERVAL_MAX 10 int           # ceiling for the auto-stretched interval (seconds)
+tc_cfg ADAPT_BUDGET 0.30 num         # raise the interval once processing exceeds this share of the cycle time; lower it again well below that
+# Tooltip data (top-10 destinations per application/device, top-10 apps per
+# device) is rebuilt from scratch every poll by default, which is fine for a
+# handful of entries but scans the whole application/device/pair tables -
+# the very thing that grows unbounded with more clients. 0 = derive the
+# rebuild interval automatically from how large those tables currently are;
+# a positive number pins it to a fixed number of polls instead (mainly for
+# testing/tuning).
+tc_cfg TOOLTIP_EVERY 0 int
+# Neighbour table / DHCP lease scans and the LAN IPv6 prefix lookup used to
+# be tied to a fixed poll COUNT (every 10 / 30 polls), which silently meant
+# a different real-world interval once INTERVAL started adapting. They are
+# now tied to real elapsed seconds instead.
+tc_cfg HOSTS_REFRESH_SEC 60 int      # how often "ip neigh"/dhcp leases/static hosts are re-read
+tc_cfg GUA_REFRESH_SEC 120 int       # how often the LAN IPv6 GUA prefix is re-detected
+tc_cfg BULK_BYTES 314572800 int      # a WEB/P2P/BE flow above this size is BULK (same option is read by nss-rk.qos)
+tc_cfg APP_HOLD 3 int                # polls a new flow waits for its netifyd label
+tc_cfg HIST_SEC 300 int              # seconds per history bucket
+tc_cfg HIST_KEEP 288 int             # history buckets kept (288 x 300 s = 24 h)
+tc_cfg BIRTH_MAX 1073741824 int      # bytes: a flow first seen (or restarted) with more than this in ONE poll cannot be new - it is adopted as baseline instead of booked
+tc_cfg GONE_GRACE 5 int              # polls a flow may be missing (short procfs read, mark flip) before its state is dropped
+tc_cfg ATTR_WIN 60 int               # seconds: window in which router WAN volume and client delivery are matched
 # Attribution of router WAN traffic to LAN devices (see "Router-originated traffic" above):
 # LAN->router flows to these destination ports are infrastructure (SSH, DNS, DHCP,
 # NTP, DoT, mDNS/LLMNR, LuCI on 80/443) and never count as "device is being served
 # by a router service". Remove 80/443 if the stream proxy itself listens there.
-ATTR_SKIP_PORTS="${ATTR_SKIP_PORTS:-22 53 67 68 80 123 443 853 5353 5355}"
+tc_cfg ATTR_SKIP_PORTS "22 53 67 68 80 123 443 853 5353 5355" list
 # Stricter: if set, ONLY LAN->router flows to these ports count (ATTR_SKIP_PORTS is then ignored).
 # Port of the stream proxy on the router; empty = every port except ATTR_SKIP_PORTS.
-ATTR_PORTS="${ATTR_PORTS:-9999}"
-ATTR_TOTALS="${ATTR_TOTALS:-1}"   # 1 (default) = credit router WAN traffic of proxy streams to the devices that are served (device totals, shown as one "Proxy-Stream (via Router)" row); 0 = off
-ATTR_TOPAPPS="${ATTR_TOPAPPS:-0}"   # 1 = the proxy row of a device carries the real application name of the router flow (default 0: generic "Proxy-Stream (via Router)")
-RATE_WIN="${RATE_WIN:-10}"        # seconds: averaging window of all rates
-UN_WIN="${UN_WIN:-30}"            # seconds: window of the "not attributed" estimate (slower on purpose: the two counters do not tick in the same instant)
-TC_HELPER="${TC_HELPER:-/usr/libexec/trafficchart-tc}"   # prints "<rx_bytes> <tx_bytes>" of the shapers; without it the page falls back to browser side rates
-[ -x "$TC_HELPER" ] || TC_HELPER=""   # not installed: no link rate, the page falls back to browser side rates
-ATTR_TOL="${ATTR_TOL:-0.6}"       # max. relative volume difference between router application and device for a pairing (0..1)
-ATTR_MIN="${ATTR_MIN:-262144}"     # bytes: a router application below this volume in the window is never attributed
-ATTR_SHARE="${ATTR_SHARE:-0.25}"   # ...nor one below this share of the router's total WAN volume (background traffic stays on "Router")
+tc_cfg ATTR_PORTS 9999 list
+tc_cfg ATTR_TOTALS 1 int             # 1 (default) = credit router WAN traffic of proxy streams to the devices that are served (device totals, shown as one "Proxy-Stream (via Router)" row); 0 = off
+tc_cfg ATTR_TOPAPPS 0 int            # 1 = the proxy row of a device carries the real application name of the router flow (default 0: generic "Proxy-Stream (via Router)")
+tc_cfg RATE_WIN 10 int               # seconds: averaging window of all rates
+tc_cfg UN_WIN 30 int                 # seconds: window of the "not attributed" estimate (slower on purpose: the two counters do not tick in the same instant)
+tc_cfg ATTR_TOL 0.6 num              # max. relative volume difference between router application and device for a pairing (0..1)
+tc_cfg ATTR_MIN 262144 int           # bytes: a router application below this volume in the window is never attributed
+tc_cfg ATTR_SHARE 0.25 num           # ...nor one below this share of the router's total WAN volume (background traffic stays on "Router")
 # Bytes per packet that the shaper (tc) counts but conntrack does not: the link layer
 # header (Ethernet 14, +4 VLAN, +8 PPPoE). Without this the "not attributed" estimate
 # is dominated by it wherever packets are small (the upload of a download is almost
@@ -172,23 +218,22 @@ ATTR_SHARE="${ATTR_SHARE:-0.25}"   # ...nor one below this share of the router's
 #                   until CAL_MIN windows are available.
 #   <number>        fixed bytes per packet (0 = old behaviour: everything shows up as
 #                   "not attributed")
-L2_OVERHEAD="${L2_OVERHEAD:-auto}"
-case "$L2_OVERHEAD" in auto|[0-9]|[0-9][0-9]) ;; *) L2_OVERHEAD=auto ;; esac
-L2_INIT="${L2_INIT:-18}"
-L2_CANDIDATES="${L2_CANDIDATES:-0 14 18 22 26}"   # 0 = no link header (tun/ppp device), 14 Ethernet, 18 +VLAN, 22 +PPPoE, 26 +PPPoE+VLAN
-CAL_TOL="${CAL_TOL:-1}"             # bytes: tolerance when flooring the measurement to a candidate
-CAL_WIN="${CAL_WIN:-30}"            # seconds per calibration window
-CAL_KEEP="${CAL_KEEP:-60}"          # windows kept (60 x 30 s = 30 min)
-CAL_MIN="${CAL_MIN:-8}"             # windows needed before the measurement replaces L2_INIT
-CAL_PCTL="${CAL_PCTL:-25}"          # percentile of the windows that is taken as the header size
-CAL_MAX_PKT="${CAL_MAX_PKT:-400}"   # bytes: only windows with a smaller mean packet size count
-CAL_MIN_PKTS="${CAL_MIN_PKTS:-500}" # ...and at least this many packets
-UN_WIN_RX="${UN_WIN_RX:-60}"        # seconds: window of the download "not attributed" estimate (the ECM/NSS counter sync of big downloads jitters more than the small upload packets)
-APP_MAX="${APP_MAX:-400}"           # applications kept (further ones are summed as "(other)")
-MX_MAX="${MX_MAX:-8000}"            # entries per tooltip matrix (application x destination, destination x device)
-PAIR_MAX="${PAIR_MAX:-4096}"        # entries of the device x application matrix
-TBL_IDLE_LONG="${TBL_IDLE_LONG:-3600}"    # seconds: when such a table is full, entries idle this long are dropped first ...
-TBL_IDLE_SHORT="${TBL_IDLE_SHORT:-600}"   # ... and if that is not enough, entries idle this long
+tc_cfg L2_OVERHEAD auto l2
+tc_cfg L2_INIT 18 int
+tc_cfg L2_CANDIDATES "0 14 18 22 26" list   # 0 = no link header (tun/ppp device), 14 Ethernet, 18 +VLAN, 22 +PPPoE, 26 +PPPoE+VLAN
+tc_cfg CAL_TOL 1 num                 # bytes: tolerance when flooring the measurement to a candidate
+tc_cfg CAL_WIN 30 int                # seconds per calibration window
+tc_cfg CAL_KEEP 60 int               # windows kept (60 x 30 s = 30 min)
+tc_cfg CAL_MIN 8 int                 # windows needed before the measurement replaces L2_INIT
+tc_cfg CAL_PCTL 25 int               # percentile of the windows that is taken as the header size
+tc_cfg CAL_MAX_PKT 400 int           # bytes: only windows with a smaller mean packet size count
+tc_cfg CAL_MIN_PKTS 500 int          # ...and at least this many packets
+tc_cfg UN_WIN_RX 60 int              # seconds: window of the download "not attributed" estimate (the ECM/NSS counter sync of big downloads jitters more than the small upload packets)
+tc_cfg APP_MAX 400 int               # applications kept (further ones are summed as "(other)")
+tc_cfg MX_MAX 8000 int               # entries per tooltip matrix (application x destination, destination x device)
+tc_cfg PAIR_MAX 4096 int             # entries of the device x application matrix
+tc_cfg TBL_IDLE_LONG 3600 int        # seconds: when such a table is full, entries idle this long are dropped first ...
+tc_cfg TBL_IDLE_SHORT 600 int        # ... and if that is not enough, entries idle this long
 
 mkdir -p "$OUT_DIR" || exit 1
 
@@ -199,6 +244,8 @@ ACCT=/proc/sys/net/netfilter/nf_conntrack_acct
 [ -w "$ACCT" ] && [ "$(cat "$ACCT" 2>/dev/null)" != "1" ] && echo 1 > "$ACCT"
 
 exec $AWK -v CT_FILE="$CT_FILE" -v OUT="$OUT_DIR" -v INTERVAL="$INTERVAL" \
+    -v ADAPT_INTERVAL="$ADAPT_INTERVAL" -v INTERVAL_MAX="$INTERVAL_MAX" -v ADAPT_BUDGET="$ADAPT_BUDGET" \
+    -v TOOLTIP_EVERY="$TOOLTIP_EVERY" -v HOSTS_REFRESH_SEC="$HOSTS_REFRESH_SEC" -v GUA_REFRESH_SEC="$GUA_REFRESH_SEC" \
     -v BULK_BYTES="$BULK_BYTES" -v V6HELPER="$V6HELPER" -v APP_HOLD="$APP_HOLD" \
     -v MAPFILE="$OUT_DIR/apps.map" -v HOSTS_HELPER="$HOSTS_HELPER" \
     -v HIST_SEC="$HIST_SEC" -v HIST_KEEP="$HIST_KEEP" -v ATTR_WIN="$ATTR_WIN" -v BIRTH_MAX="$BIRTH_MAX" -v GONE_GRACE="$GONE_GRACE" \
@@ -832,6 +879,51 @@ function wrate(cn, co, tn_, to_,   dt, r) {
     return (r > 0) ? r : 0      # a total can shrink (router bytes credited to a device): no negative rate
 }
 
+# Self-tuning poll interval: raises CUR_INTERVAL when the processing time of
+# this cycle (parse_pass + emit + everything else, measured with
+# uptime() around the work) starts eating a meaningful share of the cycle,
+# and eases it back down towards the configured floor (INTERVAL) once load
+# drops - without ever needing to know in advance whether this box handles
+# five flows or five thousand. Smoothed (EMA) so a single slow poll (procd
+# hiccup, one big conntrack read) does not cause interval flapping.
+function adapt_interval(elapsed,   frac, hi, lo) {
+    if (!adapt_init) { adapt_init = 1; ai_ema = elapsed; return }
+    ai_ema = ai_ema * 0.7 + elapsed * 0.3
+    frac = (CUR_INTERVAL > 0) ? ai_ema / CUR_INTERVAL : 0
+    hi = ADAPT_BUDGET
+    lo = ADAPT_BUDGET * 0.33
+    if (frac > hi && CUR_INTERVAL < INTERVAL_MAX) {
+        CUR_INTERVAL++
+        if (CUR_INTERVAL > INTERVAL_MAX) CUR_INTERVAL = INTERVAL_MAX
+        glog_msg(sprintf("processing takes %.0fms of a %ds cycle - raising interval to %ds", ai_ema * 1000, CUR_INTERVAL - 1, CUR_INTERVAL))
+    } else if (frac < lo && CUR_INTERVAL > INTERVAL) {
+        CUR_INTERVAL--
+        if (CUR_INTERVAL < INTERVAL) CUR_INTERVAL = INTERVAL
+    }
+}
+
+# How often the tooltip top-K lists (mx_top over the application/destination
+# and destination/device matrices, plus the per-device top-10 applications)
+# get rebuilt. Rebuilding is an O(table size) scan every time, so instead of
+# a fixed poll count this scales with how big those tables currently are -
+# a handful of entries gets rebuilt every poll (cheap, and stays snappy),
+# thousands of entries (busy CPE, many clients) get rebuilt less often
+# because a couple of seconds of staleness on a hover tooltip is not
+# noticeable but the repeated full scan is not free either.
+function tooltip_due(   every, sz) {
+    if (TOOLTIP_EVERY > 0) every = TOOLTIP_EVERY
+    else {
+        sz = mxcnt; if (npair > sz) sz = npair
+        every = 1
+        if (sz > 500)  every = 2
+        if (sz > 1500) every = 3
+        if (sz > 4000) every = 5
+        if (sz > 8000) every = 8
+    }
+    if (n - tooltip_last >= every) { tooltip_last = n; return 1 }
+    return 0
+}
+
 function rate_one(t, k, cin, cout, slot, full, now, ot,   key, oi, oo) {
     key = t SUBSEP k
     if (full) { oi = rh_in[key, slot] + 0; oo = rh_out[key, slot] + 0 } else { oi = 0; oo = 0 }
@@ -1062,57 +1154,72 @@ function jcnt(ib, ip_, ob, op_) {
     return sprintf("\"in_bytes\":%.0f,\"in_packets\":%.0f,\"out_bytes\":%.0f,\"out_packets\":%.0f", ib + 0, ip_ + 0, ob + 0, op_ + 0)
 }
 
-function emit(t,   s, tmp, a, first, k, nm, i, j, sc, nt, tsc, tky, pd, tot, n2, kp, dp, rem, ap, hh) {
-    s = "{\"since\":" since ",\"up\":" sprintf("%.2f", t) ",\"flows\":" nflows "," rate_json() ",\"apps\":{"
+function emit(t,   tmp, a, first, k, nm, i, j, sc, nt, tsc, tky, pd, tot, n2, kp, dp, rem, ap, hh, rebuild) {
+    # Writing straight to the tmp file instead of building one big string:
+    # "s = s sprintf(...)" in a loop is O(n^2) in busybox awk (every append
+    # copies the whole string so far) - harmless for a handful of apps or
+    # devices, not harmless once there are hundreds to thousands of them.
+    tmp = OUT "/classes.json.tmp"
+    printf "" > tmp
+    printf "{\"since\":%s,\"up\":%.2f,\"flows\":%d,%s,\"apps\":{", since, t, nflows, rate_json() > tmp
+
     # tooltip data: top 10 destinations per application, top 10 devices per
-    # destination - only for the 30 biggest of each (that is all the page shows)
-    split("", ktsc); split("", ktky); ktn = 0; split("", keepa)
-    for (a in aseen) kt_ins(a, aib[a] + aob[a], 30)
-    for (i = 1; i <= ktn; i++) keepa[ktky[i]] = 1
-    split("", ktsc); split("", ktky); ktn = 0; split("", keeph)
-    for (k in hseen) kt_ins(k, hib[k] + hob[k], 30)
-    for (i = 1; i <= ktn; i++) keeph[ktky[i]] = 1
-    mx_top(10)
+    # destination, top 10 applications per device - only for the 30 biggest
+    # of each (that is all the page shows). This is an O(table size) scan,
+    # so it is not necessarily redone every single poll - see tooltip_due().
+    rebuild = tooltip_due()
+    if (rebuild) {
+        split("", ktsc); split("", ktky); ktn = 0; split("", keepa)
+        for (a in aseen) kt_ins(a, aib[a] + aob[a], 30)
+        for (i = 1; i <= ktn; i++) keepa[ktky[i]] = 1
+        split("", ktsc); split("", ktky); ktn = 0; split("", keeph)
+        for (k in hseen) kt_ins(k, hib[k] + hob[k], 30)
+        for (i = 1; i <= ktn; i++) keeph[ktky[i]] = 1
+        mx_top(10)
+
+        # top 10 applications per device (from the device x application matrix)
+        split("", tdn); split("", tdv); split("", tda); split("", tdi); split("", tdo)
+        for (i = 1; i <= npair; i++) {
+            if (!(i in pdv)) continue
+            pd = pdv[i]; tot = pin[i] + pout[i]
+            if (tot <= 0) continue
+            n2 = tdn[pd] + 0
+            if (n2 < 10 || tot > tdv[pd, n2]) {
+                if (n2 < 10) { n2++; tdn[pd] = n2 }
+                j = n2
+                while (j > 1 && tdv[pd, j - 1] < tot) {
+                    tdv[pd, j] = tdv[pd, j - 1]; tda[pd, j] = tda[pd, j - 1]
+                    tdi[pd, j] = tdi[pd, j - 1]; tdo[pd, j] = tdo[pd, j - 1]; j--
+                }
+                tdv[pd, j] = tot; tda[pd, j] = pap[i]; tdi[pd, j] = pin[i]; tdo[pd, j] = pout[i]
+            }
+        }
+    }
+    # keepa/keeph/tdn/tdv/tda/tdi/tdo simply keep the last poll snapshot when
+    # not rebuilt this cycle - a few seconds of stale tooltip ranking is not
+    # visible to a human hovering over a chart segment.
 
     first = 1
     for (a in aseen) {
-        s = s sprintf("%s\"%s\":{%s%s%s}", (first ? "" : ","), a, jcnt(aib[a], aip[a], aob[a], aop[a]), jrate("a", a), ((a in keepa) ? top_json("a", a, 0) : ""))
+        printf "%s\"%s\":{%s%s%s}", (first ? "" : ","), a, jcnt(aib[a], aip[a], aob[a], aop[a]), jrate("a", a), ((a in keepa) ? top_json("a", a, 0) : "") > tmp
         first = 0
     }
 
-    # top 10 applications per device (from the device x application matrix)
-    split("", tdn); split("", tdv); split("", tda); split("", tdi); split("", tdo)
-    for (i = 1; i <= npair; i++) {
-        if (!(i in pdv)) continue
-        pd = pdv[i]; tot = pin[i] + pout[i]
-        if (tot <= 0) continue
-        n2 = tdn[pd] + 0
-        if (n2 < 10 || tot > tdv[pd, n2]) {
-            if (n2 < 10) { n2++; tdn[pd] = n2 }
-            j = n2
-            while (j > 1 && tdv[pd, j - 1] < tot) {
-                tdv[pd, j] = tdv[pd, j - 1]; tda[pd, j] = tda[pd, j - 1]
-                tdi[pd, j] = tdi[pd, j - 1]; tdo[pd, j] = tdo[pd, j - 1]; j--
-            }
-            tdv[pd, j] = tot; tda[pd, j] = pap[i]; tdi[pd, j] = pin[i]; tdo[pd, j] = pout[i]
-        }
-    }
-
-    s = s "},\"devices\":{"
+    printf "},\"devices\":{" > tmp
     first = 1
     for (k in dseen) {
-        s = s sprintf("%s\"%s\":{\"name\":\"%s\",\"ip\":\"%s\",%s%s,\"via_in\":%.0f,\"via_out\":%.0f,\"top\":[", (first ? "" : ","), k, dev_label(k), ((k in dvip) ? dvip[k] : ""), \
-                      jcnt(dib[k], dipk[k], dob[k], dopk[k]), jrate("d", k), dvi[k] + 0, dvo[k] + 0)
+        printf "%s\"%s\":{\"name\":\"%s\",\"ip\":\"%s\",%s%s,\"via_in\":%.0f,\"via_out\":%.0f,\"top\":[", (first ? "" : ","), k, dev_label(k), ((k in dvip) ? dvip[k] : ""), \
+                      jcnt(dib[k], dipk[k], dob[k], dopk[k]), jrate("d", k), dvi[k] + 0, dvo[k] + 0 > tmp
         for (j = 1; j <= tdn[k]; j++)
-            s = s sprintf("%s[\"%s\",%.0f,%.0f]", (j > 1 ? "," : ""), tda[k, j], tdi[k, j], tdo[k, j])
-        s = s "]}"
+            printf "%s[\"%s\",%.0f,%.0f]", (j > 1 ? "," : ""), tda[k, j], tdi[k, j], tdo[k, j] > tmp
+        printf "]}" > tmp
         first = 0
     }
 
-    s = s "},\"hosts\":{"
+    printf "},\"hosts\":{" > tmp
     first = 1
     for (k in hseen) {
-        s = s sprintf("%s\"%s\":{%s%s%s}", (first ? "" : ","), k, jcnt(hib[k], hip[k], hob[k], hop[k]), jrate("h", k), ((k in keeph) ? top_json("h", k, 1) : ""))
+        printf "%s\"%s\":{%s%s%s}", (first ? "" : ","), k, jcnt(hib[k], hip[k], hob[k], hop[k]), jrate("h", k), ((k in keeph) ? top_json("h", k, 1) : "") > tmp
         first = 0
     }
 
@@ -1127,7 +1234,7 @@ function emit(t,   s, tmp, a, first, k, nm, i, j, sc, nt, tsc, tky, pd, tot, n2,
             tsc[i] = sc; tky[i] = k
         }
     }
-    s = s "},\"top_flows\":["
+    printf "},\"top_flows\":[" > tmp
     for (i = 1; i <= nt; i++) {
         k = tky[i]
         split(k, kp, "|")
@@ -1138,12 +1245,10 @@ function emit(t,   s, tmp, a, first, k, nm, i, j, sc, nt, tsc, tky, pd, tot, n2,
         gsub(/["\\]/, "_", ap)
         hh = ((k in lhost) && lhost[k] != "") ? lhost[k] : ""
         gsub(/[^A-Za-z0-9._:-]/, "_", hh)
-        s = s sprintf("%s{\"dev\":\"%s\",\"ip\":\"%s\",\"app\":\"%s\",\"host\":\"%s\",\"dst\":\"%s\",\"port\":\"%s\",\"proto\":\"%s\",\"class\":\"%s\",\"in_bps\":%.0f,\"out_bps\":%.0f,\"bytes\":%.0f}", \
-                      (i > 1 ? "," : ""), dev_label(fdev[k]), ((fdev[k] in dvip) ? dvip[fdev[k]] : ""), ap, hh, rem, dp, kp[1], cname[fcls[k]], fei[k], feo[k], ftot[k])
+        printf "%s{\"dev\":\"%s\",\"ip\":\"%s\",\"app\":\"%s\",\"host\":\"%s\",\"dst\":\"%s\",\"port\":\"%s\",\"proto\":\"%s\",\"class\":\"%s\",\"in_bps\":%.0f,\"out_bps\":%.0f,\"bytes\":%.0f}", \
+                      (i > 1 ? "," : ""), dev_label(fdev[k]), ((fdev[k] in dvip) ? dvip[fdev[k]] : ""), ap, hh, rem, dp, kp[1], cname[fcls[k]], fei[k], feo[k], ftot[k] > tmp
     }
-    s = s "]}"
-    tmp = OUT "/classes.json.tmp"
-    print s > tmp
+    printf "]}\n" > tmp
     close(tmp)
     system("mv -f " tmp " " OUT "/classes.json")
 }
@@ -1186,15 +1291,34 @@ BEGIN {
     ATTR_POLLS = int(ATTR_WIN / INTERVAL) + 1
     if (ATTR_POLLS < 2) ATTR_POLLS = 2
     dtp = INTERVAL + 0
+
+    # --- adaptive interval setup ---
+    # INTERVAL is the floor/starting point; CUR_INTERVAL is what actually
+    # gets slept and is only ever changed by adapt_interval() below. Note:
+    # RATE_K/UN_K/CAL_K/ATTR_POLLS/IDLE_*_P above are sized in POLLS from the
+    # floor INTERVAL, but every rate/window computation in this script works
+    # off real uptime() timestamps stored per sample, not an assumed
+    # constant poll spacing - so if CUR_INTERVAL grows under load, windows
+    # just end up covering a bit more wall-clock time per ring slot instead
+    # of silently drifting out of sync.
+    ADAPT_INTERVAL += 0; INTERVAL_MAX += 0; ADAPT_BUDGET += 0
+    if (INTERVAL_MAX < INTERVAL) INTERVAL_MAX = INTERVAL
+    CUR_INTERVAL = INTERVAL
+    HOSTS_REFRESH_SEC += 0; GUA_REFRESH_SEC += 0
+    TOOLTIP_EVERY += 0
+
     hist_load()
     hist_t0 = uptime(); t0prev = -1
+    gua_due = 0; hosts_due = 0      # uptime() due-timestamps; 0 = due immediately (first poll)
     while (1) {
         n++
-        if ((n - 1) % 30 == 0) refresh_gua()
         t0 = uptime()
         if (t0prev >= 0 && t0 > t0prev) dtp = t0 - t0prev
         t0prev = t0
-        if ((n - 1) % 10 == 0) refresh_hosts()
+
+        if (t0 >= gua_due)   { refresh_gua();   gua_due   = t0 + GUA_REFRESH_SEC }
+        if (t0 >= hosts_due) { refresh_hosts(); hosts_due = t0 + HOSTS_REFRESH_SEC }
+
         load_map()
         parse_pass()
         tn = (t0 + uptime()) / 2
@@ -1204,7 +1328,10 @@ BEGIN {
         emit(tn)
         if (tn - hist_t0 >= HIST_SEC) { hist_close(tn - hist_t0); hist_t0 = tn }
         warm = 0
-        system("sleep " INTERVAL)
+
+        proc_elapsed = uptime() - t0
+        if (ADAPT_INTERVAL) adapt_interval(proc_elapsed)
+        system("sleep " CUR_INTERVAL)
     }
 }
 '

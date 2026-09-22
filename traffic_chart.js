@@ -9,33 +9,12 @@ var callTrafficStats = rpc.declare({
     expect: { '': {} }
 });
 
-// Same method with the optional "history" parameter: returns the daemon's
-// 24 h history buckets (kept as a parameter so no rpcd ACL change is needed).
 var callHistory = rpc.declare({
     object: 'luci.trafficchart',
     method: 'get_stats',
     params: [ 'history' ],
     expect: { '': {} }
 });
-
-// Data source: luci.trafficchart serves the output of the trafficchart-agg
-// daemon, which walks /proc/net/nf_conntrack once per interval, keeps
-// per-flow state and adds only per-flow DELTAS to monotonically growing
-// per-application / device / destination totals. nftables named counters
-// can't be used because they freeze - both bytes AND classification - once a
-// flow gets handed off to the NSS hardware fastpath; conntrack's byte counters
-// keep advancing for offloaded flows.
-//
-// Consequences for this file:
-// - Totals are cumulative since the daemon started (data.since) and never
-//   shrink when flows close.
-// - All RATES come from the daemon (data.rate and the in_bps / out_bps of
-//   every entry): a plain mean over a fixed window on the daemon's own clock,
-//   read in the same loop iteration as the tc link counters. This page does
-//   no rate estimation of its own. A poll that returns the same sample as the
-//   previous one (data.up, the daemon's sample clock) is skipped.
-// - Everything is shown per application, device, destination or flow; there
-//   are no traffic classes in the view.
 
 var DIRECTIONS = [
     { suffix: '_in',  title: _('Incoming (Download)'), centerLabel: _('INCOMING SHARE') },
@@ -50,13 +29,9 @@ var STROKE_NORMAL = 70;
 var STROKE_HOVER = 82;
 var CIRC = 2 * Math.PI * R;
 
-// "Not attributed": what the shaper (tc) carries but conntrack accounting does not
-// see (link layer headers, LAN-local flows, router internal traffic). Shown as an
-// extra slot, only when it is a real share (hysteresis-free thresholds: the daemon
-// already averages it over a long window).
 var UN_SLOT = 'su';
-var UN_MIN_BPS = 5000;        // bytes/s (= 40 kbit/s)
-var UN_MIN_SHARE = 0.04;      // and at least 4 % of the link rate
+var UN_MIN_BPS = 5000;
+var UN_MIN_SHARE = 0.04;
 
 function formatBytes(b) {
     if (!isFinite(b) || b < 0) b = 0;
@@ -70,8 +45,6 @@ function formatCount(n) {
     if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
     return String(n);
 }
-// bitsPerSec: real link-rate share (tc qdisc total rate x nftables share),
-// formatted as human readable bit/kbit/mbit-per-second.
 function formatRate(bitsPerSec) {
     if (!isFinite(bitsPerSec) || bitsPerSec < 0) bitsPerSec = 0;
     if (bitsPerSec >= 1e6) return (bitsPerSec / 1e6).toFixed(2) + ' Mbit/s';
@@ -109,10 +82,6 @@ return view.extend({
             document.head.appendChild(styleTag);
         }
 
-        // ---- shared click tooltip: top applications of a device ----
-        // Dark glass look. Every colour is !important (stylesheet AND inline) so
-        // that no LuCI theme (dark or light, some force backgrounds with
-        // !important) can turn it into white-on-white.
         var tipOld = document.getElementById('qos_tip_style');
         if (tipOld) tipOld.parentNode.removeChild(tipOld);
         var tipStyle = document.createElement('style');
@@ -151,7 +120,6 @@ return view.extend({
             tipPos.x = ev.clientX; tipPos.y = ev.clientY;
             if (tipEl.style.display !== 'none') tipPlace();
         }
-        // keep the tooltip attached to the click spot while the page scrolls
         var tipScrollY = window.pageYOffset;
         window.addEventListener('scroll', function() {
             var y = window.pageYOffset;
@@ -186,31 +154,15 @@ return view.extend({
             tipPlace();
         }
 
-        // One donut + legend for one direction.
-        // order:   ids of the slots ("s0".."sN" plus UN_SLOT)
-        // metaOf:  slot -> { label, color } used at construction; afterwards
-        //          the slots are re-assigned to applications / devices /
-        //          destinations on every poll, so label and colour come from
-        //          the meta snapshot that update() receives.
         function buildDirectionPanel(dir, order, metaOf, dynamicMeta, noun) {
             var refs = { classes: {}, segEls: {} };
             var lastValues = { total: '100.0%', classes: {}, counters: {} };
             var pinned = null;
             var hovered = null;
-            // Application view only: slot -> application assignment of the
-            // last APPLIED update. Snapshotted per update (9th argument of
-            // update()) so a frozen (pinned) panel keeps matching labels.
             var currentMeta = null;
             function getMeta(cls) { return (dynamicMeta && currentMeta && currentMeta[cls]) ? currentMeta[cls] : metaOf(cls); }
-            // Latest data received from the poll loop, kept even while
-            // frozen (pinned) so that unpinning can immediately catch up
-            // to the current numbers instead of waiting up to 2s for the
-            // next poll to redraw.
             var lastUpdateArgs = null;
 
-            // Tooltip of the clicked (pinned) slot (device view: that device's top
-            // applications), taken from the meta snapshot of the last applied
-            // update. Only this panel hides the tooltip it showed itself.
             var tipShown = false;
             function refreshTip() {
                 var m = (dynamicMeta && pinned && currentMeta && panelEl.offsetParent) ? currentMeta[pinned.key] : null;
@@ -222,9 +174,6 @@ return view.extend({
                 var wasPinned = !!pinned;
                 pinned = newPinned;
                 applyHighlight();
-                // Only trigger a catch-up render on the null transition
-                // (fully unpinned) - switching which class is pinned stays
-                // frozen at whatever data was current when freezing began.
                 if (wasPinned && !pinned && lastUpdateArgs) {
                     applyUpdate.apply(null, lastUpdateArgs);
                 }
@@ -268,9 +217,16 @@ return view.extend({
             order.forEach(function(cls) {
                 refs.classes[cls] = {};
 
-                var livePctEl = E('div', {
-                    style: "font-size:11.5px; color:var(--secondary-dark-color); font-weight:700; font-variant-numeric: tabular-nums;"
+                var liveBarEl = E('div', {
+                    style: 'position:absolute; left:0; top:0; bottom:0; width:0%; border-radius:6px; opacity:0.25; background:' + metaOf(cls).color + '; transition:width 0.4s ease;'
+                });
+                var liveTextEl = E('span', {
+                    style: 'position:relative; z-index:1; font-size:11px; font-weight:700; color:var(--secondary-dark-color); font-variant-numeric: tabular-nums;'
                 }, '0 bit/s');
+                var livePctEl = E('div', {
+                    style: 'position:relative; display:inline-flex; align-items:center; justify-content:flex-end; padding:2px 8px; border-radius:6px; background:rgba(0,0,0,0.04); min-width:85px; overflow:hidden;'
+                }, [ liveBarEl, liveTextEl ]);
+
                 var sigmaBytesEl = E('span', { style: 'color:var(--main-dark-color);' }, '0 B');
                 var sigmaPacketsEl = E('span', { style: 'color:var(--main-dark-color);' }, '0');
                 var sigmaSuffixWordEl = E('span', { style: 'color:var(--main-dark-color);' }, ' packets');
@@ -281,13 +237,13 @@ return view.extend({
                 var totalPctEl = E('span', {
                     style: 'min-width:58px; text-align:right; display:inline-block; flex-shrink:0;'
                 }, 'total: 0.0%');
-                refs.classes[cls].livePct = livePctEl;
+                refs.classes[cls].livePct = liveTextEl;
+                refs.classes[cls].liveBar = liveBarEl;
                 refs.classes[cls].sigma = sigmaEl;
                 refs.classes[cls].sigmaBytes = sigmaBytesEl;
                 refs.classes[cls].sigmaPackets = sigmaPacketsEl;
                 refs.classes[cls].sigmaSuffixTime = sigmaSuffixTimeEl;
                 refs.classes[cls].totalPct = totalPctEl;
-
 
                 var labelEl = E('span', { style: 'font-size:11.5px; color:var(--secondary-dark-color); font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;' }, metaOf(cls).label);
                 var swatch = E('span', { class: 'qos-swatch', style: 'width:11px; height:11px; background:' + metaOf(cls).color + '; border-radius:3px; display:inline-block; flex-shrink:0; box-shadow:0 2px 5px rgba(0,0,0,0.15);' });
@@ -300,7 +256,7 @@ return view.extend({
                         swatch,
                         labelEl
                     ]),
-                    E('div', { style: 'text-align:right; min-width:64px; flex-shrink:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:11px;' }, [ livePctEl ])
+                    E('div', { style: 'text-align:right; min-width:85px; flex-shrink:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:11px;' }, [ livePctEl ])
                 ]);
 
                 headerRow.addEventListener('mouseenter', function() { hovered = { type: 'class', key: cls }; applyHighlight(); });
@@ -322,20 +278,11 @@ return view.extend({
                         style: 'display:flex; flex-wrap:nowrap; justify-content:space-between; align-items:center; gap:4px; margin:0 1px; min-width:0; font-size:9.5px; color:var(--main-bright-color); font-variant-numeric: tabular-nums;'
                     }, [ sigmaEl, totalPctEl ])
                 ]);
-                // Hidden by default (display:none above) - only revealed once
-                // this class actually shows traffic, see the "table row
-                // visibility" block in applyUpdate below. This keeps the
-                // legend table limited to classes that carry traffic instead
-                // of listing all order entries (most of which sit at
-                // 0 B / 0 packets on a typical connection).
                 refs.classes[cls].rowEl = rowEl;
 
                 legendChildren.push(rowEl);
             });
 
-            // Only one active type now ('class') since conntrack aggregation
-            // no longer gives us per-counter sub-segments - hover/click
-            // simply highlights the matching class segment + legend row.
             function applyHighlight() {
                 var active = hovered || pinned;
                 refreshTip();
@@ -372,9 +319,11 @@ return view.extend({
                 E('div', { style: 'width:100%; max-width:760px; min-width:280px; flex:1 1 520px; box-sizing:border-box;' }, [ activeCountEl, legendGrid ])
             ]);
 
+            var linkStatsBar = E('div', { style: 'position:absolute; left:0; top:0; bottom:0; width:0%; background:var(--main-bright-color); opacity:0.15; transition:width 0.4s ease; border-radius:6px; pointer-events:none;' });
+            var linkStatsText = E('span', { style: 'position:relative; z-index:1; font-weight:600;' }, _('Measuring real interface throughput...'));
             var linkStatsEl = E('div', {
-                style: 'font-size:11.5px; color:var(--secondary-dark-color); margin-bottom:0px; font-variant-numeric: tabular-nums; text-align:center;'
-            }, _('Measuring real interface throughput...'));
+                style: 'position:relative; display:inline-block; font-size:11.5px; color:var(--secondary-dark-color); margin-bottom:8px; font-variant-numeric: tabular-nums; text-align:center; padding:4px 12px; border-radius:6px; background:rgba(0,0,0,0.03); overflow:hidden; min-width:60%;'
+            }, [ linkStatsBar, linkStatsText ]);
 
             var diagEl = E('div', {
                 style: 'font-size:9.5px; color:var(--main-bright-color); margin-bottom:6px; font-variant-numeric: tabular-nums; text-align:center;'
@@ -382,7 +331,7 @@ return view.extend({
 
             var panelEl = E('div', { class: 'qos-panel' }, [
                 E('div', { class: 'qos-panel-title' }, dir.title),
-                linkStatsEl,
+                E('div', { style: 'width:100%; display:flex; justify-content:center;' }, [ linkStatsEl ]),
                 diagEl,
                 card
             ]);
@@ -393,6 +342,8 @@ return view.extend({
                     refs.segEls[cls].setAttribute('stroke', m.color);
                     refs.classes[cls].swatchEl.style.background = m.color;
                     refs.classes[cls].labelEl.textContent = m.label;
+                    if (refs.classes[cls].liveBar)
+                        refs.classes[cls].liveBar.style.background = m.color;
                 });
             }
 
@@ -405,17 +356,10 @@ return view.extend({
                 var displayRates = {};
                 order.forEach(function(cls) {
                     if (rawTotal === 0) {
-                        // no traffic anywhere yet - show an even placeholder ring
                         displayRates[cls] = 1;
                     } else if (classRate[cls] > 0) {
-                        // real (if tiny) traffic - guarantee a visible sliver instead
-                        // of it disappearing at very low shares
                         displayRates[cls] = Math.max(classRate[cls], rawTotal * MIN_SLICE_FRACTION);
                     } else {
-                        // genuinely zero traffic for this class right now - no wedge at
-                        // all, otherwise every idle class permanently shows a phantom
-                        // slice even though nothing is actually flowing (e.g. NTP/VOIP
-                        // sitting idle while other classes carry all the traffic)
                         displayRates[cls] = 0;
                     }
                 });
@@ -432,46 +376,56 @@ return view.extend({
                 });
 
                 lastValues.total = rawTotal > 0 ? '100.0%' : '0.0%';
-                // "active" = carrying traffic right now (rate), not "ever had traffic"
                 var activeClassCount = order.filter(function(cls) {
                     return classRate[cls] > 0 && cls !== UN_SLOT;
                 }).length;
                 activeCountEl.textContent = _('%s (%d active)').format(noun, activeClassCount);
 
-                // Link utilization: rate of the tc qdisc counters (measured by the daemon)
                 var sourceTxt = ifaceSourceName ? ' [via ' + ifaceSourceName + ']' : '';
                 var configuredMbit = (configuredKbit || 0) / 1000;
+                var configuredBps = (configuredKbit || 0) * 1000;
+                var totalPct = 0;
+                
                 if (ifaceRateBps === null || ifaceRateBps === undefined) {
-                    linkStatsEl.textContent = _('Link rate not available (no tc counters)') + sourceTxt;
+                    linkStatsText.textContent = _('Link rate not available (no tc counters)') + sourceTxt;
                 } else {
                     var ifaceMbit = ifaceRateBps * 8 / 1e6;
-                    if (configuredMbit > 0)
-                        linkStatsEl.textContent = ifaceMbit.toFixed(1) + ' Mbit/s of ' + configuredMbit.toFixed(0) + ' Mbit/s configured (' + ((ifaceMbit / configuredMbit) * 100).toFixed(1) + '%)' + sourceTxt;
-                    else
-                        linkStatsEl.textContent = ifaceMbit.toFixed(1) + ' Mbit/s (configured SQM bandwidth not found)' + sourceTxt;
+                    if (configuredMbit > 0) {
+                        totalPct = Math.min(100, (ifaceMbit / configuredMbit) * 100);
+                        linkStatsText.textContent = ifaceMbit.toFixed(1) + ' Mbit/s of ' + configuredMbit.toFixed(0) + ' Mbit/s configured (' + totalPct.toFixed(1) + '%)' + sourceTxt;
+                    } else {
+                        linkStatsText.textContent = ifaceMbit.toFixed(1) + ' Mbit/s (configured SQM bandwidth not found)' + sourceTxt;
+                    }
                 }
+                linkStatsBar.style.width = totalPct.toFixed(1) + '%';
 
                 order.forEach(function(cls) {
-                    // rate: mean over the daemon's window; share: of the sum of all rows
                     var classFrac = rawTotal > 0 ? (classRate[cls] / rawTotal) : 0;
                     var classRateBits = classRate[cls] * 8;
                     var livePct = rawTotal > 0 ? (classFrac * 100).toFixed(1) : '0.0';
-                    var totalPct = totalBytesSum > 0 ? ((classBytes[cls] / totalBytesSum) * 100).toFixed(1) : '0.0';
+                    var tPct = totalBytesSum > 0 ? ((classBytes[cls] / totalBytesSum) * 100).toFixed(1) : '0.0';
 
                     refs.classes[cls].livePct.textContent = formatRate(classRateBits);
+                    
+                    // Skalierung der Legenden-Balken relativ zur konfigurierten Linkrate
+                    var barPct = 0;
+                    if (configuredBps > 0) {
+                        barPct = Math.min(100, (classRateBits / configuredBps) * 100);
+                    } else if (rawTotal > 0) {
+                        barPct = classFrac * 100;
+                    }
+
+                    if (refs.classes[cls].liveBar)
+                        refs.classes[cls].liveBar.style.width = barPct.toFixed(1) + '%';
+
                     refs.classes[cls].sigmaBytes.textContent = formatBytes(classBytes[cls]);
                     refs.classes[cls].sigmaPackets.textContent = formatCount(classPackets[cls]);
                     refs.classes[cls].sigmaSuffixTime.textContent = ' (' + (baselineLabel || _('since start')) + ')';
                     refs.classes[cls].sigma.title = _('Total %s - %s packets (%s)')
                         .format(formatBytes(classBytes[cls]), formatCount(classPackets[cls]), baselineLabel || _('since start'));
-                    refs.classes[cls].totalPct.textContent = 'total: ' + totalPct + '%';
-
+                    refs.classes[cls].totalPct.textContent = 'total: ' + tPct + '%';
 
                     lastValues.classes[cls] = { pct: livePct + '%' };
-
-                    // Only list rows that carry (or ever carried) traffic. Keyed on the
-                    // cumulative total, not the live rate, so a row does not blink in
-                    // and out whenever its flows briefly pause.
                     refs.classes[cls].rowEl.style.display = classBytes[cls] > 0 ? '' : 'none';
                 });
 
@@ -480,11 +434,6 @@ return view.extend({
                 }
             }
 
-            // Public entry point called every poll. Always caches the latest
-            // data (so unpinning catches up immediately, see setPinned), but
-            // only re-renders while nothing is pinned - clicking a row freezes
-            // the numbers so they can be read without shifting, like pausing a
-            // live readout.
             function update() {
                 lastUpdateArgs = arguments;
                 if (pinned) return;
@@ -498,22 +447,12 @@ return view.extend({
             return { el: panelEl, update: update, clearPinned: clearPinned };
         }
 
-
         function slotHue(name) {
             var h = 7;
             for (var i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) % 360;
             return h;
         }
 
-        // Slot view = donut pair whose segments are re-assigned every poll to
-        // the `top` entries of data.apps / data.devices / data.hosts, plus one
-        // slot summing up everything else. Ranking (per direction, so the
-        // download and the upload table each show what is busy in THAT
-        // direction): entries with traffic right now first, busiest on top;
-        // idle entries behind them by total volume. The previous order is the
-        // starting point and an entry only moves ahead of its neighbour if it
-        // is clearly better (RANK_MARGIN), so entries with a similar rate do
-        // not swap places on every poll. The rates come from the daemon.
         function makeSlotView(top, noun, labelOf, otherLabelOf, detailsOf, detailTitle) {
             var slots = [];
             for (var i = 0; i <= top; i++) slots.push('s' + i);
@@ -524,9 +463,6 @@ return view.extend({
             v.panelIn = buildDirectionPanel(DIRECTIONS[0], slots, function() { return emptyMeta; }, true, noun);
             v.panelOut = buildDirectionPanel(DIRECTIONS[1], slots, function() { return emptyMeta; }, true, noun);
 
-            // Order of all entries for one direction: busy ones first (highest
-            // rate on top), idle ones behind them by total volume, starting from
-            // the previous order (hysteresis, see above).
             function rankNames(d, items) {
                 var all = Object.keys(items), seen = {}, arr = [], sc = {}, fresh;
                 all.forEach(function(n) {
@@ -540,15 +476,15 @@ return view.extend({
                     return (y.g - x.g) || (y.a - x.a) || (y.t - x.t) || (a < b ? -1 : (a > b ? 1 : 0));
                 });
                 arr = arr.concat(fresh);
-                function beats(x, y) {                  // x is clearly ahead of y
+                function beats(x, y) {
                     var X = sc[x], Y = sc[y];
                     if (X.g !== Y.g) return X.g > Y.g;
-                    return X.g ? (X.a > Y.a * RANK_MARGIN) : (X.t > Y.t);   // idle: plain order by volume
+                    return X.g ? (X.a > Y.a * RANK_MARGIN) : (X.t > Y.t);
                 }
                 var swapped = true, guard = 0, i, tmp;
                 while (swapped && guard++ <= arr.length) {
                     swapped = false;
-                    for (i = arr.length - 1; i > 0; i--) {   // bubble up from the bottom
+                    for (i = arr.length - 1; i > 0; i--) {
                         if (beats(arr[i], arr[i - 1])) { tmp = arr[i]; arr[i] = arr[i - 1]; arr[i - 1] = tmp; swapped = true; }
                     }
                 }
@@ -593,40 +529,26 @@ return view.extend({
             return v;
         }
 
-        // data.apps: cumulative conntrack deltas per netifyd application
-        // (or "[WEB]", "[BE]" ... = the port based class for flows netifyd
-        // did not label).
-        // At most MAX_ROWS rows per list: MAX_ROWS-1 entries + one "other" row
         var MAX_ROWS = 22;
         var appsView = makeSlotView(MAX_ROWS - 1, _('Applications'),
             function(name) { return name; },
             function(n) { return _('Other (%d applications)').format(n); },
             function(e) { return (e.top && e.top.length) ? e.top : null; }, _('Top destinations'));
-        // data.devices: per LAN device (identified by MAC, see trafficchart-hosts)
         var devicesView = makeSlotView(MAX_ROWS - 1, _('Devices'),
             function(key, e) { var nm = e.name || key; return (e.ip && e.ip !== nm) ? nm + ' (' + e.ip + ')' : nm; },
             function(n) { return _('Other (%d devices)').format(n); },
             function(e) {
                 var t = (e.top || []).slice();
-                // LAN side of router services (e.g. a stream proxy on the router):
-                // not WAN traffic itself; the router's WAN traffic of the same
-                // stream is credited to this device in the totals above.
                 if ((e.via_in || 0) + (e.via_out || 0) > 0)
                     t.push([ _('via router services (proxy, DNS, LuCI ...) - LAN side, not WAN'), e.via_in || 0, e.via_out || 0 ]);
                 return t.length ? t : null;
             }, _('Top applications'));
-        // data.hosts: destinations - netifyd host name folded to the
-        // registrable domain, else the remote IP
         var hostsView = makeSlotView(MAX_ROWS - 1, _('Destinations'),
             function(name) { return name; },
             function(n) { return _('Other (%d destinations)').format(n); },
             function(e) { return (e.top && e.top.length) ? e.top : null; }, _('Top devices'));
         var slotViews = [ appsView, devicesView, hostsView ];
 
-
-        // ---------------------------------------------------------------
-        // Live flows: the 25 busiest flows (smoothed rate, from the daemon)
-        // ---------------------------------------------------------------
         function makeFlowsView() {
             var v = {};
             var hdr = function(t, right) { return E('th', { class: 'th', style: right ? 'text-align:right;' : '' }, t); };
@@ -638,31 +560,56 @@ return view.extend({
             v.el = E('div', { style: 'width:100%; display:none;' }, [
                 E('div', { class: 'qos-panel-title', style: 'text-align:center;' }, _('Busiest flows (smoothed rate, top 25)')),
                 table ]);
-            v.update = function(flows) {
+            v.update = function(flows, sqmDownKbit, sqmUpKbit) {
                 while (table.rows.length > 1) table.deleteRow(1);
                 if (!flows || !flows.length) {
                     table.appendChild(E('tr', { class: 'tr' }, [ E('td', { class: 'td', colspan: 7 }, _('No active flows')) ]));
                     return;
                 }
+                
+                var maxIn = 0, maxOut = 0;
+                flows.forEach(function(f) {
+                    if ((f.in_bps || 0) > maxIn) maxIn = f.in_bps;
+                    if ((f.out_bps || 0) > maxOut) maxOut = f.out_bps;
+                });
+
+                var downLimitBps = (sqmDownKbit || 0) * 1000;
+                var upLimitBps = (sqmUpKbit || 0) * 1000;
+
                 flows.forEach(function(f) {
                     var dest = f.host || f.dst;
                     var dev = (f.ip && f.ip !== f.dev) ? f.dev + ' (' + f.ip + ')' : f.dev;
+                    
+                    var inBits = (f.in_bps || 0) * 8;
+                    var outBits = (f.out_bps || 0) * 8;
+
+                    // Skalierung der Flow-Balken relativ zur konfigurierten Linkrate (mit Fallback)
+                    var pctIn = downLimitBps > 0 ? Math.min(100, (inBits / downLimitBps) * 100) : (maxIn > 0 ? ((f.in_bps || 0) / maxIn * 100) : 0);
+                    var pctOut = upLimitBps > 0 ? Math.min(100, (outBits / upLimitBps) * 100) : (maxOut > 0 ? ((f.out_bps || 0) / maxOut * 100) : 0);
+                    
+                    var tdIn = E('td', { class: 'td', style: num + ' position:relative; padding-right:8px;' }, [
+                        E('div', { style: 'position:absolute; right:0; top:2px; bottom:2px; width:' + pctIn.toFixed(1) + '%; background:rgba(110, 231, 183, 0.22); border-radius:4px; z-index:0; transition:width 0.4s ease; pointer-events:none;' }),
+                        E('span', { style: 'position:relative; z-index:1;' }, formatRate(inBits))
+                    ]);
+                    
+                    var tdOut = E('td', { class: 'td', style: num + ' position:relative; padding-right:8px;' }, [
+                        E('div', { style: 'position:absolute; right:0; top:2px; bottom:2px; width:' + pctOut.toFixed(1) + '%; background:rgba(147, 197, 253, 0.22); border-radius:4px; z-index:0; transition:width 0.4s ease; pointer-events:none;' }),
+                        E('span', { style: 'position:relative; z-index:1;' }, formatRate(outBits))
+                    ]);
+
                     table.appendChild(E('tr', { class: 'tr' }, [
                         E('td', { class: 'td' }, dev),
                         E('td', { class: 'td' }, f.app),
                         E('td', { class: 'td', title: f.dst + (f.host ? ' - ' + f.host : '') }, dest),
                         E('td', { class: 'td' }, (f.proto || '') + (f.port ? '/' + f.port : '')),
-                        E('td', { class: 'td', style: num }, formatRate((f.in_bps || 0) * 8)),
-                        E('td', { class: 'td', style: num }, formatRate((f.out_bps || 0) * 8)),
+                        tdIn,
+                        tdOut,
                         E('td', { class: 'td', style: num }, formatBytes(f.bytes || 0)) ]));
                 });
             };
             return v;
         }
 
-        // ---------------------------------------------------------------
-        // History: stacked bars of the daemon's 5 minute buckets (24 h)
-        // ---------------------------------------------------------------
         function makeHistoryView() {
             var v = { active: false, loadedAt: 0 };
             var st = { dim: 'a', dir: 'in', buckets: [] };
@@ -694,8 +641,6 @@ return view.extend({
                 if (k === '(other)') return 'hsl(210,8%,62%)';
                 return 'hsl(' + slotHue(k) + ',58%,46%)';
             }
-            // Inline style, not an attribute: cascade.css ("* { font-size: 100% }")
-            // overrides SVG presentation attributes but not inline styles.
             var AXIS_TEXT_STYLE = 'font-size:12px; fill:var(--main-bright-color);';
             function axisRate(mbit) {
                 if (mbit >= 100) return Math.round(mbit) + ' Mbit/s';
@@ -736,7 +681,6 @@ return view.extend({
                 var series = shown.slice();
                 if (rest.length) series.push('__rest');
 
-                // per bucket: Mbit/s per series
                 var cols = B.map(function(b) {
                     var dt = b.dt || 300, src = b[st.dim] || {}, out = {}, tot = 0;
                     series.forEach(function(k) { out[k] = 0; });
@@ -750,9 +694,6 @@ return view.extend({
                 });
                 var maxv = niceMax(Math.max.apply(null, cols.map(function(c) { return c.total; }).concat([0.001])));
 
-                // viewBox width = actual container width (fallback 900), so one
-                // user unit is one CSS pixel and the axis text below has a real
-                // pixel size instead of being scaled with the container.
                 var W = Math.max(360, Math.round(chartHost.clientWidth || 900)), H = 264, pl = 84, pr = 10, pt = 10, pb = 26;
                 var pw = W - pl - pr, ph = H - pt - pb;
                 var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H, width: '100%', style: 'display:block;' });
@@ -822,14 +763,9 @@ return view.extend({
         var flowsView = makeFlowsView();
         var histView = makeHistoryView();
 
-        // ---------------------------------------------------------------
-        // Shaper health: nsstbl + nssfq_codel counters from "tc -s qdisc"
-        // ---------------------------------------------------------------
         var shaperEl = E('div', { style: 'font-size:11.5px; color:var(--secondary-dark-color); margin:0 0 12px; line-height:1.55; font-variant-numeric: tabular-nums;' });
         var prevShaper = { rx: null, tx: null };
 
-        // Link header calibration of the daemon (bytes per packet that tc counts and
-        // conntrack does not, see L2_OVERHEAD in trafficchart-agg).
         var l2El = E('div', { id: 'qos_l2diag', style: 'font-size:11.5px; color:var(--secondary-dark-color); margin:-6px 0 12px; line-height:1.55; font-variant-numeric: tabular-nums;' });
         function l2Update(r) {
             while (l2El.firstChild) l2El.removeChild(l2El.firstChild);
@@ -863,9 +799,6 @@ return view.extend({
             ['rx', 'tx'].forEach(function(d) { prevShaper[d] = (sh && sh[d] && sh[d].sent !== undefined) ? sh[d] : null; });
         }
 
-        // ---------------------------------------------------------------
-        // Export of the latest snapshot
-        // ---------------------------------------------------------------
         var lastData = null;
         function stamp() {
             var d = new Date(), p = function(n) { return (n < 10 ? '0' : '') + n; };
@@ -938,8 +871,6 @@ return view.extend({
             var devPanels = E('div', { class: 'qos-panels', style: 'margin-bottom: 40px; display:none;' }, [ devicesView.panelIn.el, devicesView.panelOut.el ]);
             var hostPanels = E('div', { class: 'qos-panels', style: 'margin-bottom: 40px; display:none;' }, [ hostsView.panelIn.el, hostsView.panelOut.el ]);
             var groups = [ appPanels, devPanels, hostPanels, flowsView.el, histView.el ];
-            // Tabs use the theme's own tab menu (cascade.css: .cbi-tabmenu,
-            // active entry = li.cbi-tab), like the tabs on other LuCI pages.
             var tabDefs = [ ['qos_tab_apps', _('Applications')], ['qos_tab_devices', _('Devices')],
                             ['qos_tab_hosts', _('Destinations')], ['qos_tab_flows', _('Live flows')], ['qos_tab_history', _('History')] ];
             var tabBtns = [];
@@ -965,11 +896,11 @@ return view.extend({
             var toolbar = E('div', { style: 'display:flex; align-items:flex-start; justify-content:space-between; gap:12px; flex-wrap:wrap;' }, [
                 tabs, E('div', { style: 'display:flex; gap:6px; margin-bottom:1em;' }, [ btnJson, btnCsv ]) ]);
 
-                        var hintText = _('* Note: rates are the mean of the last %d s, measured by the trafficchart-agg daemon on its own clock (bytes per application, device and destination from /proc/net/nf_conntrack, application names from netifyd). The link rate comes from the tc qdisc counters read in the same instant. "Not attributed" is what the shaper carries but conntrack does not count (after subtracting the link layer header): e.g. traffic to router services, dropped inbound packets, multicast.').format((data && data.rate && data.rate.win) || 0);
-                        if (data && data.backend === 'nss')
-                            hintText += ' ' + _('NSS hardware offload bypasses nftables for accelerated flows; conntrack byte counters keep advancing under offload, which is why they are used.');
-                        var hintEl = E('div', {
-                style: 'position: absolute; bottom: 14px; left: 32px; margin-top: 40px; margin-left: 40px; margin-right: 40px; font-size: 11px; color: var(--main-bright-color); z-index: 10;'
+            var hintText = _('* Note: rates are the mean of the last %d s, measured by the trafficchart-agg daemon on its own clock (bytes per application, device and destination from /proc/net/nf_conntrack, application names from netifyd). The link rate comes from the tc qdisc counters read in the same instant. "Not attributed" is what the shaper carries but conntrack does not count (after subtracting the link layer header): e.g. traffic to router services, dropped inbound packets, multicast.').format((data && data.rate && data.rate.win) || 0);
+            if (data && data.backend === 'nss')
+                hintText += ' ' + _('NSS hardware offload bypasses nftables for accelerated flows; conntrack byte counters keep advancing under offload, which is why they are used.');
+            var hintEl = E('div', {
+                style: 'position: bottom: 14px; left: 32px; margin-top: 40px; margin-left: 40px; margin-right: 40px; font-size: 11px; color: var(--main-bright-color); z-index: 10;'
             }, hintText);
 
             container.appendChild(staleEl);
@@ -986,22 +917,13 @@ return view.extend({
         }
 
         var lastTime = Date.now();
-        // daemon-side sample clock (uptime seconds) of the last processed sample
         var lastSrvUp = null;
         var haveRenderedOnce = false;
         var lastSuccessTime = Date.now();
         var consecutiveFailures = 0;
 
-        // Shows a small persistent warning once data has already been
-        // flowing successfully but then stops (rpcd hung, ubus timeout,
-        // router rebooted mid-session, etc.). Before this fix, an error
-        // after the first successful render was completely silent - the
-        // chart just froze on its last values with zero indication
-        // anything was wrong, which is worse than an explicit "stale"
-        // notice: a frozen-looking-live chart can quietly mislead someone
-        // checking current traffic during a real outage.
         function updateStaleIndicator() {
-            if (!haveRenderedOnce) return; // pre-first-success errors use statusEl instead
+            if (!haveRenderedOnce) return;
             if (consecutiveFailures === 0) {
                 staleEl.style.display = 'none';
                 return;
@@ -1026,13 +948,6 @@ return view.extend({
             if (pollInFlight) return Promise.resolve();
             pollInFlight = true;
 
-            // Watchdog: if callTrafficStats() never settles (a genuinely
-            // hung ubus/rpcd call, not just a normal error response),
-            // pollInFlight would otherwise stay true forever and silently
-            // freeze all future polls - the tab would look "fine" but never
-            // update again. This just clears the in-flight flag after a
-            // generous timeout so polling can resume; it does not (and
-            // cannot from JS) cancel the underlying hung call itself.
             if (histView.active && Date.now() - histView.loadedAt > 60000) histView.load();
 
             var watchdog = setTimeout(function() {
@@ -1062,10 +977,6 @@ return view.extend({
                 var dt = (now - lastTime) / 1000;
                 if (dt <= 0) dt = 1;
 
-                // Daemon-side sample clock. The daemon samples on its own schedule,
-                // so consecutive polls may return the SAME sample: nothing new, skip
-                // (valid response, not a failure). A clock that jumped back by more
-                // than 30 s (router reboot, daemon restart) is a new run, not a repeat.
                 var srvUp = (typeof data.up === 'number') ? data.up : null;
                 if (haveRenderedOnce && srvUp !== null && lastSrvUp !== null && srvUp <= lastSrvUp && lastSrvUp - srvUp < 30) {
                     lastSuccessTime = Date.now();
@@ -1074,7 +985,6 @@ return view.extend({
                     return;
                 }
 
-                // Rates, incl. the link rate, are measured by the daemon on one clock.
                 var rateInfo = data.rate;
                 var ifaceRate = rateInfo.tc ? { rx: rateInfo.rx_bps || 0, tx: rateInfo.tx_bps || 0 } : null;
                 var sqmDownloadKbit = data.sqm ? (data.sqm.download_kbit || 0) : 0;
@@ -1084,16 +994,11 @@ return view.extend({
                 lastSrvUp = srvUp;
                 if (!baselineTime) baselineTime = (data.since ? new Date(data.since * 1000) : new Date(now));
 
-                // A valid sample is a successful poll even on a quiet link, so the
-                // stale-data warning does not misfire.
                 lastSuccessTime = Date.now();
                 consecutiveFailures = 0;
                 updateStaleIndicator();
 
-                // Live flows, shaper health, header calibration and the export
-                // snapshot update on every fresh sample (otherwise an idle link
-                // would keep showing the last busy flows).
-                flowsView.update(data.top_flows || []);
+                flowsView.update(data.top_flows || [], sqmDownloadKbit, sqmUploadKbit);
                 shaperUpdate(data.shaper, dt);
                 l2Update(rateInfo);
                 lastData = data;
