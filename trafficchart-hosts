@@ -14,6 +14,32 @@
 #
 # Devices are identified by MAC, not IP, so a host's IPv4 address and all its
 # (privacy) IPv6 addresses end up in ONE device.
+#
+# Active re-resolution: trafficchart-agg writes OUT_DIR/unresolved_v6 with LAN
+# IPv6 addresses it has seen carrying traffic but which have no neighbour
+# entry (typical under NSS hardware offload: once a flow is fast-pathed its
+# packets stop reaching the kernel, so IPv6 NUD never sees confirming traffic,
+# ages the entry out, and it drops from "ip neigh show" even though the
+# device is still actively sending). Pinging each address here forces the
+# kernel to run Neighbour Discovery again, so the "ip neigh show" below has a
+# fresh entry for it.
+OUT_DIR="${OUT_DIR:-/tmp/trafficchart}"
+UNRESOLVED_FILE="${UNRESOLVED_FILE:-$OUT_DIR/unresolved_v6}"
+if [ -s "$UNRESOLVED_FILE" ]; then
+    PING6=""
+    if command -v ping6 >/dev/null 2>&1; then
+        PING6="ping6 -c1 -W1 -q"
+    elif ping -6 -c1 -W1 -q ::1 >/dev/null 2>&1; then
+        PING6="ping -6 -c1 -W1 -q"
+    fi
+    if [ -n "$PING6" ]; then
+        while IFS= read -r addr; do
+            [ -n "$addr" ] || continue
+            $PING6 "$addr" >/dev/null 2>&1 &
+        done < "$UNRESOLVED_FILE"
+        wait
+    fi
+fi
 
 ip neigh show 2>/dev/null | awk '
     function v6full(a,   n, h, lc, rc, lg, rg, i, g, out, miss) {
@@ -68,4 +94,67 @@ command -v uci >/dev/null 2>&1 && uci -q show dhcp 2>/dev/null | awk -F"[.=]" '
     $3 == "name" { name[$2] = line }
     $3 == "mac"  { split(line, m, " "); mac[$2] = tolower(m[1]) }
     END { for (s in mac) if (name[s] != "" && mac[s] != "") print "N\t" mac[s] "\t" name[s] }'
+
+# Static IP<->MAC mapping from /etc/config/dhcp, IN ADDITION to the live
+# neighbour table above. This is what actually fixes IPv6 devices "splitting
+# off": a "config host" section gives name+mac+ONE fixed IPv4 per device; a
+# "config domain" section (added by hand, or by LuCI's static-lease helper)
+# can list EVERY address ever seen for that device - the fixed IPv4 plus all
+# rotating IPv6 privacy addresses. The two sections are joined by their
+# SHARED fixed IPv4 address, not by name (names can differ, e.g. host "fire"
+# vs. domain "firestick", or even collide, e.g. two hosts both named
+# "player"), so every extra address in the domain list is mapped to the
+# host's mac permanently - no live resolution, no ping, no timing window.
+# Only helps for addresses that are ALREADY recorded in such a domain entry;
+# the active re-resolution (ping) above still covers brand new ones.
+command -v uci >/dev/null 2>&1 && uci -q show dhcp 2>/dev/null | awk '
+    function val(l,   v) { v = l; sub(/^[^=]*=/, "", v); gsub(/\047/, "", v); return v }
+    {
+        if (match($0, /^dhcp\.(@host\[[0-9]+\]|[A-Za-z0-9_]+)=host$/)) {
+            sec = substr($0, 6, index($0, "=") - 6); kind[sec] = "host"; next
+        }
+        if (match($0, /^dhcp\.(@domain\[[0-9]+\]|[A-Za-z0-9_]+)=domain$/)) {
+            sec = substr($0, 6, index($0, "=") - 6); kind[sec] = "domain"; next
+        }
+        if (match($0, /^dhcp\.[^.]+\.ip=/)) {
+            sec = substr($0, 6, index($0, ".ip=") - 6); ipval[sec] = val($0); next
+        }
+        if (match($0, /^dhcp\.[^.]+\.mac=/)) {
+            sec = substr($0, 6, index($0, ".mac=") - 6); macval[sec] = tolower(val($0)); next
+        }
+        if (match($0, /^dhcp\.[^.]+\.name=/)) {
+            sec = substr($0, 6, index($0, ".name=") - 6); nameval[sec] = val($0); next
+        }
+    }
+    END {
+        # index static "config host" sections by their fixed IPv4 address,
+        # and (only if the name is unambiguous - two hosts CAN share a name,
+        # see "player" above) by name too, as a fallback for domain entries
+        # that list no fixed IPv4 at all (e.g. "mipad" above)
+        for (s in kind) {
+            if (kind[s] != "host" || !(s in macval)) continue
+            if (s in ipval) hostmac[ipval[s]] = macval[s]
+            if (s in nameval) {
+                nm = tolower(nameval[s])
+                if ((nm in namemac) && namemac[nm] != macval[s]) nameamb[nm] = 1
+                else namemac[nm] = macval[s]
+            }
+        }
+        # every "config domain" section that shares one of those IPv4s in its
+        # address list: ALL its other addresses belong to that same mac.
+        # Falls back to an unambiguous name match (stripping a trailing
+        # ".lan") only when no IPv4 is shared at all.
+        for (s in kind) {
+            if (kind[s] != "domain" || !(s in ipval)) continue
+            n = split(ipval[s], a, " ")
+            m = ""
+            for (i = 1; i <= n; i++) if (a[i] in hostmac) { m = hostmac[a[i]]; break }
+            if (m == "" && (s in nameval)) {
+                dn = tolower(nameval[s]); sub(/\.lan$/, "", dn)
+                if ((dn in namemac) && !(dn in nameamb)) m = namemac[dn]
+            }
+            if (m == "") continue
+            for (i = 1; i <= n; i++) print "I\t" a[i] "\t" m
+        }
+    }'
 exit 0

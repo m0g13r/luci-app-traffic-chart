@@ -551,11 +551,18 @@ return view.extend({
 
         function makeFlowsView() {
             var v = {};
-            var hdr = function(t, right) { return E('th', { class: 'th', style: right ? 'text-align:right;' : '' }, t); };
+            // Feste Spaltenbreiten (Summe = 100%), damit die Tabelle bei wechselnden
+            // Inhalten (kurze/lange Namen, kurze/lange Zahlen) nicht mehr hin und her springt.
+            var COL_WIDTHS = [ 16, 14, 30, 8, 11, 11, 10 ]; // Gerät, App, Ziel, Port, Down, Up, Volumen
+            var colgroup = E('colgroup', {}, COL_WIDTHS.map(function(w) {
+                return E('col', { style: 'width:' + w + '%;' });
+            }));
+            var trunc = 'overflow:hidden; text-overflow:ellipsis; white-space:nowrap;';
+            var hdr = function(t, right) { return E('th', { class: 'th', style: (right ? 'text-align:right; ' : '') + trunc }, t); };
             var head = E('tr', { class: 'tr table-titles' }, [
                 hdr(_('Device')), hdr(_('Application')), hdr(_('Destination')), hdr(_('Port')),
                 hdr(_('Download'), true), hdr(_('Upload'), true), hdr(_('Volume'), true) ]);
-            var table = E('table', { class: 'table', id: 'qos_flows_table' }, [ head ]);
+            var table = E('table', { class: 'table', id: 'qos_flows_table', style: 'table-layout:fixed; width:100%;' }, [ colgroup, head ]);
             var num = 'text-align:right; font-variant-numeric: tabular-nums; white-space:nowrap;';
             v.el = E('div', { style: 'width:100%; display:none;' }, [
                 E('div', { class: 'qos-panel-title', style: 'text-align:center;' }, _('Busiest flows (smoothed rate, top 25)')),
@@ -598,13 +605,13 @@ return view.extend({
                     ]);
 
                     table.appendChild(E('tr', { class: 'tr' }, [
-                        E('td', { class: 'td' }, dev),
-                        E('td', { class: 'td' }, f.app),
-                        E('td', { class: 'td', title: f.dst + (f.host ? ' - ' + f.host : '') }, dest),
-                        E('td', { class: 'td' }, (f.proto || '') + (f.port ? '/' + f.port : '')),
+                        E('td', { class: 'td', style: trunc, title: dev }, dev),
+                        E('td', { class: 'td', style: trunc, title: f.app }, f.app),
+                        E('td', { class: 'td', style: trunc, title: f.dst + (f.host ? ' - ' + f.host : '') }, dest),
+                        E('td', { class: 'td', style: trunc }, (f.proto || '') + (f.port ? '/' + f.port : '')),
                         tdIn,
                         tdOut,
-                        E('td', { class: 'td', style: num }, formatBytes(f.bytes || 0)) ]));
+                        E('td', { class: 'td', style: num + ' ' + trunc }, formatBytes(f.bytes || 0)) ]));
                 });
             };
             return v;
