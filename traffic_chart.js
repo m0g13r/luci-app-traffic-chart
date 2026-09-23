@@ -16,6 +16,12 @@ var callHistory = rpc.declare({
     expect: { '': {} }
 });
 
+var callRestart = rpc.declare({
+    object: 'luci.trafficchart',
+    method: 'restart',
+    expect: { '': {} }
+});
+
 var DIRECTIONS = [
     { suffix: '_in',  title: _('Incoming (Download)'), centerLabel: _('INCOMING SHARE') },
     { suffix: '_out', title: _('Outgoing (Upload)'),    centerLabel: _('OUTGOING SHARE') }
@@ -847,14 +853,42 @@ return view.extend({
         }
 
         var statusEl = E('span', { style: 'color:var(--main-bright-color);' }, _('Querying conntrack via ubus...'));
+
+        var restartBusy = false;
+        var restartBtn = E('button', {
+            type: 'button', class: 'btn cbi-button cbi-button-remove',
+            style: 'display:none; margin-left:10px; font-size:11px; padding:1px 8px; vertical-align:middle;'
+        }, _('Restart service'));
+        restartBtn.addEventListener('click', function(e) {
+            e.stopPropagation();
+            if (restartBusy) return;
+            restartBusy = true;
+            restartBtn.disabled = true;
+            restartBtn.textContent = _('Restarting...');
+            callRestart().then(function() {
+                // the aggregator needs a moment to come back up; the next
+                // poll(s) will show "aggregator not running" briefly, which
+                // is expected and clears itself once the service is back.
+                setTimeout(function() {
+                    restartBusy = false;
+                    restartBtn.disabled = false;
+                    restartBtn.textContent = _('Restart service');
+                }, 4000);
+            }).catch(function() {
+                restartBusy = false;
+                restartBtn.disabled = false;
+                restartBtn.textContent = _('Restart service');
+            });
+        });
+
         var staleEl = E('div', {
             style: 'display:none; color:var(--danger-color); font-size:11.5px; text-align:center; margin-bottom:8px;'
-        }, '');
+        }, [ E('span', { id: 'qos_stale_text' }, '') ]);
 
         var container = E('div', {
             id: 'qos_container',
             style: 'background: var(--table-background-color); border: 1px solid var(--main-bright-color); border-radius: .50em; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3); padding:28px 32px; max-width:1700px; margin:0 auto;'
-        }, [ statusEl, staleEl ]);
+        }, [ statusEl, restartBtn, staleEl ]);
 
         container.addEventListener('click', function(e) {
             if (e.target.closest && e.target.closest('.qos-seg, .qos-legend-row')) return;
@@ -933,12 +967,15 @@ return view.extend({
             if (!haveRenderedOnce) return;
             if (consecutiveFailures === 0) {
                 staleEl.style.display = 'none';
+                restartBtn.style.display = 'none';
                 return;
             }
             var secsAgo = Math.round((Date.now() - lastSuccessTime) / 1000);
-            staleEl.textContent = _('⚠ No update for %ds (last successful read: %s) - retrying automatically...')
+            var textEl = document.getElementById('qos_stale_text');
+            if (textEl) textEl.textContent = _('⚠ No update for %ds (last successful read: %s) - retrying automatically...')
                 .format(secsAgo, new Date(lastSuccessTime).toLocaleTimeString());
             staleEl.style.display = 'block';
+            restartBtn.style.display = '';
         }
 
         var baselineTime = null;
@@ -974,6 +1011,7 @@ return view.extend({
                             ? _('Error: %s').format(data.error)
                             : (data && data.apps ? _('Error: aggregator too old (no rate data) - update trafficchart-agg and restart the service')
                                                  : _('Error: No data received. Is the trafficchart service running (/etc/init.d/trafficchart start)?'));
+                        restartBtn.style.display = '';
                     } else {
                         updateStaleIndicator();
                     }

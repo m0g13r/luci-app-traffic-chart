@@ -64,7 +64,6 @@ ip neigh show 2>/dev/null | awk '
         if (mac != "") print "I\t" v6full($1) "\t" mac
     }'
 
-# addresses of the router itself
 ip -o addr show 2>/dev/null | awk '
     function v6full(a,   n, h, lc, rc, lg, rg, i, g, out, miss) {
         if (index(a, ":") == 0) return a
@@ -84,10 +83,8 @@ ip -o addr show 2>/dev/null | awk '
     }
     { for (i = 1; i < NF; i++) if ($i == "inet" || $i == "inet6") { a = $(i + 1); sub(/\/.*/, "", a); print "R\t" v6full(a) } }'
 
-# dnsmasq leases: <expiry> <mac> <ip> <hostname> <clientid>
 [ -r /tmp/dhcp.leases ] && awk '$4 != "" && $4 != "*" { print "N\t" tolower($2) "\t" $4 }' /tmp/dhcp.leases
 
-# static hosts (config host: option name + option mac / list mac)
 command -v uci >/dev/null 2>&1 && uci -q show dhcp 2>/dev/null | awk -F"[.=]" '
     $1 == "dhcp" && $2 ~ /^@?host/ { sec = $2 }
     { line = $0; sub(/^[^=]*=/, "", line); gsub(/\047/, "", line) }
@@ -95,18 +92,6 @@ command -v uci >/dev/null 2>&1 && uci -q show dhcp 2>/dev/null | awk -F"[.=]" '
     $3 == "mac"  { split(line, m, " "); mac[$2] = tolower(m[1]) }
     END { for (s in mac) if (name[s] != "" && mac[s] != "") print "N\t" mac[s] "\t" name[s] }'
 
-# Static IP<->MAC mapping from /etc/config/dhcp, IN ADDITION to the live
-# neighbour table above. This is what actually fixes IPv6 devices "splitting
-# off": a "config host" section gives name+mac+ONE fixed IPv4 per device; a
-# "config domain" section (added by hand, or by LuCI's static-lease helper)
-# can list EVERY address ever seen for that device - the fixed IPv4 plus all
-# rotating IPv6 privacy addresses. The two sections are joined by their
-# SHARED fixed IPv4 address, not by name (names can differ, e.g. host "fire"
-# vs. domain "firestick", or even collide, e.g. two hosts both named
-# "player"), so every extra address in the domain list is mapped to the
-# host's mac permanently - no live resolution, no ping, no timing window.
-# Only helps for addresses that are ALREADY recorded in such a domain entry;
-# the active re-resolution (ping) above still covers brand new ones.
 command -v uci >/dev/null 2>&1 && uci -q show dhcp 2>/dev/null | awk '
     function val(l,   v) { v = l; sub(/^[^=]*=/, "", v); gsub(/\047/, "", v); return v }
     {
@@ -127,10 +112,6 @@ command -v uci >/dev/null 2>&1 && uci -q show dhcp 2>/dev/null | awk '
         }
     }
     END {
-        # index static "config host" sections by their fixed IPv4 address,
-        # and (only if the name is unambiguous - two hosts CAN share a name,
-        # see "player" above) by name too, as a fallback for domain entries
-        # that list no fixed IPv4 at all (e.g. "mipad" above)
         for (s in kind) {
             if (kind[s] != "host" || !(s in macval)) continue
             if (s in ipval) hostmac[ipval[s]] = macval[s]
@@ -140,10 +121,6 @@ command -v uci >/dev/null 2>&1 && uci -q show dhcp 2>/dev/null | awk '
                 else namemac[nm] = macval[s]
             }
         }
-        # every "config domain" section that shares one of those IPv4s in its
-        # address list: ALL its other addresses belong to that same mac.
-        # Falls back to an unambiguous name match (stripping a trailing
-        # ".lan") only when no IPv4 is shared at all.
         for (s in kind) {
             if (kind[s] != "domain" || !(s in ipval)) continue
             n = split(ipval[s], a, " ")

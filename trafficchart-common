@@ -195,10 +195,6 @@ tc_resolve() {
     TX_IFACE="${TX_DEVS%% *}"
     if [ "$BACKEND" = "nss" ]; then
         QTXT="tc qdisc, hw stats"
-        # NSS hardware offload runs offloaded flows in the NSS firmware/hardware
-        # fastpath, bypassing the kernel netdev xmit path, so the generic sysfs
-        # counters stay near zero even under full load. The nsstbl/nssfq_codel
-        # qdisc counters DO get updated from the hardware, hence tc.
         SYSNOTE=", unreliable under NSS offload"
     else
         QTXT="tc qdisc"

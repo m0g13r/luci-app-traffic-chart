@@ -25,9 +25,19 @@ case "$1" in
     list)
         # "history" is an optional parameter of get_stats (rather than a second
         # method) so no rpcd ACL change is needed for it
-        echo '{"get_stats": {"history": 1}}'
+        echo '{"get_stats": {"history": 1}, "restart": {}}'
         ;;
     call)
+        # rpcd exec protocol passes the method name as $2; "restart" needs the
+        # write ACL (luci-app-traffic-chart.json), get_stats only needs read.
+        if [ "$2" = "restart" ]; then
+            # detached: the init script stopping this very rpcd child must not
+            # block the ubus reply
+            ( /etc/init.d/trafficchart restart >/dev/null 2>&1 & )
+            echo '{"result": "restarting"}'
+            exit 0
+        fi
+
         # optional parameters arrive as JSON on stdin (rpcd exec plugin)
         PARAMS=""
         [ -t 0 ] || PARAMS=$(cat 2>/dev/null)

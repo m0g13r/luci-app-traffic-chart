@@ -5,6 +5,11 @@
             "ubus": {
                 "luci.trafficchart": [ "get_stats" ]
             }
+        },
+        "write": {
+            "ubus": {
+                "luci.trafficchart": [ "restart" ]
+            }
         }
     }
 }
