@@ -12,7 +12,7 @@ var callTrafficStats = rpc.declare({
 var callHistory = rpc.declare({
     object: 'luci.trafficchart',
     method: 'get_stats',
-    params: [ 'history' ],
+    params: [ 'history', 'tier' ],
     expect: { '': {} }
 });
 
@@ -624,17 +624,38 @@ return view.extend({
         }
 
         function makeHistoryView() {
-            var v = { active: false, loadedAt: 0 };
-            var st = { dim: 'a', dir: 'in', buckets: [] };
+            var v = { active: false, loadedAt: 0, persist: null };
+            // range -> which stored resolution it is drawn from, and how far back it reaches
+            var RANGES = [
+                { id: '24h',  label: _('24 hours'), tier: '5m', span: 86400 },
+                { id: '7d',   label: _('Week'),     tier: '1h', span: 7 * 86400 },
+                { id: '30d',  label: _('Month'),    tier: '1d', span: 30 * 86400 },
+                { id: '365d', label: _('Year'),     tier: '1d', span: 365 * 86400 }
+            ];
+            var REFRESH_MS = { '5m': 60000, '1h': 300000, '1d': 900000 };
+            var TIER_SEC = { '5m': 300, '1h': 3600, '1d': 86400 };
+            var st = { dim: 'a', dir: 'in', range: '24h', data: {} };   // data[tier] = buckets
             var chartHost = E('div', { style: 'width:100%;' });
+            var persistEl = E('div', { style: 'text-align:center; font-size:10.5px; color:var(--main-bright-color); margin-top:4px;' });
             var btnStyle = 'margin-right:6px;';
+            var rangeDefs = RANGES.map(function(r) { return [ r.id, r.label ]; });
             var dimDefs = [ ['a', _('Applications')], ['d', _('Devices')], ['h', _('Destinations')] ];
             var dirDefs = [ ['in', _('Download')], ['out', _('Upload')], ['both', _('Both')] ];
-            var dimBtns = [], dirBtns = [];
+            var rangeBtns = [], dimBtns = [], dirBtns = [];
+            function rangeDef() {
+                for (var i = 0; i < RANGES.length; i++) if (RANGES[i].id === st.range) return RANGES[i];
+                return RANGES[0];
+            }
             function mark() {
+                rangeBtns.forEach(function(b, i) { b.className = 'btn cbi-button' + (st.range === rangeDefs[i][0] ? ' cbi-button-apply' : ''); });
                 dimBtns.forEach(function(b, i) { b.className = 'btn cbi-button' + (st.dim === dimDefs[i][0] ? ' cbi-button-apply' : ''); });
                 dirBtns.forEach(function(b, i) { b.className = 'btn cbi-button' + (st.dir === dirDefs[i][0] ? ' cbi-button-apply' : ''); });
             }
+            rangeDefs.forEach(function(d) {
+                var b = E('button', { type: 'button', style: btnStyle }, d[1]);
+                b.addEventListener('click', function(e) { e.stopPropagation(); st.range = d[0]; mark(); render(); v.load(); });
+                rangeBtns.push(b);
+            });
             dimDefs.forEach(function(d) {
                 var b = E('button', { type: 'button', style: btnStyle }, d[1]);
                 b.addEventListener('click', function(e) { e.stopPropagation(); st.dim = d[0]; mark(); render(); });
@@ -647,8 +668,8 @@ return view.extend({
             });
             v.el = E('div', { style: 'width:100%; display:none;' }, [
                 E('div', { style: 'display:flex; gap:24px; flex-wrap:wrap; justify-content:center; margin-bottom:10px;' }, [
-                    E('div', {}, dimBtns), E('div', {}, dirBtns) ]),
-                chartHost ]);
+                    E('div', {}, rangeBtns), E('div', {}, dimBtns), E('div', {}, dirBtns) ]),
+                chartHost, persistEl ]);
 
             function colorOf(k) {
                 if (k === '(other)') return 'hsl(210,8%,62%)';
@@ -669,20 +690,104 @@ return view.extend({
             function hhmm(epoch) {
                 return new Date(epoch * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
             }
+            // axis label: time of day for one day, weekday + date for a week, date for longer
+            function tickLabel(epoch, span) {
+                var d = new Date(epoch * 1000);
+                if (span <= 2 * 86400) return hhmm(epoch);
+                if (span <= 8 * 86400) return d.toLocaleDateString([], { weekday: 'short', day: 'numeric', month: 'numeric' });
+                if (span <= 40 * 86400) return d.toLocaleDateString([], { day: 'numeric', month: 'short' });
+                return d.toLocaleDateString([], { month: 'short', year: 'numeric' });
+            }
+            // tooltip text of one column
+            function stampLabel(epoch, span) {
+                var d = new Date(epoch * 1000);
+                if (span <= 2 * 86400) return hhmm(epoch);
+                return d.toLocaleDateString([], { day: 'numeric', month: 'short' }) + ' ' + hhmm(epoch);
+            }
+            function medianDt(B) {
+                var a = B.map(function(b) { return b.dt || 0; }).filter(function(x) { return x > 0; }).sort(function(x, y) { return x - y; });
+                return a.length ? a[Math.floor(a.length / 2)] : 0;
+            }
+
+            // one line per storage target: what is saved where, and which target is not reachable
+            function persistLines() {
+                var p = v.persist, out = [];
+                if (!p) return out;
+                if (p.state === 'off')
+                    return [ _('Persistence is off: the history is kept in RAM only and is lost on reboot. Set a storage path under Network - Traffic Chart Settings.') ];
+                (p.targets || []).forEach(function(t) {
+                    var pend = t.pending ? ', ' + _('%d buckets not written yet').format(t.pending) : '';
+                    if (t.state === 'ok')
+                        out.push(_('Saved to %s (last write: %s%s).').format(t.dir, t.saved ? new Date(t.saved * 1000).toLocaleString() : _('not yet'), pend));
+                    else if (t.state === 'err')
+                        out.push(_('Writing to %s failed - retrying%s.').format(t.dir, pend));
+                    else
+                        out.push(_('%s is not available (yet) - it gets everything it missed as soon as it is back%s.').format(t.dir, pend));
+                });
+                out.push(_('Written every %d min to every available target; the history stays in RAM meanwhile.').format(Math.round((p.sec || 0) / 60)));
+                return out;
+            }
+            v.setPersist = function(p) {
+                v.persist = p;
+                var lines = persistLines(), targets = (p && p.targets) || [];
+                while (persistEl.firstChild) persistEl.removeChild(persistEl.firstChild);
+                lines.forEach(function(l, i) {
+                    var bad = (p && p.state !== 'off' && targets[i] && targets[i].state !== 'ok');
+                    persistEl.appendChild(E('div', { style: bad ? 'color:var(--danger-color);' : '' }, l));
+                });
+            };
 
             function render() {
                 while (chartHost.firstChild) chartHost.removeChild(chartHost.firstChild);
-                var B = st.buckets || [];
+                var R = rangeDef(), B = st.data[R.tier];
+                if (!B) {
+                    chartHost.appendChild(E('div', { style: 'text-align:center; color:var(--main-bright-color); padding:30px 0;' }, _('Loading...')));
+                    return;
+                }
                 if (!B.length) {
                     chartHost.appendChild(E('div', { style: 'text-align:center; color:var(--main-bright-color); padding:30px 0;' },
-                        _('No history yet - the first bucket is written 5 minutes after the aggregator started.')));
+                        R.tier === '5m' ? _('No history yet - the first bucket is written 5 minutes after the aggregator started.')
+                                        : _('No data for this range yet - hourly buckets are closed at the full hour, daily buckets at midnight (and when the service is stopped).')));
                     return;
                 }
                 var idx = st.dir === 'in' ? [0] : st.dir === 'out' ? [1] : [0, 1];
                 function val(e) { var t = 0; idx.forEach(function(i) { t += e[i] || 0; }); return t; }
 
+                // window: newest bucket backwards, but not before the first data that exists
+                var end = B[B.length - 1].t;
+                var first = B[0].t - (B[0].dt || 0);
+                var start = Math.max(end - R.span, first);
+                var sel = B.filter(function(b) { return b.t - (b.dt || 0) / 2 > start; });
+                if (!sel.length) sel = [ B[B.length - 1] ];
+
+                var W = Math.max(360, Math.round(chartHost.clientWidth || 900)), H = 264, pl = 84, pr = 10, pt = 10, pb = 26;
+                var pw = W - pl - pr, ph = H - pt - pb;
+
+                // Columns: at most one per 3 px, each a whole multiple of the bucket length, anchored
+                // at the newest bucket. Buckets of one column are summed, the rate is bytes / covered time.
+                var bl = medianDt(sel) || TIER_SEC[R.tier];
+                var maxCols = Math.max(20, Math.floor(pw / 3));
+                var m = Math.max(1, Math.ceil(((end - start) / maxCols) / bl - 0.01));
+                var colw = m * bl;
+                var ncols = Math.max(1, Math.ceil((end - start) / colw));
+                var t0 = end - ncols * colw;
+                var cols = [];
+                for (var ci0 = 0; ci0 < ncols; ci0++) cols.push({ dt: 0, src: {} });
+                sel.forEach(function(b) {
+                    var mid = b.t - (b.dt || 0) / 2;
+                    var ci = ncols - 1 - Math.floor((end - mid) / colw);
+                    if (ci < 0) ci = 0;
+                    if (ci > ncols - 1) ci = ncols - 1;
+                    var c = cols[ci], src = b[st.dim] || {};
+                    c.dt += b.dt || 0;
+                    Object.keys(src).forEach(function(k) {
+                        var s = c.src[k] || (c.src[k] = [0, 0]);
+                        s[0] += src[k][0] || 0; s[1] += src[k][1] || 0;
+                    });
+                });
+
                 var totals = {}, names = {};
-                B.forEach(function(b) {
+                sel.forEach(function(b) {
                     var src = b[st.dim] || {};
                     Object.keys(src).forEach(function(k) {
                         totals[k] = (totals[k] || 0) + val(src[k]);
@@ -694,21 +799,19 @@ return view.extend({
                 var series = shown.slice();
                 if (rest.length) series.push('__rest');
 
-                var cols = B.map(function(b) {
-                    var dt = b.dt || 300, src = b[st.dim] || {}, out = {}, tot = 0;
+                cols.forEach(function(c) {
+                    var out = {}, tot = 0;
                     series.forEach(function(k) { out[k] = 0; });
-                    Object.keys(src).forEach(function(k) {
-                        var mbit = val(src[k]) * 8 / dt / 1e6;
+                    Object.keys(c.src).forEach(function(k) {
+                        var mbit = c.dt > 0 ? val(c.src[k]) * 8 / c.dt / 1e6 : 0;
                         var key = (shown.indexOf(k) >= 0) ? k : '__rest';
                         out[key] = (out[key] || 0) + mbit;
                     });
                     series.forEach(function(k) { tot += out[k] || 0; });
-                    return { b: b, v: out, total: tot };
+                    c.v = out; c.total = tot;
                 });
                 var maxv = niceMax(Math.max.apply(null, cols.map(function(c) { return c.total; }).concat([0.001])));
 
-                var W = Math.max(360, Math.round(chartHost.clientWidth || 900)), H = 264, pl = 84, pr = 10, pt = 10, pb = 26;
-                var pw = W - pl - pr, ph = H - pt - pb;
                 var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H, width: '100%', style: 'display:block;' });
                 for (var g = 0; g <= 4; g++) {
                     var y = pt + ph - (ph * g / 4);
@@ -718,6 +821,7 @@ return view.extend({
                     svg.appendChild(lbl);
                 }
                 var bw = pw / cols.length;
+                var gap = bw >= 6 ? bw * 0.1 : (bw >= 3 ? 0.4 : 0);
                 cols.forEach(function(c, ci) {
                     var acc = 0;
                     series.forEach(function(k) {
@@ -725,21 +829,21 @@ return view.extend({
                         if (vv <= 0) return;
                         var h = ph * vv / maxv, y = pt + ph - ph * (acc + vv) / maxv;
                         var name = k === '__rest' ? _('Other (%d)').format(rest.length) : (st.dim === 'd' ? (names[k] || k) : k);
-                        var r = svgEl('rect', { x: pl + ci * bw + bw * 0.1, y: y, width: Math.max(bw * 0.8, 1), height: Math.max(h, 0.5), fill: k === '__rest' ? 'hsl(210,8%,62%)' : colorOf(k) });
+                        var r = svgEl('rect', { x: pl + ci * bw + gap, y: y, width: Math.max(bw - 2 * gap, 1), height: Math.max(h, 0.5), fill: k === '__rest' ? 'hsl(210,8%,62%)' : colorOf(k) });
                         var t = svgEl('title', {});
-                        t.textContent = hhmm(c.b.t) + '  ' + name + ': ' + formatRate(vv * 1e6);
+                        t.textContent = stampLabel(t0 + ci * colw, R.span) + ' - ' + stampLabel(t0 + (ci + 1) * colw, R.span) + '  ' + name + ': ' + formatRate(vv * 1e6);
                         r.appendChild(t);
                         svg.appendChild(r);
                         acc += vv;
                     });
                 });
-                var ticks = [0, Math.floor((cols.length - 1) / 2), cols.length - 1];
-                ticks.forEach(function(ci, n) {
-                    if (n > 0 && ci === ticks[n - 1]) return;
-                    var tx = svgEl('text', { x: pl + ci * bw + bw / 2, y: H - 9, 'text-anchor': n === 0 ? 'start' : (n === ticks.length - 1 ? 'end' : 'middle'), style: AXIS_TEXT_STYLE });
-                    tx.textContent = hhmm(cols[ci].b.t);
+                var nt = 5;
+                for (var n = 0; n < nt; n++) {
+                    var fr = n / (nt - 1);
+                    var tx = svgEl('text', { x: pl + fr * pw, y: H - 9, 'text-anchor': n === 0 ? 'start' : (n === nt - 1 ? 'end' : 'middle'), style: AXIS_TEXT_STYLE });
+                    tx.textContent = tickLabel(t0 + fr * (end - t0), end - t0);
                     svg.appendChild(tx);
-                });
+                }
                 chartHost.appendChild(svg);
 
                 var legend = E('div', { style: 'display:flex; flex-wrap:wrap; gap:4px 18px; justify-content:center; margin-top:8px; font-size:11.5px;' });
@@ -751,8 +855,10 @@ return view.extend({
                 if (rest.length) legend.appendChild(E('span', {}, [
                     E('span', { style: 'display:inline-block; width:11px; height:11px; border-radius:3px; margin-right:5px; background:hsl(210,8%,62%);' }), _('Other (%d)').format(rest.length) ]));
                 chartHost.appendChild(legend);
+
+                var colTxt = colw >= 86400 ? _('%.1f days').format(colw / 86400) : colw >= 3600 ? _('%.1f h').format(colw / 3600) : _('%d min').format(Math.round(colw / 60));
                 chartHost.appendChild(E('div', { style: 'text-align:center; font-size:10.5px; color:var(--main-bright-color); margin-top:6px;' },
-                    _('Average rate per 5 minute bucket, last 24 h (kept in RAM by the aggregator, lost on reboot).')));
+                    _('Average rate per column (%s), %s - %s.').format(colTxt, new Date(t0 * 1000).toLocaleString(), new Date(end * 1000).toLocaleString())));
             }
             v.render = render;
             var resizeTimer = null;
@@ -761,15 +867,18 @@ return view.extend({
                 clearTimeout(resizeTimer);
                 resizeTimer = setTimeout(render, 150);
             });
+            v.stale = function() { return Date.now() - v.loadedAt > REFRESH_MS[rangeDef().tier]; };
             v.load = function() {
+                var tier = rangeDef().tier;
                 v.loadedAt = Date.now();
-                return callHistory(1).then(function(d) {
-                    st.buckets = (d && d.buckets) ? d.buckets : [];
+                return callHistory(1, tier).then(function(d) {
+                    st.data[tier] = (d && d.buckets) ? d.buckets : [];
                     render();
                 }).catch(function() {});
             };
             mark();
             render();
+            v.setPersist(null);
             return v;
         }
 
@@ -992,7 +1101,7 @@ return view.extend({
             if (pollInFlight) return Promise.resolve();
             pollInFlight = true;
 
-            if (histView.active && Date.now() - histView.loadedAt > 60000) histView.load();
+            if (histView.active && histView.stale()) histView.load();
 
             var watchdog = setTimeout(function() {
                 pollInFlight = false;
@@ -1047,6 +1156,7 @@ return view.extend({
                 shaperUpdate(data.shaper, dt);
                 l2Update(rateInfo);
                 lastData = data;
+                histView.setPersist(data.persist || null);
 
                 mountChartOnce(data);
 

@@ -18,14 +18,19 @@
 # poll. Per-flow deltas fix both. See the header of trafficchart-agg.
 AGG_FILE="/tmp/trafficchart/classes.json"
 # AGG_MAX_AGE (seconds; older = daemon dead/hung) is read from the config in "call"
-HIST_FILE="/tmp/trafficchart/history.json"
+HIST_DIR="${TC_OUT_DIR:-/tmp/trafficchart}"
+# history.json = 5 min buckets, history_1h.json = hourly, history_1d.json = daily
+# (RAM mirrors written by the daemon, which also reloads them from the persistent
+# storage after a reboot - this script never touches the persistent path itself)
+HIST_MAX=600   # never return more buckets than this (ubus messages are limited to 1 MB)
 
 
 case "$1" in
     list)
         # "history" is an optional parameter of get_stats (rather than a second
-        # method) so no rpcd ACL change is needed for it
-        echo '{"get_stats": {"history": 1}, "restart": {}}'
+        # method) so no rpcd ACL change is needed for it. "tier" (5m | 1h | 1d)
+        # selects the resolution, "n" limits the answer to the newest n buckets.
+        echo '{"get_stats": {"history": 1, "tier": "5m", "n": 1}, "restart": {}}'
         ;;
     call)
         # rpcd exec protocol passes the method name as $2; "restart" needs the
@@ -43,9 +48,26 @@ case "$1" in
         [ -t 0 ] || PARAMS=$(cat 2>/dev/null)
         case "$PARAMS" in
             *'"history"'*)
-                # get_stats {"history":1} -> the daemon's 24 h history buckets
+                # get_stats {"history":1,"tier":"1h","n":200} -> newest n buckets of that tier
+                TIER=$(echo "$PARAMS" | sed -n 's/.*"tier" *: *"\([a-z0-9]*\)".*/\1/p')
+                HN=$(echo "$PARAMS" | sed -n 's/.*"n" *: *\([0-9][0-9]*\).*/\1/p')
+                case "$TIER" in
+                    1h) HIST_FILE="$HIST_DIR/history_1h.json" ;;
+                    1d) HIST_FILE="$HIST_DIR/history_1d.json" ;;
+                    *)  HIST_FILE="$HIST_DIR/history.json"; TIER=5m ;;
+                esac
+                case "$HN" in ''|*[!0-9]*|0) HN=$HIST_MAX ;; esac
+                [ "$HN" -gt "$HIST_MAX" ] && HN=$HIST_MAX
                 if [ -r "$HIST_FILE" ]; then
-                    printf '{"buckets":'; cat "$HIST_FILE"; printf '}\n'
+                    # file = JSON array, one bucket per line; keep the newest HN
+                    awk -v N="$HN" -v TIER="$TIER" '
+                        /^\{/ { sub(/,$/, ""); b[++c] = $0 }
+                        END {
+                            s = c - N + 1; if (s < 1) s = 1
+                            printf "{\"tier\":\"%s\",\"buckets\":[", TIER
+                            for (i = s; i <= c; i++) printf "%s%s", (i > s ? "," : ""), b[i]
+                            print "]}"
+                        }' "$HIST_FILE"
                 else
                     echo '{"buckets":[]}'
                 fi
