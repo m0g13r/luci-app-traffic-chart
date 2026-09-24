@@ -191,29 +191,47 @@ TC_COMMON="${TC_COMMON:-/usr/libexec/trafficchart-common}"
 if [ -r "$TC_COMMON" ]; then
     . "$TC_COMMON"
     tc_cfg PROFILE low-cpu string
+    PROFILE_INTERVAL=2
+    PROFILE_ADAPT_INTERVAL=1
+    PROFILE_INTERVAL_MAX=10
+    PROFILE_ADAPT_BUDGET=0.30
+    PROFILE_TOOLTIP_EVERY=0
+    PROFILE_HOSTS_REFRESH_SEC=60
+    PROFILE_GUA_REFRESH_SEC=120
+    PROFILE_RATE_WIN=10
+    PROFILE_BULK_BYTES=314572800
     case "$PROFILE" in
         balanced)
-            tc_cfg INTERVAL 2 int;            tc_cfg ADAPT_INTERVAL 1 int;     tc_cfg INTERVAL_MAX 10 int
-            tc_cfg ADAPT_BUDGET 0.30 num;     tc_cfg TOOLTIP_EVERY 0 int;       tc_cfg HOSTS_REFRESH_SEC 60 int
-            tc_cfg GUA_REFRESH_SEC 120 int;   tc_cfg RATE_WIN 10 int;           tc_cfg BULK_BYTES 314572800 int
+            PROFILE_INTERVAL=2;            PROFILE_ADAPT_INTERVAL=1;     PROFILE_INTERVAL_MAX=10
+            PROFILE_ADAPT_BUDGET=0.30;     PROFILE_TOOLTIP_EVERY=0;      PROFILE_HOSTS_REFRESH_SEC=60
+            PROFILE_GUA_REFRESH_SEC=120;   PROFILE_RATE_WIN=10;          PROFILE_BULK_BYTES=314572800
             ;;
         low-cpu)
-            tc_cfg INTERVAL 4 int;            tc_cfg ADAPT_INTERVAL 1 int;     tc_cfg INTERVAL_MAX 20 int
-            tc_cfg ADAPT_BUDGET 0.45 num;     tc_cfg TOOLTIP_EVERY 2 int;       tc_cfg HOSTS_REFRESH_SEC 180 int
-            tc_cfg GUA_REFRESH_SEC 300 int;   tc_cfg RATE_WIN 10 int;           tc_cfg BULK_BYTES 314572800 int
+            PROFILE_INTERVAL=4;            PROFILE_ADAPT_INTERVAL=1;     PROFILE_INTERVAL_MAX=20
+            PROFILE_ADAPT_BUDGET=0.45;     PROFILE_TOOLTIP_EVERY=2;      PROFILE_HOSTS_REFRESH_SEC=180
+            PROFILE_GUA_REFRESH_SEC=300;   PROFILE_RATE_WIN=10;          PROFILE_BULK_BYTES=314572800
             ;;
         very-low-cpu)
-            tc_cfg INTERVAL 6 int;            tc_cfg ADAPT_INTERVAL 1 int;     tc_cfg INTERVAL_MAX 30 int
-            tc_cfg ADAPT_BUDGET 0.55 num;     tc_cfg TOOLTIP_EVERY 3 int;       tc_cfg HOSTS_REFRESH_SEC 300 int
-            tc_cfg GUA_REFRESH_SEC 600 int;   tc_cfg RATE_WIN 10 int;           tc_cfg BULK_BYTES 314572800 int
+            PROFILE_INTERVAL=6;            PROFILE_ADAPT_INTERVAL=1;     PROFILE_INTERVAL_MAX=30
+            PROFILE_ADAPT_BUDGET=0.55;     PROFILE_TOOLTIP_EVERY=3;      PROFILE_HOSTS_REFRESH_SEC=300
+            PROFILE_GUA_REFRESH_SEC=600;   PROFILE_RATE_WIN=10;          PROFILE_BULK_BYTES=314572800
             ;;
         *)
             PROFILE=balanced
-            tc_cfg INTERVAL 2 int;            tc_cfg ADAPT_INTERVAL 1 int;     tc_cfg INTERVAL_MAX 10 int
-            tc_cfg ADAPT_BUDGET 0.30 num;     tc_cfg TOOLTIP_EVERY 0 int;       tc_cfg HOSTS_REFRESH_SEC 60 int
-            tc_cfg GUA_REFRESH_SEC 120 int;   tc_cfg RATE_WIN 10 int;           tc_cfg BULK_BYTES 314572800 int
+            PROFILE_INTERVAL=2;            PROFILE_ADAPT_INTERVAL=1;     PROFILE_INTERVAL_MAX=10
+            PROFILE_ADAPT_BUDGET=0.30;     PROFILE_TOOLTIP_EVERY=0;      PROFILE_HOSTS_REFRESH_SEC=60
+            PROFILE_GUA_REFRESH_SEC=120;   PROFILE_RATE_WIN=10;          PROFILE_BULK_BYTES=314572800
             ;;
     esac
+    tc_cfg INTERVAL "$PROFILE_INTERVAL" int
+    tc_cfg ADAPT_INTERVAL "$PROFILE_ADAPT_INTERVAL" int
+    tc_cfg INTERVAL_MAX "$PROFILE_INTERVAL_MAX" int
+    tc_cfg ADAPT_BUDGET "$PROFILE_ADAPT_BUDGET" num
+    tc_cfg TOOLTIP_EVERY "$PROFILE_TOOLTIP_EVERY" int
+    tc_cfg HOSTS_REFRESH_SEC "$PROFILE_HOSTS_REFRESH_SEC" int
+    tc_cfg GUA_REFRESH_SEC "$PROFILE_GUA_REFRESH_SEC" int
+    tc_cfg RATE_WIN "$PROFILE_RATE_WIN" int
+    tc_cfg BULK_BYTES "$PROFILE_BULK_BYTES" int
     tc_cfg HIST_SEC 300 int;          tc_cfg HIST_KEEP 288 int
     tc_cfg HIST_HOUR_KEEP 192 int;    tc_cfg HIST_DAY_KEEP 400 int
     tc_cfg PERSIST_DIR "";            tc_cfg PERSIST_MOUNT "";         tc_cfg PERSIST_SEC 3600 int
@@ -235,14 +253,6 @@ fi
 CT_FILE="${CT_FILE:-/proc/net/nf_conntrack}"
 OUT_DIR="${OUT_DIR:-/tmp/trafficchart}"
 export OUT_DIR   # trafficchart-hosts (spawned via awk's pipe) needs this to find unresolved_v6
-INTERVAL="${INTERVAL:-2}"
-ADAPT_INTERVAL="${ADAPT_INTERVAL:-1}"
-INTERVAL_MAX="${INTERVAL_MAX:-10}"
-ADAPT_BUDGET="${ADAPT_BUDGET:-0.30}"
-TOOLTIP_EVERY="${TOOLTIP_EVERY:-0}"
-HOSTS_REFRESH_SEC="${HOSTS_REFRESH_SEC:-60}"
-GUA_REFRESH_SEC="${GUA_REFRESH_SEC:-120}"
-BULK_BYTES="${BULK_BYTES:-314572800}"
 V6HELPER="${V6HELPER:-/usr/libexec/trafficchart-v6prefixes}"
 AWK="${AWK:-awk}"
 APP_HOLD="${APP_HOLD:-3}"
@@ -256,21 +266,13 @@ ATTR_WIN="${ATTR_WIN:-60}"   # seconds: window in which router WAN volume and cl
 # LAN->router flows to these destination ports are infrastructure (SSH, DNS, DHCP,
 # NTP, DoT, mDNS/LLMNR, LuCI on 80/443) and never count as "device is being served
 # by a router service". Remove 80/443 if the stream proxy itself listens there.
-ATTR_SKIP_PORTS="${ATTR_SKIP_PORTS:-22 53 67 68 80 123 443 853 5353 5355}"
+# ATTR_SKIP_PORTS was loaded above.
 # Stricter: if set, ONLY LAN->router flows to these ports count (ATTR_SKIP_PORTS is then ignored).
 # Port of the stream proxy on the router; empty = every port except ATTR_SKIP_PORTS.
-ATTR_PORTS="${ATTR_PORTS:-9999}"
-ATTR_TOTALS="${ATTR_TOTALS:-1}"   # 1 (default) = credit router WAN traffic of proxy streams to the devices that are served (device totals, shown as one "Proxy-Stream (via Router)" row); 0 = off
-ATTR_TOPAPPS="${ATTR_TOPAPPS:-0}"   # 1 = the proxy row of a device carries the real application name of the router flow (default 0: generic "Proxy-Stream (via Router)")
-RATE_WIN="${RATE_WIN:-10}"        # seconds: averaging window of all rates
-UN_WIN="${UN_WIN:-30}"            # seconds: window of the "not attributed" estimate (slower on purpose: the two counters do not tick in the same instant)
+ # ATTR_PORTS, ATTR_TOTALS, ATTR_TOPAPPS, RATE_WIN and UN_WIN were loaded above.
 TC_HELPER="${TC_HELPER:-/usr/libexec/trafficchart-tc}"   # prints "<rx_bytes> <tx_bytes> <rx_drop> <rx_ecn> <tx_drop> <tx_ecn>" of the shapers; without it the page falls back to browser side rates and no shaper history
 [ -x "$TC_HELPER" ] || TC_HELPER=""   # not installed: no link rate, the page falls back to browser side rates
-ATTR_TOL="${ATTR_TOL:-0.6}"       # max. relative volume difference between router application and device for a pairing (0..1)
-ATTR_MIN="${ATTR_MIN:-262144}"     # bytes: a router application below this volume in the window is never attributed
-ATTR_SHARE="${ATTR_SHARE:-0.25}"   # ...nor one below this share of the router's total WAN volume (background traffic stays on "Router")
-ATTR_MAX_APPS="${ATTR_MAX_APPS:-64}"       # largest router applications considered by attribution; 0 = unlimited
-ATTR_MAX_DEVICES="${ATTR_MAX_DEVICES:-64}" # largest delivered-to devices considered by attribution; 0 = unlimited
+ # ATTR_TOL, ATTR_MIN, ATTR_SHARE, ATTR_MAX_APPS and ATTR_MAX_DEVICES were loaded above.
 # Bytes per packet that the shaper (tc) counts but conntrack does not: the link layer
 # header (Ethernet 14, +4 VLAN, +8 PPPoE). Without this the "not attributed" estimate
 # is dominated by it wherever packets are small (the upload of a download is almost
@@ -289,29 +291,11 @@ ATTR_MAX_DEVICES="${ATTR_MAX_DEVICES:-64}" # largest delivered-to devices consid
 #                   until CAL_MIN windows are available.
 #   <number>        fixed bytes per packet (0 = old behaviour: everything shows up as
 #                   "not attributed")
-L2_OVERHEAD="${L2_OVERHEAD:-auto}"
 case "$L2_OVERHEAD" in auto|[0-9]|[0-9][0-9]) ;; *) L2_OVERHEAD=auto ;; esac
-L2_INIT="${L2_INIT:-18}"
-L2_CANDIDATES="${L2_CANDIDATES:-0 14 18 22 26}"   # 0 = no link header (tun/ppp device), 14 Ethernet, 18 +VLAN, 22 +PPPoE, 26 +PPPoE+VLAN
-CAL_TOL="${CAL_TOL:-1}"             # bytes: tolerance when flooring the measurement to a candidate
-CAL_WIN="${CAL_WIN:-30}"            # seconds per calibration window
-CAL_KEEP="${CAL_KEEP:-60}"          # windows kept (60 x 30 s = 30 min)
-CAL_MIN="${CAL_MIN:-8}"             # windows needed before the measurement replaces L2_INIT
-CAL_PCTL="${CAL_PCTL:-25}"          # percentile of the windows that is taken as the header size
-CAL_MAX_PKT="${CAL_MAX_PKT:-400}"   # bytes: only windows with a smaller mean packet size count
-CAL_MIN_PKTS="${CAL_MIN_PKTS:-500}" # ...and at least this many packets
-UN_WIN_RX="${UN_WIN_RX:-60}"        # seconds: window of the download "not attributed" estimate (the ECM/NSS counter sync of big downloads jitters more than the small upload packets)
-APP_MAX="${APP_MAX:-400}"           # applications kept (further ones are summed as "(other)")
-MX_MAX="${MX_MAX:-8000}"            # entries per tooltip matrix (application x destination, destination x device)
-PAIR_MAX="${PAIR_MAX:-4096}"        # entries of the device x application matrix
-TBL_IDLE_LONG="${TBL_IDLE_LONG:-3600}"    # seconds: when such a table is full, entries idle this long are dropped first ...
-TBL_IDLE_SHORT="${TBL_IDLE_SHORT:-600}"   # ... and if that is not enough, entries idle this long
+ # L2_INIT, L2_CANDIDATES, calibration settings, UN_WIN_RX and table limits were loaded above.
 
 # --- persistent history: validate the settings (they end up in shell commands of the daemon) ---
-PERSIST_DIR="${PERSIST_DIR:-}"; PERSIST_MOUNT="${PERSIST_MOUNT:-}"
-PERSIST_SEC="${PERSIST_SEC:-3600}"
-HOST_MAX="${HOST_MAX:-200}"   # distinct destinations kept individually (JSON size grows with it)
-HIST_HOUR_KEEP="${HIST_HOUR_KEEP:-192}"; HIST_DAY_KEEP="${HIST_DAY_KEEP:-400}"
+ # Persistent/history settings and HOST_MAX were loaded above.
 HOUR_SEC="${HOUR_SEC:-3600}"; DAY_SEC="${DAY_SEC:-86400}"
 # PERSIST_DIR and PERSIST_MOUNT are space separated lists of absolute paths (letters, digits and
 # . _ - / only, no trailing slash); an invalid entry is dropped and logged
@@ -335,7 +319,6 @@ PERSIST_DIR=$(_clean "$PERSIST_DIR")
 PERSIST_MOUNT=$(_clean "$PERSIST_MOUNT")
 # every access to a target (a NAS may hang) runs under "timeout"; TOUT4 = shorter one used
 # while the service is being stopped
-PERSIST_TIMEOUT="${PERSIST_TIMEOUT:-10}"
 case "$PERSIST_TIMEOUT" in ''|*[!0-9]*) PERSIST_TIMEOUT=10 ;; esac
 [ "$PERSIST_TIMEOUT" -ge 3 ] || PERSIST_TIMEOUT=3
 [ "$PERSIST_TIMEOUT" -le 120 ] || PERSIST_TIMEOUT=120
