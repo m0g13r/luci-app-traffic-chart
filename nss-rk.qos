@@ -59,11 +59,10 @@ STATE_FILE="${SQM_STATE_DIR}/${IFACE}.state"
 
 # Kernel 5.10 frequently crashes when nssifb is deleted; on 5.15 the qdisc only
 # works on the first attach, so nssifb has to be deleted there.
-if [[ "$(uname -r)" != *"5.10"* ]]; then
-   DELETENSSIFB=1
-else
-   sqm_debug "Kernel version 5.10 found, will not delete nssifb on reload/stop"
-fi
+case "$(uname -r)" in
+  *5.10*) sqm_debug "Kernel version 5.10 found, will not delete nssifb on reload/stop" ;;
+  *) DELETENSSIFB=1 ;;
+esac
 
 # Waits (max ~2 min) until the WAN interface has an IPv4 or IPv6 address.
 # Never blocks forever: on timeout it warns and lets SQM start anyway.
@@ -430,27 +429,29 @@ add_nssfq_codel() {
   # codel interval (settable via eqdisc_opts): should be the "worst case"
   # latency to your services; 100ms works unless the link is so slow that
   # target > interval (you would not use NSS then).
-  if [[ "${QDISC_OPTS}" != *"interval"* ]]; then
-    sqm_debug "add_nssfq_codel $IF: No interval specified, defaulting to 100ms"
-    QDISC_OPTS="interval 100ms ${QDISC_OPTS}"
-  fi
+  case "${QDISC_OPTS}" in
+    *interval*) ;;
+    *) sqm_debug "add_nssfq_codel $IF: No interval specified, defaulting to 100ms"; QDISC_OPTS="interval 100ms ${QDISC_OPTS}" ;;
+  esac
 
   # Quantum = bytes dequeued at once. At MTU all packets weigh the same; a
   # smaller quantum favours small packets. Below 100 Mbit that helps, so use ~MTU/5.
   # https://www.bufferbloat.net/projects/codel/wiki/Best_practices_for_benchmarking_Codel_and_FQ_Codel/
-  if [[ "${QDISC_OPTS}" != *"quantum"* ]]; then
-    let QUANTUM=MTU
-    if [ ${SPEED} -lt 100000 ]; then
-      let QUANTUM/=5
-      let QUANTUM+=1
-    fi
-    QDISC_OPTS="`get_quantum ${QUANTUM}` ${QDISC_OPTS}"
-  fi
+  case "${QDISC_OPTS}" in
+    *quantum*) ;;
+    *) let QUANTUM=MTU
+       if [ ${SPEED} -lt 100000 ]; then
+         let QUANTUM/=5
+         let QUANTUM+=1
+       fi
+       QDISC_OPTS="`get_quantum ${QUANTUM}` ${QDISC_OPTS}" ;;
+  esac
 
   # number of flow buckets, required by nssfq_codel
-  if [[ "${QDISC_OPTS}" != *"flows"* ]]; then
-    QDISC_OPTS="flows 1024 ${QDISC_OPTS}"
-  fi
+  case "${QDISC_OPTS}" in
+    *flows*) ;;
+    *) QDISC_OPTS="flows 1024 ${QDISC_OPTS}" ;;
+  esac
 
   $TC qdisc add dev $IF parent 1: handle 10: nssfq_codel `get_limit $LIMIT` `get_target ${TARGET} ${SPEED}` ${QDISC_OPTS} set_default || return 1
   return 0

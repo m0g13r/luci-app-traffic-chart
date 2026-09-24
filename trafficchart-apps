@@ -121,10 +121,10 @@ run_reader() {
         if (--kref[k] <= 0) { delete kref[k]; dead[k] = now; deadflag = 1 }
     }
     {
-        if (index($0, "\"type\":\"flow\"}")) {
+        if (index($0, "\"type\":\"flow\"")) {
             now = jnum($0, "last_seen_at"); if (now < 0) now = lastflush
             on_flow($0)
-        } else if (index($0, "\"type\":\"flow_purge\"}")) {
+        } else if (index($0, "\"type\":\"flow_purge\"")) {
             now = jnum($0, "last_seen_at"); if (now < 0) now = lastflush
             on_purge($0)
         } else if (index($0, "\"type\":\"agent_status\"")) {
