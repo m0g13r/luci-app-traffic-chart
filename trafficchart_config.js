@@ -29,8 +29,12 @@ return view.extend({
         o.value('generic', _('Generic (cake / htb+fq_codel)'));
         o.default = 'auto';
 
-        o = s.option(form.DummyValue, 'preset', _('Preset'),
-            _('Low CPU profile (default): app names stay enabled, polling starts at 4s and stretches up to 20s, with slower host and IPv6 refreshes.'));
+        o = s.option(form.ListValue, 'profile', _('Profile'),
+            _('Preset tuning profile. The selected profile sets the low-level timing values, but you can still override any of them individually.'));
+        o.value('balanced', _('Balanced'));
+        o.value('low-cpu', _('Low CPU'));
+        o.value('very-low-cpu', _('Very low CPU'));
+        o.default = 'low-cpu';
 
         o = s.option(form.Value, 'interval', _('Poll interval'), _('Seconds between conntrack passes (starting point; auto-stretches under load, see below).'));
         o.datatype = 'uinteger';
