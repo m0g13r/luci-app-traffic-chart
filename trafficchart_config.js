@@ -29,9 +29,13 @@ return view.extend({
         o.value('generic', _('Generic (cake / htb+fq_codel)'));
         o.default = 'auto';
 
+        o = s.option(form.DummyValue, 'preset', _('Preset'),
+            _('Low CPU profile (default): app names stay enabled, polling starts at 4s and stretches up to 20s, with slower host and IPv6 refreshes.'));
+
         o = s.option(form.Value, 'interval', _('Poll interval'), _('Seconds between conntrack passes (starting point; auto-stretches under load, see below).'));
         o.datatype = 'uinteger';
-        o.placeholder = '2';
+        o.placeholder = '4';
+        o.default = '4';
 
         o = s.option(form.Flag, 'adapt_interval', _('Adaptive interval'),
             _('Auto-stretch the poll interval once processing time grows into a meaningful share of the cycle, and ease it back down again.'));
@@ -39,8 +43,29 @@ return view.extend({
 
         o = s.option(form.Value, 'interval_max', _('Max interval'), _('Seconds: ceiling for the auto-stretched interval.'));
         o.datatype = 'uinteger';
-        o.placeholder = '10';
+        o.placeholder = '20';
+        o.default = '20';
         o.depends('adapt_interval', '1');
+
+        o = s.option(form.Value, 'adapt_budget', _('Adapt budget'), _('Fraction of the polling cycle the daemon may spend before stretching the interval.'));
+        o.datatype = 'string';
+        o.placeholder = '0.45';
+        o.default = '0.45';
+
+        o = s.option(form.Value, 'hosts_refresh_sec', _('Host refresh'), _('Seconds between neighbour/DHCP/host table refreshes.'));
+        o.datatype = 'uinteger';
+        o.placeholder = '180';
+        o.default = '180';
+
+        o = s.option(form.Value, 'gua_refresh_sec', _('IPv6 prefix refresh'), _('Seconds between LAN IPv6 GUA prefix re-detection.'));
+        o.datatype = 'uinteger';
+        o.placeholder = '300';
+        o.default = '300';
+
+        o = s.option(form.Value, 'tooltip_every', _('Tooltip refresh'), _('How often the tooltip matrices are rebuilt. 2 polls is a good low-CPU default for busy routers.'));
+        o.datatype = 'uinteger';
+        o.placeholder = '2';
+        o.default = '2';
 
         o = s.option(form.Value, 'bulk_bytes', _('Bulk threshold'),
             _('Bytes: a WEB/P2P/BE flow above this size is shown as BULK. Shared with nss-rk.qos ' +
