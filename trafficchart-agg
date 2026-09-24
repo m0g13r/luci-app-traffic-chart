@@ -87,9 +87,21 @@
 #   5m  every HIST_SEC seconds (default 300)       HIST_KEEP       buckets (288 = 24 h)
 #   1h  every full local hour                      HIST_HOUR_KEEP  buckets (192 = 8 days)
 #   1d  every local midnight                       HIST_DAY_KEEP   buckets (400 days)
-# Each bucket holds the deltas of the top applications / devices / destinations.
+# Each bucket holds the deltas of the top applications / devices / destinations,
+# plus the shaper's dropped/ECN packet deltas of that period (see "sh" below).
 # They are kept in RAM and mirrored to $OUT_DIR/history.json, history_1h.json,
 # history_1d.json (reloaded when the daemon restarts).
+#
+# Shaper health in the history ("sh" key of each bucket, {"rx":[drop,ecn,peak_backlog_bytes],"tx":[...]}):
+# (the backlog is momentary, so each open bucket keeps the highest value seen at a poll)
+# trafficchart-tc additionally prints the shaper qdiscs' CUMULATIVE dropped-packet
+# and ECN-mark counters (tc_shaper_drops() in trafficchart-common), read in the
+# same loop iteration as the byte counters (tc_update() below). This daemon turns
+# them into per-poll deltas the same way tc bytes become tc_rx_rate/tc_tx_rate,
+# and hist_close() turns the running per-poll sums into a per-bucket delta the
+# same way it already does for aib/aob etc. A history full of application/device
+# byte totals but no idea when the link was actually congested (drops, ECN) was
+# the main thing "lost" in the old History tab - this puts it back.
 #
 # Persistence (option persist_dir, empty = off): the buckets are additionally appended
 # to PERSIST_DIR/history-{5m,1h,1d}.jsonl every PERSIST_SEC seconds (only the new
@@ -106,6 +118,17 @@
 # nothing is lost on a clean stop; a power failure loses at most PERSIST_SEC seconds
 # plus the open bucket.
 # Bucket boundaries of 1h / 1d are only used while the clock is plausible.
+#
+# History reset (reset.req, separate from a service restart): luci.trafficchart's
+# "reset_history" ubus call touches $OUT_DIR/reset.req. This daemon checks for it once
+# per poll (same mechanism as stop.req) and, if present, clears the cumulative
+# application/device/destination/shaper totals and the in-RAM history of all three
+# tiers (see hist_reset()), then keeps running - no procd bounce, no re-attaching of
+# persistence targets, live per-flow tracking (and so the "top flows" list) is
+# unaffected. Buckets already written to a persistent storage path are left alone
+# (only the RAM view is cleared); delete those files yourself if you also want the
+# on-disk archive gone. Before this, the only way to reset the totals shown on the
+# page was "Restart service", which also bounces the whole daemon.
 #
 # Router-originated traffic (e.g. a stream proxy running on the router):
 # such flows have the router as source, so they used to be ignored, while
@@ -161,7 +184,7 @@
 # HOUR_SEC DAY_SEC (tier lengths, testing only) TC_COMMON HOST_MAX
 #
 # Every variable can also be set in /etc/config/trafficchart (option = variable name in
-# lower case, see trafficchart.config); the environment wins over UCI.
+# lower case, see trafficchart.config). The environment wins over UCI.
 
 TC_COMMON="${TC_COMMON:-/usr/libexec/trafficchart-common}"
 if [ -r "$TC_COMMON" ]; then
@@ -211,7 +234,7 @@ ATTR_TOTALS="${ATTR_TOTALS:-1}"   # 1 (default) = credit router WAN traffic of p
 ATTR_TOPAPPS="${ATTR_TOPAPPS:-0}"   # 1 = the proxy row of a device carries the real application name of the router flow (default 0: generic "Proxy-Stream (via Router)")
 RATE_WIN="${RATE_WIN:-10}"        # seconds: averaging window of all rates
 UN_WIN="${UN_WIN:-30}"            # seconds: window of the "not attributed" estimate (slower on purpose: the two counters do not tick in the same instant)
-TC_HELPER="${TC_HELPER:-/usr/libexec/trafficchart-tc}"   # prints "<rx_bytes> <tx_bytes>" of the shapers; without it the page falls back to browser side rates
+TC_HELPER="${TC_HELPER:-/usr/libexec/trafficchart-tc}"   # prints "<rx_bytes> <tx_bytes> <rx_drop> <rx_ecn> <tx_drop> <tx_ecn>" of the shapers; without it the page falls back to browser side rates and no shaper history
 [ -x "$TC_HELPER" ] || TC_HELPER=""   # not installed: no link rate, the page falls back to browser side rates
 ATTR_TOL="${ATTR_TOL:-0.6}"       # max. relative volume difference between router application and device for a pairing (0..1)
 ATTR_MIN="${ATTR_MIN:-262144}"     # bytes: a router application below this volume in the window is never attributed
@@ -302,6 +325,10 @@ mkdir -p "$OUT_DIR" || exit 1
 # A previous instance that is still flushing is waited for (max 20 s), so the new one
 # does not read the history before the old one has written it.
 STOPFILE="$OUT_DIR/stop.req"
+# Separate, lighter request: clear cumulative totals + in-RAM history without
+# restarting the daemon (luci.trafficchart's "reset_history" ubus call writes this;
+# see the "History reset" header comment above).
+RESETFILE="$OUT_DIR/reset.req"
 PIDFILE="$OUT_DIR/agg.pid"
 if [ -r "$PIDFILE" ]; then
     _old=$(cat "$PIDFILE" 2>/dev/null)
@@ -313,7 +340,7 @@ if [ -r "$PIDFILE" ]; then
         done
     fi
 fi
-rm -f "$STOPFILE"
+rm -f "$STOPFILE" "$RESETFILE"
 echo $$ > "$PIDFILE"
 
 # The byte/packet counters in /proc/net/nf_conntrack only exist with conntrack
@@ -325,7 +352,7 @@ ACCT=/proc/sys/net/netfilter/nf_conntrack_acct
 $AWK -v CT_FILE="$CT_FILE" -v OUT="$OUT_DIR" -v INTERVAL="$INTERVAL" \
     -v PERSIST_DIR="$PERSIST_DIR" -v PERSIST_MOUNT="$PERSIST_MOUNT" -v PERSIST_SEC="$PERSIST_SEC" -v TOUT="$TOUT" -v TOUT4="$TOUT4" \
     -v HIST_HOUR_KEEP="$HIST_HOUR_KEEP" -v HIST_DAY_KEEP="$HIST_DAY_KEEP" -v HOUR_SEC="$HOUR_SEC" -v DAY_SEC="$DAY_SEC" \
-    -v WPID="$$" -v STOPFILE="$STOPFILE" -v PIDFILE="$PIDFILE" \
+    -v WPID="$$" -v STOPFILE="$STOPFILE" -v RESETFILE="$RESETFILE" -v PIDFILE="$PIDFILE" \
     -v BULK_BYTES="$BULK_BYTES" -v V6HELPER="$V6HELPER" -v APP_HOLD="$APP_HOLD" \
     -v MAPFILE="$OUT_DIR/apps.map" -v HOSTS_HELPER="$HOSTS_HELPER" \
     -v HIST_SEC="$HIST_SEC" -v HIST_KEEP="$HIST_KEEP" -v ATTR_WIN="$ATTR_WIN" -v BIRTH_MAX="$BIRTH_MAX" -v GONE_GRACE="$GONE_GRACE" \
@@ -1049,28 +1076,59 @@ function rates_update(now,   slot, full, ot, k) {
     }
 }
 
-# post-shaping byte counters of the link (helper prints "<rx> <tx>"), timed with
-# uptime() right after they were read; a restarted qdisc (counter goes back) is
-# treated as "no growth" for that sample
-function tc_update(   l, f, rx, tx, tnow, dx, dy, slot, full, ot, orx, otx, ok) {
-    ok = 0; l = ""
+# post-shaping byte counters of the link (helper prints "<rx> <tx> <rx_drop>
+# <rx_ecn> <tx_drop> <tx_ecn>"), timed with uptime() right after they were
+# read; a restarted qdisc (counter goes back) is treated as "no growth" for
+# that sample. The drop/ECN fields are optional (older/custom TC_HELPER
+# builds may only print two fields) - shd_rx/she_rx/shd_tx/she_tx simply stay
+# 0 and the history just carries no "sh" data, get_stats keeps working.
+function tc_update(   l, f, rx, tx, rxd, rxe, txd, txe, rxb, txb, T, tnow, dx, dy, dd, de, slot, full, ot, orx, otx, ok) {
+    ok = 0; l = ""; rxd = -1; rxe = -1; txd = -1; txe = -1; rxb = -1; txb = -1
     if (TC_HELPER != "") {
         if ((TC_HELPER | getline l) > 0) {
             split(l, f, " ")
-            if (f[1] ~ /^[0-9]+$/ && f[2] ~ /^[0-9]+$/) { rx = f[1] + 0; tx = f[2] + 0; ok = 1 }
+            if (f[1] ~ /^[0-9]+$/ && f[2] ~ /^[0-9]+$/) {
+                rx = f[1] + 0; tx = f[2] + 0; ok = 1
+                if (f[3] ~ /^[0-9]+$/) rxd = f[3] + 0
+                if (f[4] ~ /^[0-9]+$/) rxe = f[4] + 0
+                if (f[5] ~ /^[0-9]+$/) txd = f[5] + 0
+                if (f[6] ~ /^[0-9]+$/) txe = f[6] + 0
+                if (f[7] ~ /^[0-9]+$/) rxb = f[7] + 0
+                if (f[8] ~ /^[0-9]+$/) txb = f[8] + 0
+            }
         }
         close(TC_HELPER)
     }
     have_tc = ok
     if (!ok) return
+    # momentary queue backlog: every open history bucket keeps the highest value it saw
+    for (T = 1; T <= 3; T++) {
+        if (rxb > pk_rx[T]) pk_rx[T] = rxb
+        if (txb > pk_tx[T]) pk_tx[T] = txb
+    }
     tnow = uptime()
     if (tc_have_prev) {
         dx = rx - tc_prx; dy = tx - tc_ptx
         if (dx < 0) dx = 0
         if (dy < 0) dy = 0
         tcc_rx += dx; tcc_tx += dy
+        # shaper drop/ECN counters: cumulative since qdisc creation, so also
+        # monotonic between polls unless the qdisc was recreated (SQM
+        # restart) - a decrease is treated as "no growth", same as the byte
+        # counters just above.
+        if (rxd >= 0 && sh_have_prev) {
+            dd = rxd - sh_prxd; if (dd < 0) dd = 0; shd_rx += dd
+            de = rxe - sh_prxe; if (de < 0) de = 0; she_rx += de
+        }
+        if (txd >= 0 && sh_have_prev) {
+            dd = txd - sh_ptxd; if (dd < 0) dd = 0; shd_tx += dd
+            de = txe - sh_ptxe; if (de < 0) de = 0; she_tx += de
+        }
     } else { tc_t0 = tnow; tc_have_prev = 1 }
     tc_prx = rx; tc_ptx = tx
+    if (rxd >= 0 && txd >= 0) {
+        sh_prxd = rxd; sh_prxe = rxe; sh_ptxd = txd; sh_ptxe = txe; sh_have_prev = 1
+    }
     tc_rn++
     slot = tc_rn % RATE_K
     full = (tc_rn > RATE_K)
@@ -1255,8 +1313,11 @@ function wall_refresh(t,   l, f, z, s) {
 
 function wall_ep(t) { return int(t + wall_off + 0.5) }
 
-# close the open bucket of tier T (covering "elapsed" seconds) and store it
-function hist_close(T, elapsed,   di, dov, tin, tout, as, ds, hs, nc, a, k, ep, line) {
+# close the open bucket of tier T (covering "elapsed" seconds) and store it.
+# Besides application/device/destination deltas, this also closes out the
+# shaper drop/ECN deltas of the period (see the "Shaper health in the
+# history" header comment) - "sh":{"rx":[dropped,ecn],"tx":[dropped,ecn]}.
+function hist_close(T, elapsed,   di, dov, tin, tout, as, ds, hs, nc, a, k, ep, line, rxdd, rxde, txdd, txde, rxbp, txbp) {
     if (elapsed < 1) return
     tin = 0; tout = 0
     nc = 0
@@ -1283,9 +1344,14 @@ function hist_close(T, elapsed,   di, dov, tin, tout, as, ds, hs, nc, a, k, ep, 
         if (di + dov > 0) { nc++; cn[nc] = k; ci[nc] = di; co[nc] = dov }
     }
     hs = hist_topk(12, 0, nc)
+    rxdd = shd_rx - ssh_rx_d[T]; rxde = she_rx - ssh_rx_e[T]
+    txdd = shd_tx - ssh_tx_d[T]; txde = she_tx - ssh_tx_e[T]
+    ssh_rx_d[T] = shd_rx; ssh_rx_e[T] = she_rx; ssh_tx_d[T] = shd_tx; ssh_tx_e[T] = she_tx
+    rxbp = pk_rx[T] + 0; txbp = pk_tx[T] + 0; pk_rx[T] = 0; pk_tx[T] = 0
     ep = wall_ep(uptime())
     if (ep > last_t) last_t = ep
-    line = sprintf("{\"t\":%.0f,\"dt\":%.0f,\"in\":%.0f,\"out\":%.0f,\"a\":{%s},\"d\":{%s},\"h\":{%s}}", ep, elapsed, tin, tout, as, ds, hs)
+    line = sprintf("{\"t\":%.0f,\"dt\":%.0f,\"in\":%.0f,\"out\":%.0f,\"a\":{%s},\"d\":{%s},\"h\":{%s},\"sh\":{\"rx\":[%.0f,%.0f,%.0f],\"tx\":[%.0f,%.0f,%.0f]}}", \
+                   ep, elapsed, tin, tout, as, ds, hs, rxdd, rxde, rxbp, txdd, txde, txbp)
     hj[T, ++hn[T]] = line
     pend_dirty = 1
     hist_trim(T)
@@ -1311,6 +1377,43 @@ function hist_tick(t,   lt, kh, kd) {
     if (hkey[2] == "") { hkey[2] = kh; hkey[3] = kd }
     if (kh != hkey[2]) { hist_close(2, t - ht0[2]); ht0[2] = t; hkey[2] = kh }
     if (kd != hkey[3]) { hist_close(3, t - ht0[3]); ht0[3] = t; hkey[3] = kd }
+}
+
+# ---- history / cumulative-totals reset (reset.req, see the header comment
+# "History reset" above) ----
+# Clears everything the page shows as "totals since start" (applications,
+# devices, destinations, the device x application and tooltip matrices, and
+# the in-RAM history of all three tiers) and resets "since" to now, WITHOUT
+# touching per-flow tracking (gen/pb1/pb2/...), so ongoing flows keep being
+# delta-accounted correctly into the fresh totals instead of being treated as
+# newly born. Persisted (on-disk) history buckets already written to a
+# PERSIST_DIR target are left alone; only the RAM/UI view is cleared - psv/
+# hpfile bookkeeping is untouched, so the next persist_flush_one() simply
+# finds nothing new to append until fresh buckets are closed.
+function hist_reset(   T, i) {
+    split("", aseen); split("", aib); split("", aob); split("", aip); split("", aop); napp = 0
+    split("", dseen); split("", dib); split("", dob); split("", dipk); split("", dopk)
+    split("", dname); split("", dvip); ndev = 0
+    split("", hseen); split("", hib); split("", hob); split("", hip); split("", hop); split("", hlast); nhost = 0
+    split("", pidx); split("", pdv); split("", pap); split("", pin); split("", pout); split("", plast)
+    npair = 0; npair_live = 0; npfree = 0; split("", pfree)
+    split("", mxidx); split("", mxt); split("", mxa); split("", mxb); split("", mxin); split("", mxout); split("", mxlast)
+    mxcnt = 0; split("", mxtn); split("", mxfree); nmxfree = 0
+    for (T = 1; T <= 3; T++) {
+        for (i = 1; i <= hn[T]; i++) delete hj[T, i]
+        hn[T] = 0
+        ht0[T] = uptime()
+        hist_write(T)
+    }
+    hkey[2] = ""; hkey[3] = ""
+    split("", sa_in); split("", sa_out); split("", sd_in); split("", sd_out); split("", sh_in); split("", sh_out)
+    shd_rx = 0; she_rx = 0; shd_tx = 0; she_tx = 0
+    split("", ssh_rx_d); split("", ssh_rx_e); split("", ssh_tx_d); split("", ssh_tx_e)
+    split("", pk_rx); split("", pk_tx)
+    "date +%s" | getline since
+    close("date +%s")
+    pend_dirty = 1
+    glog_msg("history and cumulative totals cleared on request (reset_history)")
 }
 
 # ---- persistence (one or more targets, all of them are mirrors) ----
@@ -1597,6 +1700,7 @@ BEGIN {
     hfile[1] = OUT "/history.json"; hfile[2] = OUT "/history_1h.json"; hfile[3] = OUT "/history_1d.json"
     HOUR_SEC += 0; DAY_SEC += 0; PERSIST_SEC += 0
     last_t = 0; wall_off = 0; tzoff = 0; wall_ok = 0; wall_at = -1000
+    shd_rx = 0; she_rx = 0; shd_tx = 0; she_tx = 0; sh_have_prev = 0
     # persistence targets; a target under one of the PERSIST_MOUNT paths is only used while that path is mounted
     NP = split(PERSIST_DIR, ptd, " ")
     nmt = split(PERSIST_MOUNT, mts, " ")
@@ -1633,6 +1737,13 @@ BEGIN {
         # stop request from the init script: final flush, then leave
         if ((getline sl < STOPFILE) >= 0) { close(STOPFILE); hist_final(uptime()); exit 0 }
         close(STOPFILE)
+        # reset request (luci.trafficchart "reset_history"): clear totals/history
+        # and keep running - see hist_reset() and the header comment above
+        if ((getline rl < RESETFILE) >= 0) {
+            close(RESETFILE)
+            system("rm -f " RESETFILE)
+            hist_reset()
+        } else close(RESETFILE)
         # a newer instance took over (this one is an orphan): leave without touching the history
         if ((getline pl2 < PIDFILE) > 0 && pl2 != WPID) exit 0
         close(PIDFILE)
@@ -1649,7 +1760,7 @@ stop_agg() {
     _i=0
     while [ "$_i" -lt 14 ] && kill -0 "$APID" 2>/dev/null; do sleep 1; _i=$((_i + 1)); done
     kill "$APID" 2>/dev/null
-    rm -f "$PIDFILE" "$STOPFILE"
+    rm -f "$PIDFILE" "$STOPFILE" "$RESETFILE"
     exit 0
 }
 trap stop_agg TERM INT HUP

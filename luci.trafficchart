@@ -30,16 +30,34 @@ case "$1" in
         # "history" is an optional parameter of get_stats (rather than a second
         # method) so no rpcd ACL change is needed for it. "tier" (5m | 1h | 1d)
         # selects the resolution, "n" limits the answer to the newest n buckets.
-        echo '{"get_stats": {"history": 1, "tier": "5m", "n": 1}, "restart": {}}'
+        echo '{"get_stats": {"history": 1, "tier": "5m", "n": 1}, "restart": {}, "reset_history": {}}'
         ;;
     call)
-        # rpcd exec protocol passes the method name as $2; "restart" needs the
-        # write ACL (luci-app-traffic-chart.json), get_stats only needs read.
+        # rpcd exec protocol passes the method name as $2; "restart" and
+        # "reset_history" both need the write ACL (luci-app-traffic-chart.json),
+        # get_stats only needs read.
         if [ "$2" = "restart" ]; then
             # detached: the init script stopping this very rpcd child must not
             # block the ubus reply
             ( /etc/init.d/trafficchart restart >/dev/null 2>&1 & )
             echo '{"result": "restarting"}'
+            exit 0
+        fi
+
+        if [ "$2" = "reset_history" ]; then
+            # Distinct from "restart": this only asks the RUNNING daemon to
+            # clear its cumulative application/device/destination totals and
+            # its in-RAM history (all three tiers), then keep going - no procd
+            # bounce, no re-attaching of persistence targets, live flow
+            # tracking (and therefore the "top flows" list) is unaffected.
+            # trafficchart-agg polls for this file once per loop iteration
+            # (same mechanism as its stop.req) and removes it once handled.
+            # Buckets already written to a persistent storage path are left
+            # alone (only the RAM/UI view is cleared) - delete those files
+            # yourself if you also want the on-disk archive gone.
+            mkdir -p "$HIST_DIR" 2>/dev/null
+            : > "${HIST_DIR}/reset.req"
+            echo '{"result": "reset requested"}'
             exit 0
         fi
 

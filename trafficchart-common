@@ -10,6 +10,7 @@
 #   . /usr/libexec/trafficchart-common
 #   tc_resolve          # who is shaped, and where
 #   tc_read_counters    # post-shaping byte counters (needs tc_resolve first)
+#   tc_shaper_drops DEV BACKEND   # "<dropped> <ecn> <backlog bytes>" of DEV's qdisc (drops/ECN cumulative, backlog momentary)
 #
 # tc_resolve sets:
 #   BACKEND        nss | generic
@@ -132,6 +133,54 @@ tc_qdisc_bytes() {
         ''|*[!0-9]*) return 1 ;;
     esac
     echo "$bytes"
+}
+
+# Cumulative dropped-packet and ECN-mark counters of the shaper qdisc on
+# device $1 ("" if the device has none). $2 = backend ("nss" or "generic",
+# from tc_resolve's $BACKEND) selects which qdisc in the "tc -s qdisc show"
+# output holds the numbers we want:
+#   nss      nsstbl (root) has no drops of its own; nssfq_codel (leaf) carries
+#            "dropped" (Sent line) and "ecn_mark" (maxpacket line)
+#   generic  first qdisc is the root (cake, or htb); if there are fq_codel
+#            leaves (htb+fq_codel), their dropped/ecn are summed - cake reports
+#            drops on its own root line instead, so that is used as a fallback
+# Prints "<dropped> <ecn>", both 0 if the device/qdisc could not be read.
+# Shared by luci.trafficchart (live shaper panel) and trafficchart-tc (feeds
+# trafficchart-agg, which turns the cumulative numbers into per-bucket deltas
+# for the History tab - see hist_close() there).
+tc_shaper_drops() {
+    local dev="$1" backend="$2"
+    [ -n "$dev" ] && [ -e "$SYSNET/${dev}" ] || { echo "0 0 0"; return; }
+    tc -s qdisc show dev "$dev" 2>/dev/null | awk -v BACKEND="$backend" '
+        function num(v,   n, u) {
+            n = v + 0; u = v; sub(/^[0-9.]+/, "", u)
+            if (u ~ /^K/) n *= 1024; else if (u ~ /^M/) n *= 1048576; else if (u ~ /^G/) n *= 1073741824
+            return n
+        }
+        /^qdisc / { q++; nm[q] = $2; next }
+        /^ *backlog / { bl[q] = num($2); next }
+        /^ *Sent / {
+            l = $0; gsub(/[(),]/, " ", l); n = split(l, f, " ")
+            for (i = 1; i <= n; i++) if (f[i] == "dropped") dr[q] = f[i + 1] + 0
+            next
+        }
+        /maxpacket/ {
+            for (i = 1; i < NF; i++) if ($i == "ecn_mark") ecn[q] = $(i + 1) + 0
+            next
+        }
+        END {
+            D = 0; E = 0; B = 0
+            if (BACKEND == "nss") {
+                for (i = 1; i <= q; i++) if (nm[i] == "nssfq_codel") { D = dr[i]; E = ecn[i] }
+                if (!D) for (i = 1; i <= q; i++) if (nm[i] == "nsstbl") D = dr[i]
+                for (i = 1; i <= q; i++) if (nm[i] == "nssfq_codel" || nm[i] == "nsstbl") B += bl[i]   # leaf + token bucket, same as the live shaper line
+            } else {
+                for (i = 1; i <= q; i++) if (nm[i] ~ /fq_codel$/) { D += dr[i]; E += ecn[i] }
+                if (!D && q >= 1) D = dr[1] + 0   # cake (or a root with no fq_codel leaf): its own drops
+                B = bl[1] + 0                     # the root reports what is queued below it
+            }
+            printf "%d %d %.0f\n", D + 0, E + 0, B + 0
+        }'
 }
 
 # list helpers: tc_in_list "<list>" item / tc_push LISTVAR item (no duplicates)
