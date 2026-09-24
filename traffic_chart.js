@@ -502,13 +502,13 @@ return view.extend({
                     if (X.g !== Y.g) return X.g > Y.g;
                     return X.g ? (X.a > Y.a * RANK_MARGIN) : (X.t > Y.t);
                 }
-                var swapped = true, guard = 0, i, tmp;
-                while (swapped && guard++ <= arr.length) {
-                    swapped = false;
-                    for (i = arr.length - 1; i > 0; i--) {
-                        if (beats(arr[i], arr[i - 1])) { tmp = arr[i]; arr[i] = arr[i - 1]; arr[i - 1] = tmp; swapped = true; }
-                    }
-                }
+                var previous = {};
+                arr.forEach(function(n, i) { previous[n] = i; });
+                arr.sort(function(a, b) {
+                    if (beats(a, b)) return -1;
+                    if (beats(b, a)) return 1;
+                    return previous[a] - previous[b];
+                });
                 v.order[d] = arr;
                 return arr;
             }
@@ -572,6 +572,7 @@ return view.extend({
 
         function makeFlowsView() {
             var v = {};
+            var flowRows = [], emptyRow;
             var COL_WIDTHS = [ 16, 14, 30, 8, 11, 11, 10 ];
             var colgroup = E('colgroup', {}, COL_WIDTHS.map(function(w) {
                 return E('col', { style: 'width:' + w + '%;' });
@@ -586,12 +587,34 @@ return view.extend({
             v.el = E('div', { style: 'width:100%; display:none;' }, [
                 E('div', { class: 'qos-panel-title', style: 'text-align:center;' }, _('Busiest flows (smoothed rate, top 25)')),
                 table ]);
+            function makeBarCell(color) {
+                var bar = E('div', { style: 'position:absolute; right:0; top:2px; bottom:2px; width:0%; background:' + color + '; border-radius:4px; z-index:0; transition:width 0.4s ease; pointer-events:none;' });
+                var text = E('span', { style: 'position:relative; z-index:1;' });
+                return { cell: E('td', { class: 'td', style: num + ' position:relative; padding-right:8px;' }, [ bar, text ]), bar: bar, text: text };
+            }
+            function makeFlowRow() {
+                var down = makeBarCell('rgba(110, 231, 183, 0.22)');
+                var up = makeBarCell('rgba(147, 197, 253, 0.22)');
+                var cells = [
+                    E('td', { class: 'td', style: trunc }), E('td', { class: 'td', style: trunc }),
+                    E('td', { class: 'td', style: trunc }), E('td', { class: 'td', style: trunc }),
+                    down.cell, up.cell, E('td', { class: 'td', style: num + ' ' + trunc })
+                ];
+                var row = { el: E('tr', { class: 'tr' }, cells), cells: cells, down: down, up: up };
+                table.appendChild(row.el);
+                return row;
+            }
             v.update = function(flows, sqmDownKbit, sqmUpKbit) {
-                while (table.rows.length > 1) table.deleteRow(1);
                 if (!flows || !flows.length) {
-                    table.appendChild(E('tr', { class: 'tr' }, [ E('td', { class: 'td', colspan: 7 }, _('No active flows')) ]));
+                    flowRows.forEach(function(row) { row.el.style.display = 'none'; });
+                    if (!emptyRow) {
+                        emptyRow = E('tr', { class: 'tr' }, [ E('td', { class: 'td', colspan: 7 }, _('No active flows')) ]);
+                        table.appendChild(emptyRow);
+                    }
+                    emptyRow.style.display = '';
                     return;
                 }
+                if (emptyRow) emptyRow.style.display = 'none';
                 
                 var maxIn = 0, maxOut = 0;
                 flows.forEach(function(f) {
@@ -602,7 +625,8 @@ return view.extend({
                 var downLimitBps = (sqmDownKbit || 0) * 1000;
                 var upLimitBps = (sqmUpKbit || 0) * 1000;
 
-                flows.forEach(function(f) {
+                flows.forEach(function(f, i) {
+                    var row = flowRows[i] || (flowRows[i] = makeFlowRow());
                     var dest = f.host || f.dst;
                     var dev = (f.ip && f.ip !== f.dev) ? f.dev + ' (' + f.ip + ')' : f.dev;
                     
@@ -612,25 +636,16 @@ return view.extend({
                     var pctIn = downLimitBps > 0 ? Math.min(100, (inBits / downLimitBps) * 100) : (maxIn > 0 ? ((f.in_bps || 0) / maxIn * 100) : 0);
                     var pctOut = upLimitBps > 0 ? Math.min(100, (outBits / upLimitBps) * 100) : (maxOut > 0 ? ((f.out_bps || 0) / maxOut * 100) : 0);
                     
-                    var tdIn = E('td', { class: 'td', style: num + ' position:relative; padding-right:8px;' }, [
-                        E('div', { style: 'position:absolute; right:0; top:2px; bottom:2px; width:' + pctIn.toFixed(1) + '%; background:rgba(110, 231, 183, 0.22); border-radius:4px; z-index:0; transition:width 0.4s ease; pointer-events:none;' }),
-                        E('span', { style: 'position:relative; z-index:1;' }, formatRate(inBits))
-                    ]);
-                    
-                    var tdOut = E('td', { class: 'td', style: num + ' position:relative; padding-right:8px;' }, [
-                        E('div', { style: 'position:absolute; right:0; top:2px; bottom:2px; width:' + pctOut.toFixed(1) + '%; background:rgba(147, 197, 253, 0.22); border-radius:4px; z-index:0; transition:width 0.4s ease; pointer-events:none;' }),
-                        E('span', { style: 'position:relative; z-index:1;' }, formatRate(outBits))
-                    ]);
-
-                    table.appendChild(E('tr', { class: 'tr' }, [
-                        E('td', { class: 'td', style: trunc, title: dev }, dev),
-                        E('td', { class: 'td', style: trunc, title: f.app }, f.app),
-                        E('td', { class: 'td', style: trunc, title: f.dst + (f.host ? ' - ' + f.host : '') }, dest),
-                        E('td', { class: 'td', style: trunc }, (f.proto || '') + (f.port ? '/' + f.port : '')),
-                        tdIn,
-                        tdOut,
-                        E('td', { class: 'td', style: num + ' ' + trunc }, formatBytes(f.bytes || 0)) ]));
+                    row.el.style.display = '';
+                    row.cells[0].textContent = dev; row.cells[0].title = dev;
+                    row.cells[1].textContent = f.app; row.cells[1].title = f.app;
+                    row.cells[2].textContent = dest; row.cells[2].title = f.dst + (f.host ? ' - ' + f.host : '');
+                    row.cells[3].textContent = (f.proto || '') + (f.port ? '/' + f.port : '');
+                    row.down.bar.style.width = pctIn.toFixed(1) + '%'; row.down.text.textContent = formatRate(inBits);
+                    row.up.bar.style.width = pctOut.toFixed(1) + '%'; row.up.text.textContent = formatRate(outBits);
+                    row.cells[6].textContent = formatBytes(f.bytes || 0);
                 });
+                for (var i = flows.length; i < flowRows.length; i++) flowRows[i].el.style.display = 'none';
             };
             return v;
         }
