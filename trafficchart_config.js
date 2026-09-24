@@ -13,6 +13,7 @@ return view.extend({
         s = m.section(form.TypedSection, 'trafficchart', _('General'));
         s.anonymous = true;
         s.addremove = false;
+        s.cfgsections = function() { return ['global']; };
 
         o = s.option(form.Flag, 'enabled', _('Enable'), _('Disable to stop the aggregator entirely (0 = do not start the daemon).'));
         o.default = '1';
@@ -96,6 +97,7 @@ return view.extend({
               'Without a storage path they live in RAM only and are lost on reboot.'));
         s.anonymous = true;
         s.addremove = false;
+                s.cfgsections = function() { return ['global']; };
 
         function validPaths(section_id, value) {
             if (value === null || value === '') return true;
@@ -153,6 +155,7 @@ return view.extend({
         s.anonymous = true;
         s.addremove = false;
         s.optional = true;
+        s.cfgsections = function() { return ['global']; };
 
         o = s.option(form.Value, 'app_max', _('Max applications'), _('Applications kept individually; further ones are summed as "(other)".'));
         o.datatype = 'uinteger';
