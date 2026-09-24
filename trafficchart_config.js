@@ -2,6 +2,15 @@
 'require form';
 'require view';
 
+// Values a profile sets (must mirror the PROFILE_* settings in trafficchart-agg). An option
+// that is left empty uses the value of the selected profile, which is shown as grey placeholder.
+var PROFILES = {
+    'balanced':     { interval: 2, interval_max: 10, adapt_budget: 0.30, tooltip_every: 0, hosts_refresh_sec: 60,  gua_refresh_sec: 120, bulk_bytes: 314572800 },
+    'low-cpu':      { interval: 4, interval_max: 20, adapt_budget: 0.45, tooltip_every: 2, hosts_refresh_sec: 180, gua_refresh_sec: 300, bulk_bytes: 314572800 },
+    'very-low-cpu': { interval: 6, interval_max: 30, adapt_budget: 0.55, tooltip_every: 3, hosts_refresh_sec: 300, gua_refresh_sec: 600, bulk_bytes: 314572800 }
+};
+var PROFILE_DEFAULT = 'low-cpu';   // used by the daemon when no profile is set
+
 return view.extend({
     render: function() {
         var m, s, o;
@@ -28,16 +37,15 @@ return view.extend({
         o.default = 'auto';
 
         o = s.option(form.ListValue, 'profile', _('Profile'),
-            _('Preset tuning profile. The selected profile sets the low-level timing values, but you can still override any of them individually.'));
+            _('Preset tuning profile. The selected profile sets the low-level timing values (shown in grey in the fields below while they are empty); you can still override any of them individually.'));
         o.value('balanced', _('Balanced'));
         o.value('low-cpu', _('Low CPU'));
         o.value('very-low-cpu', _('Very low CPU'));
-        o.default = 'low-cpu';
+        o.default = PROFILE_DEFAULT;
 
         o = s.option(form.Value, 'interval', _('Poll interval'), _('Seconds between conntrack passes (starting point; auto-stretches under load, see below).'));
         o.datatype = 'uinteger';
-        o.placeholder = '4';
-        o.default = '4';
+        o.placeholder = String(PROFILES[PROFILE_DEFAULT].interval);
 
         o = s.option(form.Flag, 'adapt_interval', _('Adaptive interval'),
             _('Auto-stretch the poll interval once processing time grows into a meaningful share of the cycle, and ease it back down again.'));
@@ -45,35 +53,30 @@ return view.extend({
 
         o = s.option(form.Value, 'interval_max', _('Max interval'), _('Seconds: ceiling for the auto-stretched interval.'));
         o.datatype = 'uinteger';
-        o.placeholder = '20';
-        o.default = '20';
+        o.placeholder = String(PROFILES[PROFILE_DEFAULT].interval_max);
         o.depends('adapt_interval', '1');
 
         o = s.option(form.Value, 'adapt_budget', _('Adapt budget'), _('Fraction of the polling cycle the daemon may spend before stretching the interval.'));
-        o.datatype = 'string';
-        o.placeholder = '0.45';
-        o.default = '0.45';
+        o.datatype = 'ufloat';
+        o.placeholder = String(PROFILES[PROFILE_DEFAULT].adapt_budget);
 
         o = s.option(form.Value, 'hosts_refresh_sec', _('Host refresh'), _('Seconds between neighbour/DHCP/host table refreshes.'));
         o.datatype = 'uinteger';
-        o.placeholder = '180';
-        o.default = '180';
+        o.placeholder = String(PROFILES[PROFILE_DEFAULT].hosts_refresh_sec);
 
         o = s.option(form.Value, 'gua_refresh_sec', _('IPv6 prefix refresh'), _('Seconds between LAN IPv6 GUA prefix re-detection.'));
         o.datatype = 'uinteger';
-        o.placeholder = '300';
-        o.default = '300';
+        o.placeholder = String(PROFILES[PROFILE_DEFAULT].gua_refresh_sec);
 
-        o = s.option(form.Value, 'tooltip_every', _('Tooltip refresh'), _('How often the tooltip matrices are rebuilt. 2 polls is a good low-CPU default for busy routers.'));
+        o = s.option(form.Value, 'tooltip_every', _('Tooltip refresh'), _('How often (in polls) the tooltip matrices are rebuilt. 0 = automatic, depending on the size of the tables.'));
         o.datatype = 'uinteger';
-        o.placeholder = '2';
-        o.default = '2';
+        o.placeholder = String(PROFILES[PROFILE_DEFAULT].tooltip_every);
 
         o = s.option(form.Value, 'bulk_bytes', _('Bulk threshold'),
             _('Bytes: a WEB/P2P/BE flow above this size is shown as BULK. Shared with nss-rk.qos ' +
               '(restart SQM after changing this so the classifier picks it up too).'));
         o.datatype = 'uinteger';
-        o.placeholder = '314572800';
+        o.placeholder = String(PROFILES[PROFILE_DEFAULT].bulk_bytes);
 
         o = s.option(form.Value, 'l2_overhead', _('Link header size'),
             _('Bytes per packet the shaper counts but conntrack does not (used for "Not attributed"). "auto" measures it; ' +
@@ -168,6 +171,21 @@ return view.extend({
         o.datatype = 'uinteger';
         o.placeholder = '1';
 
-        return m.render();
+        return m.render().then(function(node) {
+            function applyProfile() {
+                var opt = m.lookupOption('profile', 'global');
+                var pv = (opt && opt[0]) ? opt[0].formvalue('global') : null;
+                if (!PROFILES[pv]) pv = PROFILE_DEFAULT;
+                Object.keys(PROFILES[pv]).forEach(function(name) {
+                    var id = 'cbid.trafficchart.global.' + name;
+                    var el = node.querySelector('[id="widget.' + id + '"], [name="' + id + '"]');
+                    if (el) el.placeholder = String(PROFILES[pv][name]);
+                });
+            }
+            // the dropdown reports a change through one of these (bubbling) events, depending on the LuCI version
+            [ 'widget-change', 'cbi-dropdown-change', 'change' ].forEach(function(ev) { node.addEventListener(ev, applyProfile); });
+            applyProfile();
+            return node;
+        });
     }
 });

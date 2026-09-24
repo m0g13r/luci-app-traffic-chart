@@ -660,6 +660,7 @@ return view.extend({
             ];
             var REFRESH_MS = { '5m': 60000, '1h': 300000, '1d': 900000 };
             var TIER_SEC = { '5m': 300, '1h': 3600, '1d': 86400 };
+            var TIER_ORDER = [ '5m', '1h', '1d' ];   // finest first
             var st = { dim: 'a', dir: 'in', range: '24h', data: {}, cmp: false, hidden: {} };
             var chartHost = E('div', { style: 'width:100%;' });
             var persistEl = E('div', { style: 'text-align:center; font-size:10.5px; color:var(--main-bright-color); margin-top:4px;' });
@@ -669,7 +670,8 @@ return view.extend({
             var dirDefs = [ ['in', _('Download')], ['out', _('Upload')], ['both', _('Both')] ];
             var rangeBtns = [], dimBtns = [], dirBtns = [];
             var cmpBtn = E('button', { type: 'button', style: btnStyle }, _('Compare'));
-            cmpBtn.addEventListener('click', function(e) { e.stopPropagation(); st.cmp = !st.cmp; mark(); render(); });
+            cmpBtn.addEventListener('click', function(e) { e.stopPropagation(); st.cmp = !st.cmp; mark(); render(); if (st.cmp) v.load(); });
+            cmpBtn.title = _('Dashed line: the same length of time before the shown period');
             function rangeDef() {
                 for (var i = 0; i < RANGES.length; i++) if (RANGES[i].id === st.range) return RANGES[i];
                 return RANGES[0];
@@ -678,7 +680,7 @@ return view.extend({
                 rangeBtns.forEach(function(b, i) { b.className = 'btn cbi-button' + (st.range === rangeDefs[i][0] ? ' cbi-button-apply' : ''); });
                 dimBtns.forEach(function(b, i) { b.className = 'btn cbi-button' + (st.dim === dimDefs[i][0] ? ' cbi-button-apply' : ''); });
                 dirBtns.forEach(function(b, i) { b.className = 'btn cbi-button' + (st.dir === dirDefs[i][0] ? ' cbi-button-apply' : ''); });
-                cmpBtn.className = 'btn cbi-button' + (st.cmp && !cmpBtn.disabled ? ' cbi-button-apply' : '');
+                cmpBtn.className = 'btn cbi-button' + (st.cmp ? ' cbi-button-apply' : '');
             }
             rangeDefs.forEach(function(d) {
                 var b = E('button', { type: 'button', style: btnStyle }, d[1]);
@@ -978,18 +980,33 @@ return view.extend({
                     });
                 });
 
-                var shift = ncols * colw, pcols = [], prevAny = false;
+                // Previous period: the same length of time right before the shown window. The shown tier only
+                // reaches back as far as its keep limit (24 h of 5 min buckets, for example, has nothing before it),
+                // so the finest tier that covers most of that time is used, and every bucket is spread over the
+                // columns it overlaps.
+                var shift = ncols * colw, pcols = [], prevAny = false, pStart = t0 - shift;
                 for (var pi = 0; pi < ncols; pi++) pcols.push({ dt: 0, b: [0, 0] });
-                B.forEach(function(b) {
-                    var mid2 = b.t - (b.dt || 0) / 2 + shift;
-                    if (mid2 <= t0 || mid2 > end) return;
-                    var pc = pcols[Math.min(ncols - 1, Math.max(0, ncols - 1 - Math.floor((end - mid2) / colw)))];
-                    pc.dt += b.dt || 0; pc.b[0] += b['in'] || 0; pc.b[1] += b.out || 0;
-                    prevAny = true;
+                var prevB = null, prevCov = 0;
+                if (st.cmp) TIER_ORDER.slice(TIER_ORDER.indexOf(R.tier)).forEach(function(tier) {
+                    var Bt = st.data[tier];
+                    if (!Bt || !Bt.length) return;
+                    var cov = 0;
+                    Bt.forEach(function(b) { var ov = Math.min(b.t, t0) - Math.max(b.t - (b.dt || 0), pStart); if (ov > 0) cov += ov; });
+                    if (cov > prevCov + 0.05 * shift) { prevB = Bt; prevCov = cov; }
                 });
-                cmpBtn.disabled = !prevAny;
-                cmpBtn.title = prevAny ? _('Dashed line: the same length of time before the shown period')
-                                       : _('No data stored for the period before this one (see hist_keep / hist_hour_keep / hist_day_keep)');
+                (prevB || []).forEach(function(b) {
+                    var d = b.dt || 0;
+                    if (d <= 0) return;
+                    var o0 = Math.max(b.t - d, pStart), o1 = Math.min(b.t, t0);
+                    if (o1 <= o0) return;
+                    var c0 = Math.max(0, Math.floor((o0 + shift - t0) / colw)), c1 = Math.min(ncols - 1, Math.floor((o1 + shift - t0 - 1e-6) / colw));
+                    for (var cj = c0; cj <= c1; cj++) {
+                        var ov = Math.min(o1 + shift, t0 + (cj + 1) * colw) - Math.max(o0 + shift, t0 + cj * colw);
+                        if (ov <= 0) continue;
+                        pcols[cj].dt += ov; pcols[cj].b[0] += (b['in'] || 0) * ov / d; pcols[cj].b[1] += (b.out || 0) * ov / d;
+                        prevAny = true;
+                    }
+                });
                 mark();
                 var drawPrev = st.cmp && prevAny;
 
@@ -1191,6 +1208,7 @@ return view.extend({
                     legend.appendChild(legendItem(k, colorOf(k), name + ' (' + formatBytes(totals[k]) + ')'));
                 });
                 if (rest.length) legend.appendChild(legendItem('__rest', 'hsl(210,8%,62%)', _('Other (%d)').format(rest.length)));
+                if (st.cmp && !prevAny) legend.appendChild(E('span', { style: 'opacity:0.7;' }, _('Previous period: no data stored yet')));
                 if (drawPrev) legend.appendChild(E('span', {}, [
                     E('span', { style: 'display:inline-block; width:16px; margin-right:5px; vertical-align:middle; border-top:2px dashed var(--secondary-dark-color);' }), _('Previous period') ]));
                 if (showDrops) legend.appendChild(E('span', {}, [
@@ -1211,12 +1229,12 @@ return view.extend({
             });
             v.stale = function() { return Date.now() - v.loadedAt > REFRESH_MS[rangeDef().tier]; };
             v.load = function() {
-                var tier = rangeDef().tier;
+                var tier = rangeDef().tier, tiers = [ tier ];
+                if (st.cmp) tiers = tiers.concat(TIER_ORDER.slice(TIER_ORDER.indexOf(tier) + 1));
                 v.loadedAt = Date.now();
-                return callHistory(1, tier).then(function(d) {
-                    st.data[tier] = (d && d.buckets) ? d.buckets : [];
-                    render();
-                }).catch(function() {});
+                return Promise.all(tiers.map(function(t) {
+                    return callHistory(1, t).then(function(d) { st.data[t] = (d && d.buckets) ? d.buckets : []; }).catch(function() {});
+                })).then(render);
             };
             mark();
             render();
