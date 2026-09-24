@@ -25,6 +25,8 @@
 # fresh entry for it.
 OUT_DIR="${OUT_DIR:-/tmp/trafficchart}"
 UNRESOLVED_FILE="${UNRESOLVED_FILE:-$OUT_DIR/unresolved_v6}"
+UNRESOLVED_MAX="${UNRESOLVED_MAX:-32}"
+case "$UNRESOLVED_MAX" in ''|*[!0-9]*) UNRESOLVED_MAX=32 ;; esac
 if [ -s "$UNRESOLVED_FILE" ]; then
     PING6=""
     if command -v ping6 >/dev/null 2>&1; then
@@ -33,10 +35,10 @@ if [ -s "$UNRESOLVED_FILE" ]; then
         PING6="ping -6 -c1 -W1 -q"
     fi
     if [ -n "$PING6" ]; then
-        while IFS= read -r addr; do
+        awk -v max="$UNRESOLVED_MAX" '!seen[$0]++ { print; if (++n >= max) exit }' "$UNRESOLVED_FILE" | while IFS= read -r addr; do
             [ -n "$addr" ] || continue
             $PING6 "$addr" >/dev/null 2>&1 &
-        done < "$UNRESOLVED_FILE"
+        done
         wait
     fi
 fi
