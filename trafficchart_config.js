@@ -10,10 +10,7 @@ return view.extend({
             _('Settings for the traffic-chart aggregator (trafficchart-agg) and the SQM traffic classes it shares with nss-rk.qos. ' +
               'Saving restarts the aggregator (cumulative totals reset, the history survives).'));
 
-        s = m.section(form.TypedSection, 'trafficchart', _('General'));
-        s.anonymous = true;
-        s.addremove = false;
-        s.cfgsections = function() { return ['global']; };
+        s = m.section(form.NamedSection, 'global', 'trafficchart', _('General'));
 
         o = s.option(form.Flag, 'enabled', _('Enable'), _('Disable to stop the aggregator entirely (0 = do not start the daemon).'));
         o.default = '1';
@@ -92,12 +89,9 @@ return view.extend({
             _('Only used when the field above is empty: ports that never count as "router is serving this device" (SSH, DNS, DHCP, NTP, DoT, mDNS, LuCI ...).'));
         o.placeholder = '22 53 67 68 80 123 443 853 5353 5355';
 
-        s = m.section(form.TypedSection, 'trafficchart', _('History and persistent storage'),
+                s = m.section(form.NamedSection, 'global', 'trafficchart', _('History and persistent storage'),
             _('The History tab keeps three resolutions: 5 minute buckets (24 hours view), hourly buckets (week) and daily buckets (month, year). ' +
               'Without a storage path they live in RAM only and are lost on reboot.'));
-        s.anonymous = true;
-        s.addremove = false;
-                s.cfgsections = function() { return ['global']; };
 
         function validPaths(section_id, value) {
             if (value === null || value === '') return true;
@@ -151,11 +145,8 @@ return view.extend({
         o.datatype = 'uinteger';
         o.placeholder = '400';
 
-        s = m.section(form.TypedSection, 'trafficchart', _('Advanced'));
-        s.anonymous = true;
-        s.addremove = false;
+        s = m.section(form.NamedSection, 'global', 'trafficchart', _('Advanced'));
         s.optional = true;
-        s.cfgsections = function() { return ['global']; };
 
         o = s.option(form.Value, 'app_max', _('Max applications'), _('Applications kept individually; further ones are summed as "(other)".'));
         o.datatype = 'uinteger';
