@@ -5,9 +5,10 @@
 // Values a profile sets (must mirror the PROFILE_* settings in trafficchart-agg). An option
 // that is left empty uses the value of the selected profile, which is shown as grey placeholder.
 var PROFILES = {
-    'balanced':     { interval: 2, interval_max: 10, adapt_budget: 0.30, tooltip_every: 0, hosts_refresh_sec: 60,  gua_refresh_sec: 120, bulk_bytes: 314572800 },
-    'low-cpu':      { interval: 4, interval_max: 20, adapt_budget: 0.45, tooltip_every: 2, hosts_refresh_sec: 180, gua_refresh_sec: 300, bulk_bytes: 314572800 },
-    'very-low-cpu': { interval: 6, interval_max: 30, adapt_budget: 0.55, tooltip_every: 3, hosts_refresh_sec: 300, gua_refresh_sec: 600, bulk_bytes: 314572800 }
+    'realtime':     { interval: 1, interval_max: 5, adapt_budget: 0.15, tooltip_every: 1, hosts_refresh_sec: 30,  gua_refresh_sec: 60,  bulk_bytes: 314572800, mx_max: 4000, pair_max: 2000 },
+    'balanced':     { interval: 2, interval_max: 10, adapt_budget: 0.30, tooltip_every: 0, hosts_refresh_sec: 60,  gua_refresh_sec: 120, bulk_bytes: 314572800, mx_max: 2000, pair_max: 1000 },
+    'low-cpu':      { interval: 4, interval_max: 20, adapt_budget: 0.45, tooltip_every: 2, hosts_refresh_sec: 180, gua_refresh_sec: 300, bulk_bytes: 314572800, mx_max: 1000, pair_max: 500 },
+    'very-low-cpu': { interval: 6, interval_max: 30, adapt_budget: 0.55, tooltip_every: 3, hosts_refresh_sec: 300, gua_refresh_sec: 600, bulk_bytes: 314572800, mx_max: 500,  pair_max: 250 }
 };
 var PROFILE_DEFAULT = 'low-cpu';   // used by the daemon when no profile is set
 
@@ -38,6 +39,7 @@ return view.extend({
 
         o = s.option(form.ListValue, 'profile', _('Profile'),
             _('Preset tuning profile. The selected profile sets the low-level timing values (shown in grey in the fields below while they are empty); you can still override any of them individually.'));
+        o.value('realtime', _('RealTime'));
         o.value('balanced', _('Balanced'));
         o.value('low-cpu', _('Low CPU'));
         o.value('very-low-cpu', _('Very low CPU'));
@@ -91,6 +93,54 @@ return view.extend({
         o = s.option(form.Value, 'attr_skip_ports', _('Router infrastructure ports'),
             _('Only used when the field above is empty: ports that never count as "router is serving this device" (SSH, DNS, DHCP, NTP, DoT, mDNS, LuCI ...).'));
         o.placeholder = '22 53 67 68 80 123 443 853 5353 5355';
+
+        s = m.section(form.NamedSection, 'global', 'trafficchart', _('CPU / Performance'),
+            _('These options actually turn off expensive features (not just tune them). Take effect on the next ' +
+              'aggregator restart, or - for the address re-resolution one - on the next host refresh.'));
+
+        o = s.option(form.Flag, 'tooltips', _('Detailed tooltips'),
+            _('Maintains the application x destination, destination x device and device x application tables that ' +
+              'feed the "top applications/destinations" tooltips in the live view. Costs CPU on EVERY accounted flow ' +
+              'delta, regardless of whether a tab showing them is even open. Disabling leaves the tooltips empty; ' +
+              'totals and the History tab are not affected.'));
+        o.default = '1';
+
+        o = s.option(form.Flag, 'attr_totals', _('Router proxy attribution'),
+            _('Tries to attribute the router\'s own WAN traffic (e.g. a stream proxy) to the LAN device it served, ' +
+              'instead of showing it generically as "Router". Needs a per-poll match of every candidate application ' +
+              'against every candidate device. Disabling skips that entirely; the traffic then stays on the "Router" device.'));
+        o.default = '1';
+
+        o = s.option(form.Flag, 'v6_reresolve', _('Active IPv6 re-resolution'),
+            _('Under NSS hardware offload, periodically pings LAN IPv6 addresses that dropped out of the neighbour ' +
+              'table so they fold back into the right device (by MAC) instead of showing up as their own "device" keyed ' +
+              'by a raw IPv6 address. Causes short, parallel ping6 processes on every host refresh. Disabling skips that; ' +
+              'affected addresses stay as a separate entry until they re-announce themselves.'));
+        o.default = '1';
+
+        o = s.option(form.Flag, 'tc_stats', _('Daemon-side link/shaper stats'),
+            _('Forks "tc -s qdisc show" once per shaped device (twice with multi-WAN) on EVERY poll of this daemon, ' +
+              'whether or not a browser tab is open - unlike the live shaper line at the top of the page, which only ' +
+              'runs on an actual page request and is cached for 1 s. Feeds the daemon-side link rate, the "Not attributed" ' +
+              'ring segment, and the History tab\'s shaper drop/ECN/backlog row. Disabling behaves exactly like not having ' +
+              'the trafficchart-tc helper installed: those three go away, everything else (totals, applications, devices, ' +
+              'destinations, and the live shaper line itself) keeps working.'));
+        o.default = '1';
+
+        o = s.option(form.Value, 'mx_max', _('Max tooltip-matrix entries'),
+            _('Combined size limit for the application x destination and destination x device tables. Once full, ' +
+              'long-idle entries are dropped first; if nothing is idle, new entries are simply skipped. Only relevant ' +
+              'while "Detailed tooltips" is on.'));
+        o.datatype = 'uinteger';
+        o.placeholder = String(PROFILES[PROFILE_DEFAULT].mx_max);
+        o.depends('tooltips', '1');
+
+        o = s.option(form.Value, 'pair_max', _('Max device x application entries'),
+            _('Size limit for the "top applications per device" table. Same cleanup behaviour as above. Only relevant ' +
+              'while "Detailed tooltips" is on.'));
+        o.datatype = 'uinteger';
+        o.placeholder = String(PROFILES[PROFILE_DEFAULT].pair_max);
+        o.depends('tooltips', '1');
 
                 s = m.section(form.NamedSection, 'global', 'trafficchart', _('History and persistent storage'),
             _('The History tab keeps three resolutions: 5 minute buckets (24 hours view), hourly buckets (week) and daily buckets (month, year). ' +

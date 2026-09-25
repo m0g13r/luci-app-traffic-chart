@@ -167,7 +167,10 @@
 # The link layer header (tc counts it, conntrack does not) is measured automatically,
 # see L2_OVERHEAD below. LAN-local flows never reach the WAN shaper and are not part
 # of it. Rates over UN_WIN seconds (download: UN_WIN_RX, longer, because the counter
-# sync of big NSS downloads jitters more).
+# sync of big NSS downloads jitters more). Reported is the SMALLER of that short-window rate
+# and a UN_WIN_LONG rate (default 300s, 0 = off): a start/end timing offset between the shaper
+# and conntrack counters shows up as a swing in the short window that nets out to about zero
+# over the long one, so it is suppressed; a persistently missing volume is not.
 #
 # Bounded memory: applications (APP_MAX), tooltip matrices (MX_MAX, PAIR_MAX) have a
 # size limit; when one is full, long idle entries are dropped first (TBL_IDLE_*).
@@ -175,12 +178,18 @@
 # apps.map: trafficchart-apps bumps apps.map.ver after every write; the map is only
 # re-read when that changed.
 #
+# TOOLTIPS (default 1): 0 disables the per-flow tooltip-matrix bookkeeping (application x
+# destination, destination x device, device x application - the "top applications" /
+# "top destinations" lists in the Live tabs' tooltips). Real CPU cost, paid on every
+# accounted flow delta regardless of whether tooltip_every ever renders it. Totals and
+# the History tab are computed independently and are NOT affected by this flag.
+#
 # Environment overrides (mainly for testing): CT_FILE OUT_DIR INTERVAL
 # BULK_BYTES V6HELPER AWK APP_HOLD HOSTS_HELPER HIST_SEC HIST_KEEP ATTR_WIN BIRTH_MAX GONE_GRACE
-# ATTR_PORTS ATTR_SKIP_PORTS ATTR_MIN ATTR_SHARE ATTR_TOL ATTR_MAX_APPS ATTR_MAX_DEVICES
+# ATTR_PORTS ATTR_SKIP_PORTS ATTR_MIN ATTR_SHARE ATTR_TOL ATTR_MAX_APPS ATTR_MAX_DEVICES TOOLTIPS TC_STATS
 # ADAPT_INTERVAL INTERVAL_MAX ADAPT_BUDGET TOOLTIP_EVERY HOSTS_REFRESH_SEC GUA_REFRESH_SEC
 # L2_OVERHEAD L2_INIT L2_CANDIDATES CAL_WIN CAL_KEEP CAL_MIN CAL_PCTL CAL_TOL CAL_MAX_PKT
-# CAL_MIN_PKTS UN_WIN UN_WIN_RX APP_MAX MX_MAX PAIR_MAX TBL_IDLE_LONG TBL_IDLE_SHORT
+# CAL_MIN_PKTS UN_WIN UN_WIN_RX UN_WIN_LONG APP_MAX MX_MAX PAIR_MAX TBL_IDLE_LONG TBL_IDLE_SHORT
 # TC_HELPER RATE_WIN PERSIST_DIR PERSIST_MOUNT PERSIST_SEC PERSIST_TIMEOUT HIST_HOUR_KEEP HIST_DAY_KEEP
 # HOUR_SEC DAY_SEC (tier lengths, testing only) TC_COMMON HOST_MAX
 #
@@ -200,27 +209,39 @@ if [ -r "$TC_COMMON" ]; then
     PROFILE_GUA_REFRESH_SEC=120
     PROFILE_RATE_WIN=10
     PROFILE_BULK_BYTES=314572800
+    PROFILE_MX_MAX=2000
+    PROFILE_PAIR_MAX=1000
     case "$PROFILE" in
+        realtime)
+            PROFILE_INTERVAL=1;            PROFILE_ADAPT_INTERVAL=1;     PROFILE_INTERVAL_MAX=5
+            PROFILE_ADAPT_BUDGET=0.15;     PROFILE_TOOLTIP_EVERY=1;      PROFILE_HOSTS_REFRESH_SEC=30
+            PROFILE_GUA_REFRESH_SEC=60;    PROFILE_RATE_WIN=5;           PROFILE_BULK_BYTES=314572800
+            PROFILE_MX_MAX=4000;           PROFILE_PAIR_MAX=2000
+            ;;
         balanced)
             PROFILE_INTERVAL=2;            PROFILE_ADAPT_INTERVAL=1;     PROFILE_INTERVAL_MAX=10
             PROFILE_ADAPT_BUDGET=0.30;     PROFILE_TOOLTIP_EVERY=0;      PROFILE_HOSTS_REFRESH_SEC=60
             PROFILE_GUA_REFRESH_SEC=120;   PROFILE_RATE_WIN=10;          PROFILE_BULK_BYTES=314572800
+            PROFILE_MX_MAX=2000;           PROFILE_PAIR_MAX=1000
             ;;
         low-cpu)
             PROFILE_INTERVAL=4;            PROFILE_ADAPT_INTERVAL=1;     PROFILE_INTERVAL_MAX=20
             PROFILE_ADAPT_BUDGET=0.45;     PROFILE_TOOLTIP_EVERY=2;      PROFILE_HOSTS_REFRESH_SEC=180
             PROFILE_GUA_REFRESH_SEC=300;   PROFILE_RATE_WIN=10;          PROFILE_BULK_BYTES=314572800
+            PROFILE_MX_MAX=1000;           PROFILE_PAIR_MAX=500
             ;;
         very-low-cpu)
             PROFILE_INTERVAL=6;            PROFILE_ADAPT_INTERVAL=1;     PROFILE_INTERVAL_MAX=30
             PROFILE_ADAPT_BUDGET=0.55;     PROFILE_TOOLTIP_EVERY=3;      PROFILE_HOSTS_REFRESH_SEC=300
             PROFILE_GUA_REFRESH_SEC=600;   PROFILE_RATE_WIN=10;          PROFILE_BULK_BYTES=314572800
+            PROFILE_MX_MAX=500;            PROFILE_PAIR_MAX=250
             ;;
         *)
             PROFILE=balanced
             PROFILE_INTERVAL=2;            PROFILE_ADAPT_INTERVAL=1;     PROFILE_INTERVAL_MAX=10
             PROFILE_ADAPT_BUDGET=0.30;     PROFILE_TOOLTIP_EVERY=0;      PROFILE_HOSTS_REFRESH_SEC=60
             PROFILE_GUA_REFRESH_SEC=120;   PROFILE_RATE_WIN=10;          PROFILE_BULK_BYTES=314572800
+            PROFILE_MX_MAX=2000;           PROFILE_PAIR_MAX=1000
             ;;
     esac
     tc_cfg INTERVAL "$PROFILE_INTERVAL" int
@@ -237,13 +258,16 @@ if [ -r "$TC_COMMON" ]; then
     tc_cfg PERSIST_DIR "";            tc_cfg PERSIST_MOUNT "";         tc_cfg PERSIST_SEC 3600 int
     tc_cfg PERSIST_TIMEOUT 10 int
     tc_cfg HOST_MAX 200 int
-    tc_cfg APP_HOLD 3 int;            tc_cfg APP_MAX 400 int;          tc_cfg MX_MAX 8000 int
-    tc_cfg PAIR_MAX 4096 int;         tc_cfg TBL_IDLE_LONG 3600 int;   tc_cfg TBL_IDLE_SHORT 600 int
+    tc_cfg APP_HOLD 3 int;            tc_cfg APP_MAX 400 int;          tc_cfg MX_MAX "$PROFILE_MX_MAX" int
+    tc_cfg PAIR_MAX "$PROFILE_PAIR_MAX" int;   tc_cfg TBL_IDLE_LONG 3600 int;   tc_cfg TBL_IDLE_SHORT 600 int
     tc_cfg BIRTH_MAX 1073741824 int;  tc_cfg GONE_GRACE 5 int
     tc_cfg L2_OVERHEAD auto l2;       tc_cfg L2_INIT 18 int;           tc_cfg L2_CANDIDATES "0 14 18 22 26" list
     tc_cfg CAL_WIN 30 int;            tc_cfg CAL_KEEP 60 int;          tc_cfg CAL_MIN 8 int
     tc_cfg CAL_PCTL 25 int;           tc_cfg CAL_MAX_PKT 400 int;      tc_cfg CAL_MIN_PKTS 500 int
     tc_cfg CAL_TOL 1 int;             tc_cfg UN_WIN 30 int;            tc_cfg UN_WIN_RX 60 int
+    tc_cfg UN_WIN_LONG 300 int
+    tc_cfg TOOLTIPS 1 int
+    tc_cfg TC_STATS 1 int
     tc_cfg ATTR_TOTALS 1 int;         tc_cfg ATTR_TOPAPPS 0 int;       tc_cfg ATTR_PORTS 9999 list
     tc_cfg ATTR_SKIP_PORTS "22 53 67 68 80 123 443 853 5353 5355" list
     tc_cfg ATTR_WIN 60 int;           tc_cfg ATTR_TOL 0.6 num;         tc_cfg ATTR_MIN 262144 int
@@ -272,6 +296,18 @@ ATTR_WIN="${ATTR_WIN:-60}"   # seconds: window in which router WAN volume and cl
  # ATTR_PORTS, ATTR_TOTALS, ATTR_TOPAPPS, RATE_WIN and UN_WIN were loaded above.
 TC_HELPER="${TC_HELPER:-/usr/libexec/trafficchart-tc}"   # prints "<rx_bytes> <tx_bytes> <rx_drop> <rx_ecn> <tx_drop> <tx_ecn>" of the shapers; without it the page falls back to browser side rates and no shaper history
 [ -x "$TC_HELPER" ] || TC_HELPER=""   # not installed: no link rate, the page falls back to browser side rates
+# TC_STATS (option tc_stats, default 1): trafficchart-tc itself forks "tc -s qdisc show"
+# once per RX device and once per TX device (twice that with multi-WAN), PLUS
+# tc_resolve()'s own config_load/config_foreach over uci sqm - all of that on every
+# single INTERVAL poll of THIS daemon, independent of whether a browser tab is even
+# open (unlike luci.trafficchart's own tc calls, which only run on an actual page
+# request and are 1s-cached). 0 disables it the same way a missing trafficchart-tc
+# binary already does: no daemon-side link rate, no "Not attributed" ring segment, and
+# the History tab's shaper drop/ECN/backlog row stays empty. The live shaper health
+# line at the top of the page (drops/ECN sparkline) is unaffected either way - that one
+# always comes from luci.trafficchart's own per-request tc call, not from this daemon.
+TC_STATS="${TC_STATS:-1}"
+[ "$TC_STATS" = "1" ] || TC_HELPER=""
  # ATTR_TOL, ATTR_MIN, ATTR_SHARE, ATTR_MAX_APPS and ATTR_MAX_DEVICES were loaded above.
 # Bytes per packet that the shaper (tc) counts but conntrack does not: the link layer
 # header (Ethernet 14, +4 VLAN, +8 PPPoE). Without this the "not attributed" estimate
@@ -372,8 +408,9 @@ $AWK -v CT_FILE="$CT_FILE" -v OUT="$OUT_DIR" -v INTERVAL="$INTERVAL" \
     -v MAPFILE="$OUT_DIR/apps.map" -v HOSTS_HELPER="$HOSTS_HELPER" \
     -v HIST_SEC="$HIST_SEC" -v HIST_KEEP="$HIST_KEEP" -v ATTR_WIN="$ATTR_WIN" -v BIRTH_MAX="$BIRTH_MAX" -v GONE_GRACE="$GONE_GRACE" \
     -v ADAPT_INTERVAL="$ADAPT_INTERVAL" -v INTERVAL_MAX="$INTERVAL_MAX" -v ADAPT_BUDGET="$ADAPT_BUDGET" -v TOOLTIP_EVERY="$TOOLTIP_EVERY" -v HOSTS_REFRESH_SEC="$HOSTS_REFRESH_SEC" -v GUA_REFRESH_SEC="$GUA_REFRESH_SEC" \
+    -v TOOLTIPS="$TOOLTIPS" \
     -v RATE_WIN="$RATE_WIN" -v UN_WIN="$UN_WIN" -v TC_HELPER="$TC_HELPER" -v ATTR_TOL="$ATTR_TOL" -v ATTR_TOPAPPS="$ATTR_TOPAPPS" -v ATTR_TOTALS="$ATTR_TOTALS" -v ATTR_SKIP_PORTS="$ATTR_SKIP_PORTS" -v ATTR_PORTS="$ATTR_PORTS" -v ATTR_MIN="$ATTR_MIN" -v ATTR_SHARE="$ATTR_SHARE" -v ATTR_MAX_APPS="$ATTR_MAX_APPS" -v ATTR_MAX_DEVICES="$ATTR_MAX_DEVICES" -v L2_OVERHEAD="$L2_OVERHEAD" -v L2_INIT="$L2_INIT" -v L2_CANDIDATES="$L2_CANDIDATES" -v CAL_TOL="$CAL_TOL" -v CAL_WIN="$CAL_WIN" -v CAL_KEEP="$CAL_KEEP" -v CAL_MIN="$CAL_MIN" -v CAL_PCTL="$CAL_PCTL" -v CAL_MAX_PKT="$CAL_MAX_PKT" -v CAL_MIN_PKTS="$CAL_MIN_PKTS" \
-    -v HOST_MAX="$HOST_MAX" -v UN_WIN_RX="$UN_WIN_RX" -v APP_MAX="$APP_MAX" -v MX_MAX="$MX_MAX" -v PAIR_MAX="$PAIR_MAX" -v TBL_IDLE_LONG="$TBL_IDLE_LONG" -v TBL_IDLE_SHORT="$TBL_IDLE_SHORT" -v MAPVER="$OUT_DIR/apps.map.ver" '
+    -v HOST_MAX="$HOST_MAX" -v UN_WIN_RX="$UN_WIN_RX" -v UN_WIN_LONG="$UN_WIN_LONG" -v APP_MAX="$APP_MAX" -v MX_MAX="$MX_MAX" -v PAIR_MAX="$PAIR_MAX" -v TBL_IDLE_LONG="$TBL_IDLE_LONG" -v TBL_IDLE_SHORT="$TBL_IDLE_SHORT" -v MAPVER="$OUT_DIR/apps.map.ver" '
 # "LAN-side" / non-WAN address? (RFC1918, loopback, link-local, multicast,
 # ULA, plus the dynamically discovered LAN GUA prefixes in "gua").
 # IPv6 addresses in /proc/net/nf_conntrack are fully expanded (%pI6).
@@ -462,8 +499,8 @@ function dev_key(lan, src, rsrc,   addr, mac, key, nm) {
 }
 
 function dev_add(key, lan, d1, d2, q1, q2) {
-    if (lan) { dob[key] += d1; dopk[key] += q1; dib[key] += d2; dipk[key] += q2 }
-    else     { dib[key] += d1; dipk[key] += q1; dob[key] += d2; dopk[key] += q2 }
+    if (lan) { dob[key] += d1; dopk[key] += q1; dib[key] += d2; dipk[key] += q2; dob_rt[key] += d1; dib_rt[key] += d2 }
+    else     { dib[key] += d1; dipk[key] += q1; dob[key] += d2; dopk[key] += q2; dib_rt[key] += d1; dob_rt[key] += d2 }
 }
 
 # display name of a device key
@@ -745,9 +782,11 @@ function attr_match(dir,   k, p, a, d, ra, rap, sel, vd, rem, used, cr, cv, pick
         if (dir == 0) {
             pair_xfer(bd, ba, x, 0, (ATTR_TOPAPPS ? ba : "Proxy-Stream (via Router)"))
             dib[bd] += x; dib["router"] -= x; dipk[bd] += pk; dipk["router"] -= pk
+            dib_rt["router"] -= x
         } else {
             pair_xfer(bd, ba, 0, x, (ATTR_TOPAPPS ? ba : "Proxy-Stream (via Router)"))
             dob[bd] += x; dob["router"] -= x; dopk[bd] += pk; dopk["router"] -= pk
+            dob_rt["router"] -= x
         }
         used[bd] = 1; rem[ba] -= x; cr[ba] += x; cv[bd] += x
     }
@@ -824,6 +863,12 @@ function acct(dk, a, host, lan, d1, d2, q1, q2,   hk) {
     if (dk == "router" && lan) { rti[a] += d2; rto[a] += d1; rtip[a] += q2; rtop[a] += q1 }
     app_add(a, lan, d1, d2, q1, q2)
     hk = host_add(host, lan, d1, d2, q1, q2)
+    # TOOLTIPS=0: skip the per-flow tooltip-matrix bookkeeping entirely (2 mx_add +
+    # 1 pair_add per accounted delta, each a hash lookup plus a possible mx_gc/pair_gc
+    # sweep once the table is full) - this is the actual CPU cost of the tooltip
+    # feature, not just how often emit() renders it. Totals (app/device/destination)
+    # and the History tab are unaffected: they never read these matrices.
+    if (!TOOLTIPS) return
     pair_add(dk, a, lan, d1, d2)
     mx_add("a", a, hk, lan, d1, d2)
     mx_add("h", hk, dk, lan, d1, d2)
@@ -1003,7 +1048,10 @@ function parse_pass(   line, r, h, proto, mark, pp, t, sp, b1, b2, p1, p2,
             if (d1 > 0 || d2 > 0) {
                 dk = dev_key(1, src, "")
                 dvi[dk] += d2; dvo[dk] += d1
-                if (attr_port_ok(proto, pp)) { vdl[dk] += d2; vul[dk] += d1 }
+                # dib_rt/dob_rt mirror dib/dob but credit router-attributable traffic THE MOMENT it is
+                # delivered, not when attr_match() later moves it from the Router bucket to the device
+                # (which can lag up to ATTR_WIN seconds and land in one lump - see rate_one() below).
+                if (attr_port_ok(proto, pp)) { vdl[dk] += d2; vul[dk] += d1; dib_rt[dk] += d2; dob_rt[dk] += d1 }
             }
             pb1[key] = b1; pb2[key] = b2; pp1[key] = p1; pp2[key] = p2; gen[key] = n
             continue
@@ -1090,7 +1138,7 @@ function rates_update(now,   slot, full, ot, k) {
     full = (rn > RATE_K)
     ot = full ? rt_t[slot] : rt_t0
     for (k in aseen) rate_one("a", k, aib[k], aob[k], slot, full, now, ot)
-    for (k in dseen) rate_one("d", k, dib[k], dob[k], slot, full, now, ot)
+    for (k in dseen) rate_one("d", k, dib_rt[k] + 0, dob_rt[k] + 0, slot, full, now, ot)
     for (k in hseen) rate_one("h", k, hib[k], hob[k], slot, full, now, ot)
     rt_t[slot] = now
     # what conntrack accounting saw in total (applications add up to everything)
@@ -1228,7 +1276,7 @@ function un_rate1(d, cur, now,   slot, full, ot, ov, k) {
 # would jump by millions of packets x 1 byte). It can go negative for a moment (ECM/NSS
 # syncs the conntrack counters in bursts, and conntrack can also count MORE than the
 # shaper sent, e.g. upload packets dropped by the shaper); rates are clamped at 0.
-function un_update(now,   oh) {
+function un_update(now,   oh, lr, lt) {
     if (!have_tc || !rt_init) return
     cal_update()
     oh = l2_now()
@@ -1239,6 +1287,14 @@ function un_update(now,   oh) {
         un_cum_tx += (tcc_tx - up_tc_tx) - (ct_tot_out - up_ct_tx) - oh * (ct_pk_out - up_pk_tx)
         un_rx_rate = un_rate1("rx", un_cum_rx, now)
         un_tx_rate = un_rate1("tx", un_cum_tx, now)
+        # A timing offset between the shaper counters and the conntrack counters (NSS syncs the latter in
+        # bursts) makes the difference swing up when a transfer starts and down when it ends: it adds up to
+        # about zero over the whole transfer. A really missing volume does not. So only what is also there
+        # in the long window is reported: the smaller of the two rates.
+        if (UN_WIN_LONG > 0) {
+            lr = un_rate1("rxL", un_cum_rx, now); if (lr < un_rx_rate) un_rx_rate = lr
+            lt = un_rate1("txL", un_cum_tx, now); if (lt < un_tx_rate) un_tx_rate = lt
+        }
     }
     up_tc_rx = tcc_rx; up_tc_tx = tcc_tx; up_ct_rx = ct_tot_in; up_ct_tx = ct_tot_out; up_pk_rx = ct_pk_in; up_pk_tx = ct_pk_out
 }
@@ -1420,6 +1476,7 @@ function hist_tick(t,   lt, kh, kd) {
 function hist_reset(   T, i) {
     split("", aseen); split("", aib); split("", aob); split("", aip); split("", aop); napp = 0
     split("", dseen); split("", dib); split("", dob); split("", dipk); split("", dopk)
+    split("", dib_rt); split("", dob_rt)
     split("", dname); split("", dvip); ndev = 0
     split("", hseen); split("", hib); split("", hob); split("", hip); split("", hop); split("", hlast); nhost = 0
     split("", pidx); split("", pdv); split("", pap); split("", pin); split("", pout); split("", plast)
@@ -1601,7 +1658,7 @@ function emit(t,   s, tmp, a, first, k, nm, i, j, sc, nt, tsc, tky, pd, tot, n2,
     # destination - only for the 30 biggest of each (that is all the page shows)
     tooltip_period = (mxcnt > 6000 || npair > 3000) ? 10 : ((mxcnt > 2000 || npair > 1000) ? 5 : 1)
     tooltip_due = (tooltip_last == 0 || (TOOLTIP_EVERY > 0 && n - tooltip_last >= TOOLTIP_EVERY) || (TOOLTIP_EVERY <= 0 && n - tooltip_last >= tooltip_period))
-    if (tooltip_due) {
+    if (TOOLTIPS && tooltip_due) {
         split("", ktsc); split("", ktky); ktn = 0; split("", keepa)
         for (a in aseen) kt_ins(a, aib[a] + aob[a], 30)
         for (i = 1; i <= ktn; i++) keepa[ktky[i]] = 1
@@ -1706,6 +1763,9 @@ BEGIN {
     UN_WIN_RX += 0; if (UN_WIN_RX < UN_WIN) UN_WIN_RX = UN_WIN
     UN_K_RX = int(UN_WIN_RX / INTERVAL + 0.5); if (UN_K_RX < 2) UN_K_RX = 2
     un_k["rx"] = UN_K_RX; un_k["tx"] = UN_K
+    UN_WIN_LONG += 0; if (UN_WIN_LONG > 0 && UN_WIN_LONG < UN_WIN_RX) UN_WIN_LONG = UN_WIN_RX
+    UN_K_LONG = int(UN_WIN_LONG / INTERVAL + 0.5); if (UN_K_LONG < 2) UN_K_LONG = 2
+    un_k["rxL"] = UN_K_LONG; un_k["txL"] = UN_K_LONG
     # link header size: measured (auto) or fixed
     if (L2_OVERHEAD == "auto" || L2_OVERHEAD == "") { l2_auto = 1; l2_est = L2_INIT + 0 } else { l2_auto = 0; L2_OVERHEAD += 0 }
     ncand = split(L2_CANDIDATES, cand, " ")
@@ -1723,6 +1783,7 @@ BEGIN {
     IDLE_MIN_P = int(TBL_IDLE_SHORT / 5 / INTERVAL) + 2   # last resort: idle for about 2 minutes
     HOST_MAX += 0; if (HOST_MAX < 20) HOST_MAX = 20
     TBL_LOG_POLLS = int(3600 / INTERVAL) + 1
+    TOOLTIPS += 0
     ATTR_MIN += 0; ATTR_SHARE += 0; ATTR_TOL += 0; ATTR_TOPAPPS += 0; ATTR_TOTALS += 0
     ATTR_MAX_APPS += 0; ATTR_MAX_DEVICES += 0
     nskip = split(ATTR_SKIP_PORTS, skipl, " ")
