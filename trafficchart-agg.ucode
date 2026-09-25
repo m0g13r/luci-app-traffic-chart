@@ -1,0 +1,334 @@
+#!/usr/bin/env ucode
+
+/* Native Netify flow aggregator.  Counters come from flow events, not from a
+ * conntrack polling loop.  The JSON file is intentionally compatible with the
+ * shell aggregator's public contract. */
+
+import * as fs from 'fs';
+import * as socket from 'socket';
+import * as uloop from 'uloop';
+import * as uci from 'uci';
+import * as ubus from 'ubus';
+
+let cfg = {
+	interval: 2,
+	rate_win: 10,
+	app_hold: 3,
+	app_max: 512,
+	device_max: 256,
+	host_max: 512,
+	top_flows: 25,
+	out_dir: '/tmp/trafficchart',
+	sock: '/var/run/netifyd/netifyd.sock',
+	bulk_bytes: 314572800,
+	flow_grace: 3,
+	profile: 'very-low-cpu'
+};
+
+let flows = {};
+let digests = {};
+let apps = {};
+let classes = {};
+let devices = {};
+let hosts = {};
+let rates = { samples: [], last: 0 };
+let seq = 0;
+let since = time();
+let stopped = false;
+let dirty = true;
+let netify = null;
+let netify_fd = null;
+let ub = null;
+let rxbuf = '';
+
+function logmsg(level, message) {
+	let out = fs.stderr;
+	out.write(`[${level}] ${message}\n`);
+	out.flush();
+}
+
+function number(v, fallback) {
+	if (v == null || v == '') return fallback;
+	let n = +v;
+	return isNaN(n) ? fallback : n;
+}
+
+function read_config() {
+	let c = uci.cursor();
+	let section = c.get_all('trafficchart', 'global') || {};
+	if (!section) return;
+	for (let k in cfg) {
+		let v = section[k];
+		if (v == null) continue;
+		if (k == 'out_dir' || k == 'sock' || k == 'profile') cfg[k] = v;
+		else cfg[k] = number(v, cfg[k]);
+	}
+	if (section.agg_interval != null) cfg.interval = number(section.agg_interval, cfg.interval);
+	if (section.netify_socket != null) cfg.sock = section.netify_socket;
+}
+
+function mkdir(path) {
+	fs.mkdir(path, 493);
+}
+
+function clean(s) {
+	return replace('' + (s == null ? '' : s), /["\\\x00-\x1f]/g, '_');
+}
+
+function ip6short(ip) {
+	return replace('' + ip, /^::ffff:/i, '');
+}
+
+function local_ip(ip) {
+	ip = ip6short(ip);
+	return /^10\./.test(ip) || /^192\.168\./.test(ip) ||
+		/^172\.(1[6-9]|2[0-9]|3[01])\./.test(ip) ||
+	/^fd[0-9a-f]{2}:/i.test(ip) || ip == '::1' || ip == '127.0.0.1';
+}
+
+function class_name(c) {
+	let names = ['UNMARKED', 'PRIO', 'VOIP', 'GAME', 'WEB', 'STREAM',
+		'BULK', 'P2P', 'BE', 'VPN', 'MAIL', 'NTP', 'FTP', 'REMOTE',
+		'DB', 'MGMT', 'CONTAINER', 'IOT'];
+	return names[c] || 'UNMARKED';
+}
+
+function event_value(e, names, fallback) {
+	for (let n in names) if (e[names[n]] != null) return e[names[n]];
+	return fallback;
+}
+
+function flow_tuple(e) {
+	let proto = event_value(e, ['protocol', 'detected_protocol_name'], 'ip');
+	let src = event_value(e, ['local_ip', 'source_ip', 'src_ip'], '');
+	let dst = event_value(e, ['other_ip', 'destination_ip', 'dst_ip'], '');
+	let sp = event_value(e, ['local_port', 'source_port', 'sport'], '');
+	let dp = event_value(e, ['other_port', 'destination_port', 'dport'], '');
+	return join('|', [lc('' + proto), ip6short(src), ip6short(dst), '' + sp, '' + dp]);
+}
+
+function reverse_tuple(e) {
+	let proto = event_value(e, ['protocol', 'detected_protocol_name'], 'ip');
+	let src = event_value(e, ['local_ip', 'source_ip', 'src_ip'], '');
+	let dst = event_value(e, ['other_ip', 'destination_ip', 'dst_ip'], '');
+	let sp = event_value(e, ['local_port', 'source_port', 'sport'], '');
+	let dp = event_value(e, ['other_port', 'destination_port', 'dport'], '');
+	return join('|', [lc('' + proto), ip6short(dst), ip6short(src), '' + dp, '' + sp]);
+}
+
+function app_name(name) {
+	name = replace(clean(name || 'Unknown'), /^netify\./, '');
+	if (!name || name == 'Unknown') return '';
+	if (apps[name] == null && length(keys(apps)) >= cfg.app_max) return '(other)';
+	return name;
+}
+
+function host_name(e) {
+	let h = event_value(e, ['host_server_name', 'dns_host_name', 'host'], '');
+	if (!h) h = event_value(e, ['other_ip', 'destination_ip', 'dst_ip'], '');
+	h = lc(clean(h));
+	let p = split(h, '.');
+	if (length(p) > 2) h = p[length(p) - 2] + '.' + p[length(p) - 1];
+	return h;
+}
+
+function device(e, src, dst) {
+	let ip = local_ip(src) ? src : (local_ip(dst) ? dst : 'router');
+	let mac = event_value(e, ['source_mac', 'client_mac', 'mac'], '');
+	return clean(mac || ip || 'Router');
+}
+
+function bounded(table, key, limit) {
+	if (table[key] != null) return table[key];
+	if (length(keys(table)) >= limit) return table['(other)'] || (table['(other)'] = {});
+	return table[key] = {};
+}
+
+function bucket(table, key, limit) {
+	let b = bounded(table, key, limit);
+	if (b.in_bytes == null) b = table[key] = { in_bytes: 0, in_packets: 0, out_bytes: 0, out_packets: 0 };
+	return b;
+}
+
+function add_count(b, inbound, bytes, packets) {
+	if (bytes < 0) bytes = 0;
+	if (packets < 0) packets = 0;
+	if (inbound) { b.in_bytes += bytes; b.in_packets += packets; }
+	else { b.out_bytes += bytes; b.out_packets += packets; }
+}
+
+function account(f, din, dout, pin, pout) {
+	if (din <= 0 && dout <= 0 && pin <= 0 && pout <= 0) return;
+	let inbound = f.local;
+	let a = f.app || ('[' + class_name(f.class) + ']');
+	let h = f.host || f.remote;
+	let d = f.device;
+	let ab = bucket(apps, a, cfg.app_max);
+	let cb = bucket(classes, class_name(f.class), 18);
+	let db = bucket(devices, d, cfg.device_max);
+	let hb = bucket(hosts, h, cfg.host_max);
+	add_count(ab, inbound, inbound ? din : dout, inbound ? pin : pout);
+	add_count(ab, !inbound, inbound ? dout : din, inbound ? pout : pin);
+	add_count(cb, inbound, inbound ? din : dout, inbound ? pin : pout);
+	add_count(cb, !inbound, inbound ? dout : din, inbound ? pout : pin);
+	add_count(db, inbound, inbound ? din : dout, inbound ? pin : pout);
+	add_count(db, !inbound, inbound ? dout : din, inbound ? pout : pin);
+	add_count(hb, inbound, inbound ? din : dout, inbound ? pin : pout);
+	add_count(hb, !inbound, inbound ? dout : din, inbound ? pout : pin);
+	dirty = true;
+}
+
+function classify(e) {
+	let mark = number(event_value(e, ['mark', 'class', 'traffic_class'], 0), 0) & 255;
+	let total = number(event_value(e, ['bytes', 'total_bytes'], 0), 0);
+	let c = mark;
+	if ((c == 4 || c == 7 || c == 8) && total > cfg.bulk_bytes) c = 6;
+	return c > 17 || c == 64 ? 0 : c;
+}
+
+function flow_event(e) {
+	let key = event_value(e, ['digest', 'flow_id', 'id'], '') || flow_tuple(e);
+	let tuple = flow_tuple(e);
+	let twin = digests[key] || digests[tuple] || digests[reverse_tuple(e)];
+	if (twin && twin != key) key = twin;
+	let f = flows[key];
+	if (!f) f = flows[key] = { bytes: 0, packets: 0, rbytes: 0, rpackets: 0, age: seq, class: classify(e) };
+	digests[tuple] = key;
+	if (event_value(e, ['digest'], '') != '') digests[event_value(e, ['digest'], '')] = key;
+	let bytes = number(event_value(e, ['bytes', 'total_bytes'], 0), 0);
+	let packets = number(event_value(e, ['packets', 'total_packets'], 0), 0);
+	let rbytes = number(event_value(e, ['reply_bytes', 'other_bytes'], 0), 0);
+	let rpackets = number(event_value(e, ['reply_packets', 'other_packets'], 0), 0);
+	let first = !f.seen;
+	let db = bytes - f.bytes, dp = packets - f.packets;
+	let rdb = rbytes - f.rbytes, rdp = rpackets - f.rpackets;
+	if (first) { db = 0; dp = 0; rdb = 0; rdp = 0; }
+	if (db < 0 || rdb < 0 || dp < 0 || rdp < 0) { db = max(db, 0); dp = max(dp, 0); rdb = max(rdb, 0); rdp = max(rdp, 0); }
+	f.bytes = bytes; f.packets = packets; f.rbytes = rbytes; f.rpackets = rpackets;
+	f.seen = true; f.age = seq; f.class = classify(e);
+	f.local = local_ip(event_value(e, ['local_ip', 'source_ip', 'src_ip'], ''));
+	f.remote = ip6short(event_value(e, ['other_ip', 'destination_ip', 'dst_ip'], ''));
+	f.device = device(e, event_value(e, ['local_ip', 'source_ip', 'src_ip'], ''), event_value(e, ['other_ip', 'destination_ip', 'dst_ip'], ''));
+	let candidate = app_name(event_value(e, ['detected_application_name', 'detected_protocol_name', 'application'], ''));
+	if (candidate) f.app = candidate;
+	f.host = host_name(e);
+	account(f, db, rdb, dp, rdp);
+	let now = time();
+	f.in_bps = (f.in_bps || 0) * 0.5 + ((f.local ? rdb : db) / max(now - (f.last || now), 1)) * 0.5;
+	f.out_bps = (f.out_bps || 0) * 0.5 + ((f.local ? db : rdb) / max(now - (f.last || now), 1)) * 0.5;
+	f.last = now;
+}
+
+function purge_event(e) {
+	let key = event_value(e, ['digest', 'flow_id', 'id'], '');
+	if (!key || !flows[key]) return;
+	delete flows[key];
+}
+
+function parse_event(line) {
+	let e;
+	try { e = json(line); } catch (err) { return; }
+	if (!e) return;
+	let type = e.type || e.event || '';
+	if (type == 'flow' || type == 'flow_update' || e.detected_application_name != null) flow_event(e);
+	else if (type == 'flow_purge' || type == 'flow_end') purge_event(e);
+}
+
+function consume(data) {
+	rxbuf += data;
+	while (index(rxbuf, '\n') >= 0) {
+		let p = index(rxbuf, '\n');
+		let line = substr(rxbuf, 0, p);
+		rxbuf = substr(rxbuf, p + 1);
+		if (length(line)) parse_event(line);
+	}
+}
+
+function emit() {
+	let out = { since: since, up: time() - since, flows: length(keys(flows)), rate: { win: cfg.rate_win, tc: 0, rx_bps: 0, tx_bps: 0, ct_rx_bps: 0, ct_tx_bps: 0, un_rx_bps: 0, un_tx_bps: 0, un_rx_bytes: 0, un_tx_bytes: 0, l2: 0, l2_mode: 0, l2_n: 0, l2_min: 0, l2_raw: 0 }, persist: { state: 'off', sec: 0, targets: [] }, classes: {}, apps: {}, devices: {}, hosts: {}, top_flows: [] };
+	for (let k in classes) out.classes[k] = classes[k];
+	for (let k in apps) out.apps[k] = apps[k];
+	for (let k in devices) { out.devices[k] = devices[k]; out.devices[k].name = k; out.devices[k].ip = k; out.devices[k].via_in = 0; out.devices[k].via_out = 0; out.devices[k].top = []; }
+	for (let k in hosts) out.hosts[k] = hosts[k];
+	let top = [];
+	for (let k in flows) {
+		let f = flows[k];
+		if (!f.seen) continue;
+		push(top, { dev: f.device, ip: f.device, app: f.app || ('[' + class_name(f.class) + ']'), host: f.host, dst: f.remote, port: '', proto: '', class: class_name(f.class), in_bps: f.in_bps || 0, out_bps: f.out_bps || 0, bytes: f.bytes + f.rbytes });
+	}
+	sort(top, (a, b) => (b.in_bps + b.out_bps) - (a.in_bps + a.out_bps));
+	while (length(top) > cfg.top_flows) pop(top);
+	out.top_flows = top;
+	let tmp = cfg.out_dir + '/classes.json.tmp';
+	fs.writefile(tmp, sprintf('%J\n', out));
+	fs.rename(tmp, cfg.out_dir + '/classes.json');
+	dirty = false;
+}
+
+function request_file(name) { return cfg.out_dir + '/' + name; }
+
+function tick() {
+	seq++;
+	for (let k in flows) if (seq - flows[k].age > cfg.flow_grace * max(cfg.interval, 1)) delete flows[k];
+	if (dirty) emit();
+	if (fs.stat(request_file('reset.req'))) { fs.unlink(request_file('reset.req')); apps = {}; devices = {}; hosts = {}; dirty = true; emit(); }
+	if (fs.stat(request_file('stop.req'))) {
+		fs.unlink(request_file('stop.req'));
+		stopped = true;
+		emit();
+		if (netify_fd) { netify_fd.delete(); netify_fd = null; }
+		if (netify) { netify.close(); netify = null; }
+		if (ub) ub.close();
+		return;
+	}
+	uloop.timer(tick, cfg.interval * 1000);
+}
+
+function on_data(s, data) { consume(data); if (dirty) emit(); }
+
+function on_readable() {
+	let data;
+	try {
+		data = netify.recv(16384, socket.MSG_DONTWAIT);
+	} catch (err) {
+		logmsg('warn', `netify read failed: ${err}`);
+		return;
+	}
+	if (data == null || length(data) == 0) {
+		logmsg('warn', `netify connection closed: ${cfg.sock}`);
+		if (netify_fd) { netify_fd.delete(); netify_fd = null; }
+		if (netify) { netify.close(); netify = null; }
+		if (!stopped) uloop.timer(connect_netify, 5000);
+		return;
+	}
+	consume(data);
+	if (dirty) emit();
+}
+
+function connect_netify() {
+	try {
+		netify = socket.connect(cfg.sock);
+		netify_fd = uloop.handle(netify, on_readable, uloop.ULOOP_READ);
+		logmsg('info', `connected to netify: ${cfg.sock}`);
+	} catch (err) {
+		logmsg('warn', `netify connect failed: ${err}`);
+		uloop.timer(connect_netify, 5000);
+	}
+}
+
+function status(req) { return { running: !stopped, socket: cfg.sock, flows: length(keys(flows)), applications: length(keys(apps)), devices: length(keys(devices)) }; }
+
+function reset(req) { fs.writefile(request_file('reset.req'), ''); return { result: 'reset requested' }; }
+function stop(req) { fs.writefile(request_file('stop.req'), ''); return { result: 'stop requested' }; }
+
+read_config();
+mkdir(cfg.out_dir);
+emit();
+try {
+	ub = ubus.connect();
+	ub.publish('trafficchart-agg', { status: status, reset: reset, stop: stop });
+} catch (err) { ub = null; }
+uloop.init();
+connect_netify();
+uloop.timer(tick, 0);
+uloop.run();

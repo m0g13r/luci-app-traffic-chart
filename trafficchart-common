@@ -98,9 +98,12 @@ tc_cfg() {
 
 tc_detect_backend() {
     local b
-    b=$(uci -q get trafficchart.global.backend 2>/dev/null)
+    tc_cfg BACKEND auto string
+    b="${BACKEND:-auto}"
     case "$b" in
         nss|generic) echo "$b"; return ;;
+        auto) ;;
+        *) b=auto ;;
     esac
     if [ -e "$SYSNET/nssifb" ]; then echo nss; else echo generic; fi
 }

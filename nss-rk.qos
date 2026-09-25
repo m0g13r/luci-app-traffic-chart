@@ -193,9 +193,10 @@ nft_setup() {
     # 300 MB, deliberately high: with a low value every longer video stream
     # flipped to BULK and the WEB/BULK split depended on connection age.
     # Configurable: option bulk_bytes in /etc/config/trafficchart (the traffic
-    # chart daemon reads the same option, so both always agree).
+    # chart daemon reads the same option, so both always agree). The environment
+    # also wins here for testing and overrides, just like the daemon logic.
     local BULK_BYTES
-    BULK_BYTES=$(uci -q get trafficchart.global.bulk_bytes 2>/dev/null)
+    BULK_BYTES="${BULK_BYTES:-$(uci -q get trafficchart.global.bulk_bytes 2>/dev/null)}"
     case "${BULK_BYTES}" in ''|*[!0-9]*) BULK_BYTES=314572800 ;; esac
 
     # Ports that are never demoted to BULK, because they are either
