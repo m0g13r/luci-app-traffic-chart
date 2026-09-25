@@ -933,27 +933,54 @@ return view.extend({
                 var w = windowOf(B, R);
                 return { R: R, sel: w.sel, start: w.start, end: w.end };
             }
+            function historyExportData() {
+                var R = rangeDef(), B = st.data[R.tier];
+                if (!B || !B.length) return null;
+                var w = windowOf(B, R);
+                // Take a snapshot of exactly what the History view currently shows.
+                // Do not fall back to the live-data exporter and do not export a
+                // different tier/dimension because another tab/range was used before.
+                var dim = st.dim, dir = st.dir;
+                var buckets = w.sel.map(function(b) {
+                    var out = {
+                        t: b.t,
+                        dt: b.dt || 0,
+                        in: b['in'] || 0,
+                        out: b.out || 0
+                    };
+                    out[dim] = b[dim] || {};
+                    if (b.sh) out.sh = b.sh;
+                    return out;
+                });
+                return { R: R, start: w.start, end: w.end, dim: dim, dir: dir, buckets: buckets };
+            }
             v.exportJson = function() {
-                var d = rangeData();
+                var d = historyExportData();
                 if (!d) return;
                 saveFile('trafficchart-history-' + d.R.id + '-' + stamp() + '.json', 'application/json', JSON.stringify({
-                    generated: new Date().toISOString(), range: d.R.id, tier: d.R.tier, from: d.start, to: d.end,
-                    sqm_kbit: { download: v.sqm.down, upload: v.sqm.up }, buckets: d.sel }, null, 2));
+                    generated: new Date().toISOString(),
+                    range: d.R.id,
+                    tier: d.R.tier,
+                    from: d.start,
+                    to: d.end,
+                    dimension: d.dim,
+                    direction: d.dir,
+                    sqm_kbit: { download: v.sqm.down, upload: v.sqm.up },
+                    buckets: d.buckets
+                }, null, 2));
             };
             v.exportCsv = function() {
-                var d = rangeData();
+                var d = historyExportData();
                 if (!d) return;
-                var DIMS = [ [ 'a', 'application' ], [ 'd', 'device' ], [ 'h', 'destination' ] ];
+                var dimName = d.dim === 'a' ? 'application' : d.dim === 'd' ? 'device' : 'destination';
                 var lines = [ csvLine([ 'time_start', 'time_end', 'epoch_end', 'seconds', 'dimension', 'id', 'name', 'in_bytes', 'out_bytes', 'rx_drops', 'rx_ecn', 'tx_drops', 'tx_ecn', 'rx_backlog_peak_bytes', 'tx_backlog_peak_bytes' ]) ];
-                d.sel.forEach(function(b) {
+                d.buckets.forEach(function(b) {
                     var dt = b.dt || 0, t0 = new Date((b.t - dt) * 1000).toISOString(), t1 = new Date(b.t * 1000).toISOString();
                     var sh = b.sh || {}, rx = sh.rx || [], tx = sh.tx || [];
                     lines.push(csvLine([ t0, t1, b.t, dt, 'total', '', '', b['in'], b.out, rx[0] || 0, rx[1] || 0, tx[0] || 0, tx[1] || 0, rx[2] || 0, tx[2] || 0 ]));
-                    DIMS.forEach(function(dm) {
-                        var src = b[dm[0]] || {};
-                        Object.keys(src).forEach(function(k) {
-                            lines.push(csvLine([ t0, t1, b.t, dt, dm[1], k, (dm[0] === 'd' && src[k][2]) ? src[k][2] : k, src[k][0], src[k][1], '', '', '', '', '', '' ]));
-                        });
+                    var src = b[d.dim] || {};
+                    Object.keys(src).forEach(function(k) {
+                        lines.push(csvLine([ t0, t1, b.t, dt, dimName, k, (d.dim === 'd' && src[k][2]) ? src[k][2] : k, src[k][0], src[k][1], '', '', '', '', '', '' ]));
                     });
                 });
                 saveFile('trafficchart-history-' + d.R.id + '-' + stamp() + '.csv', 'text/csv', lines.join('\n') + '\n');
