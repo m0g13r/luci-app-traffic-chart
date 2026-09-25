@@ -1,0 +1,343 @@
+#!/usr/bin/ucode
+/* Native ucode aggregator. ONCE=1 is the deterministic fixture mode. */
+import * as fs from 'fs';
+
+let ct_file = getenv('CT_FILE') || '/proc/net/nf_conntrack';
+let out_dir = getenv('OUT_DIR') || '/tmp/trafficchart';
+let bulk_bytes = +(getenv('BULK_BYTES') || '314572800');
+let birth_max = +(getenv('BIRTH_MAX') || '1073741824');
+let gone_grace = +(getenv('GONE_GRACE') || '5');
+let app_hold = +(getenv('APP_HOLD') || '3');
+let map_file = `${out_dir}/apps.map`;
+let map_ver_file = `${out_dir}/apps.map.ver`;
+let poll_no = 0;
+let warm = getenv('WARM') != '0';
+let flows = {};
+let apps = {};
+let devices = {};
+let hosts = {};
+let app_map = {};
+let app_hosts = {};
+let map_version = '';
+let class_names = [ 'UNMARKED', 'PRIO', 'VOIP', 'GAME', 'WEB', 'STREAM', 'BULK', 'P2P', 'BE', 'VPN', 'MAIL', 'NTP', 'FTP', 'REMOTE', 'DB', 'MGMT', 'CONTAINER', 'IOT' ];
+let class_totals = {};
+let host_mac = {}, host_names = {}, router_ips = {}, v6seen = {};
+let via_in = {}, via_out = {}, router_pool = {}, device_pool = {};
+let history = [], started_at = time(), last_history = started_at, hist_sec = +(getenv('HIST_SEC') || '300');
+let hist_keep = +(getenv('HIST_KEEP') || '288'), persist_dir = getenv('PERSIST_DIR') || '';
+let persist_sec = +(getenv('PERSIST_SEC') || '3600'), tc_file = getenv('TC_FILE') || '';
+let sample_sec = max(1, +(getenv('INTERVAL') || '4'));
+let tc_prev = {}, tc_state = { rx_bps: 0, tx_bps: 0, un_rx_bps: 0, un_tx_bps: 0, drops_rx: 0, drops_tx: 0, ecn_rx: 0, ecn_tx: 0 };
+let hosts_file = getenv('HOSTS_FILE') || `${out_dir}/hosts.fixture`;
+let stop_file = `${out_dir}/stop.req`, reset_file = `${out_dir}/reset.req`, pid_file = `${out_dir}/agg.pid`;
+
+function json_write(path, value) {
+    let tmp = `${path}.tmp`;
+    fs.writefile(tmp, sprintf('%J\n', value));
+    fs.rename(tmp, path);
+}
+
+function jsonl_append(path, value) {
+    fs.writefile(path, (fs.readfile(path) || '') + sprintf('%J\n', value));
+}
+
+function regdom(host) {
+    host = lc(host || '');
+    if (match(host, /^[0-9.:]+$/)) return host;
+    let p = split(host, '.');
+    if (length(p) <= 2) return host;
+    let suffix = p[length(p) - 1], pen = p[length(p) - 2];
+    return (length(suffix) == 2 && (pen == 'co' || pen == 'com' || pen == 'org' || pen == 'net')) ? `${p[length(p) - 3]}.${pen}.${suffix}` : `${pen}.${suffix}`;
+}
+
+function load_hosts() {
+    let text = fs.readfile(hosts_file) || '', lines = split(text, '\n');
+    for (let i = 0; i < length(lines); i++) {
+        let f = split(lines[i], '\t');
+        if (f[0] == 'I' && f[1] && f[2]) host_mac[f[1]] = f[2];
+        else if (f[0] == 'N' && f[1]) host_names[f[1]] = f[2] || f[1];
+        else if (f[0] == 'R' && f[1]) router_ips[f[1]] = true;
+    }
+}
+
+function write_unresolved() {
+    let text = '';
+    for (let address in v6seen)
+        if (poll_no - v6seen[address] <= 30 && !host_mac[address]) text += `${address}\n`;
+    if (text) fs.writefile(`${out_dir}/unresolved_v6`, text);
+    else fs.unlink(`${out_dir}/unresolved_v6`);
+}
+
+function device_key(address) {
+    if (!address || router_ips[address]) return 'router';
+    if (host_mac[address]) return host_mac[address];
+    if (match(address, /:/)) v6seen[address] = poll_no;
+    return address;
+}
+
+function load_tc() {
+    if (!tc_file) return;
+    let fields = split(trim(fs.readfile(tc_file) || ''), ' ');
+    if (length(fields) < 2 || match(fields[0], /^[0-9]+$/) == null) return;
+    let rx = +fields[0], tx = +fields[1];
+    let drx = rx - (tc_prev.rx || rx), dtx = tx - (tc_prev.tx || tx);
+    if (drx < 0) drx = 0;
+    if (dtx < 0) dtx = 0;
+    let elapsed = max(1, +(getenv('INTERVAL') || '4'));
+    tc_state.rx_bps = drx / elapsed; tc_state.tx_bps = dtx / elapsed;
+    tc_state.drops_rx = +(fields[2] || 0); tc_state.ecn_rx = +(fields[3] || 0);
+    tc_state.drops_tx = +(fields[4] || 0); tc_state.ecn_tx = +(fields[5] || 0);
+    tc_prev = { rx: rx, tx: tx };
+}
+
+function attribute_router() {
+    for (let name in router_pool) for (let device in device_pool) {
+        let amount = min(router_pool[name], device_pool[device]);
+        if (amount <= 0) continue;
+        if (!devices[device]) devices[device] = { in_bytes: 0, in_packets: 0, out_bytes: 0, out_packets: 0 };
+        devices[device].in_bytes += amount;
+        devices[device].via_in = (devices[device].via_in || 0) + amount;
+        if (devices.router) devices.router.in_bytes = max(0, devices.router.in_bytes - amount);
+        router_pool[name] -= amount; device_pool[device] -= amount;
+    }
+}
+
+function history_tick(now) {
+    if (now - last_history < hist_sec && getenv('FORCE_HISTORY') != '1') return;
+    let bucket = { t: now, dt: now - last_history, in: 0, out: 0, a: {}, d: {}, h: {}, sh: { rx: [tc_state.drops_rx || 0, tc_state.ecn_rx || 0, 0], tx: [tc_state.drops_tx || 0, tc_state.ecn_tx || 0, 0] } };
+    for (let name in apps) { bucket.a[name] = [apps[name].in_bytes || 0, apps[name].out_bytes || 0]; bucket.in += apps[name].in_bytes || 0; bucket.out += apps[name].out_bytes || 0; }
+    for (let name in devices) bucket.d[name] = [devices[name].in_bytes || 0, devices[name].out_bytes || 0, devices[name].name || name];
+    for (let name in hosts) bucket.h[name] = [hosts[name].in_bytes || 0, hosts[name].out_bytes || 0];
+    history[length(history)] = bucket;
+    while (length(history) > hist_keep) history.shift();
+    json_write(`${out_dir}/history.json`, history);
+    json_write(`${out_dir}/history_1h.json`, history);
+    json_write(`${out_dir}/history_1d.json`, history);
+    if (persist_dir) {
+        fs.mkdir(persist_dir);
+        jsonl_append(`${persist_dir}/history-5m.jsonl`, bucket);
+        jsonl_append(`${persist_dir}/history-1h.jsonl`, bucket);
+        jsonl_append(`${persist_dir}/history-1d.jsonl`, bucket);
+    }
+    last_history = now;
+}
+
+function add(table, key, ib, ip, ob, op) {
+    if (!table[key]) table[key] = { in_bytes: 0, in_packets: 0, out_bytes: 0, out_packets: 0, in_bps: 0, out_bps: 0 };
+    table[key].in_bytes += ib;
+    table[key].in_packets += ip;
+    table[key].out_bytes += ob;
+    table[key].out_packets += op;
+    table[key].in_bps += ib / sample_sec;
+    table[key].out_bps += ob / sample_sec;
+}
+
+function local(address) {
+    return match(address, /^(10\.|127\.|169\.254\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|224\.|225\.|226\.|227\.|228\.|229\.|23[0-9]\.|fd|fc|fe[89ab]|ff)/) != null || address == '::1' || !!router_ips[address];
+}
+
+function field(line, name, occurrence) {
+    let found = 0;
+    let parts = split(line, ' ');
+    for (let i = 0; i < length(parts); i++) {
+        if (substr(parts[i], 0, length(name) + 1) == `${name}=`) {
+            found++;
+            if (found == occurrence) return substr(parts[i], length(name) + 1);
+        }
+    }
+    return '';
+}
+
+function number_field(line, name, occurrence) {
+    let value = field(line, name, occurrence);
+    return match(value, /^[0-9]+$/) != null ? +value : 0;
+}
+
+function load_map() {
+    let version = trim(fs.readfile(map_ver_file) || '');
+    if (version == map_version) return;
+    app_map = {};
+    app_hosts = {};
+    map_version = version;
+    let lines = split(fs.readfile(map_file) || '', '\n');
+    for (let i = 0; i < length(lines); i++) {
+        let fields = split(lines[i], '\t');
+        if (length(fields) < 2 || !fields[0] || !fields[1]) continue;
+        app_map[fields[0]] = fields[1];
+        app_hosts[fields[0]] = fields[2] || '';
+    }
+}
+
+function mapped_app(flow) {
+    let direct = `${flow.proto}|${flow.src}|${flow.dst}|${flow.sport}|${flow.dport}`;
+    if (app_map[direct]) return { name: app_map[direct], host: app_hosts[direct] || '' };
+    let reverse = `${flow.proto}|${flow.dst}|${flow.src}|${flow.dport}|${flow.sport}`;
+    if (app_map[reverse]) return { name: app_map[reverse], host: app_hosts[reverse] || '' };
+    return null;
+}
+
+function parse(line) {
+    let head = split(line, ' ');
+    if (length(head) < 3) return null;
+    let proto = head[2], src = field(line, 'src', 1), dst = field(line, 'dst', 1);
+    if (!src || !dst) return null;
+    let sport = field(line, 'sport', 1), dport = field(line, 'dport', 1);
+    let reply_src = field(line, 'src', 2);
+    let mark = number_field(line, 'mark', 1) & 255;
+    let p1 = number_field(line, 'packets', 1), b1 = number_field(line, 'bytes', 1);
+    let p2 = number_field(line, 'packets', 2), b2 = number_field(line, 'bytes', 2);
+    return { proto: proto, src: src, dst: dst, reply_src: reply_src, sport: sport, dport: dport,
+             p1: p1, b1: b1, p2: p2, b2: b2, mark: mark };
+}
+
+function device_name(address) {
+    return device_key(address);
+}
+
+function poll() {
+    let text = fs.readfile(ct_file);
+    if (text == null) return false;
+    load_map();
+    for (let key in apps) { apps[key].in_bps = 0; apps[key].out_bps = 0; }
+    for (let key in devices) { devices[key].in_bps = 0; devices[key].out_bps = 0; }
+    for (let key in hosts) { hosts[key].in_bps = 0; hosts[key].out_bps = 0; }
+    let seen = {};
+    let lines = split(text, '\n');
+    for (let i = 0; i < length(lines); i++) {
+        let flow = parse(lines[i]);
+        if (!flow || flow.mark == 64 || flow.mark > 17) continue;
+        let lan = local(flow.src);
+        if (flow.mark == 0 && !(lan && !local(flow.dst)) && !(flow.reply_src && local(flow.reply_src))) continue;
+        let key = `${flow.proto}|${flow.src}|${flow.dst}|${flow.sport}|${flow.dport}`;
+        seen[key] = true;
+        let old = flows[key], d1 = flow.b1, d2 = flow.b2, q1 = flow.p1, q2 = flow.p2;
+        if (old) {
+            d1 -= old.b1; d2 -= old.b2; q1 -= old.p1; q2 -= old.p2;
+            if (d1 < 0 || d2 < 0 || q1 < 0 || q2 < 0) {
+                if (flow.b1 + flow.b2 <= birth_max) { d1 = flow.b1; d2 = flow.b2; q1 = flow.p1; q2 = flow.p2; }
+                else { d1 = max(d1, 0); d2 = max(d2, 0); q1 = max(q1, 0); q2 = max(q2, 0); }
+            }
+        } else if (warm || flow.b1 + flow.b2 > birth_max) {
+            d1 = 0; d2 = 0; q1 = 0; q2 = 0;
+        }
+        let bulk = old && old.bulk;
+        if (!bulk && (flow.mark == 4 || flow.mark == 7 || flow.mark == 8) && flow.b1 + flow.b2 > bulk_bytes) bulk = true;
+        let class_id = bulk ? 6 : flow.mark;
+        let device_address = lan ? flow.src : flow.reply_src;
+        let device = device_name(device_address);
+        let incoming = lan ? d2 : d1, outgoing = lan ? d1 : d2;
+        let in_packets = lan ? q2 : q1, out_packets = lan ? q1 : q2;
+        let state = old || {}, mapped = mapped_app(flow);
+        if (incoming || outgoing || in_packets || out_packets) {
+            let fallback = `[${class_names[class_id] || 'UNMARKED'}]`;
+            let app = mapped ? mapped.name : state.app;
+            let host = mapped && mapped.host ? mapped.host : (state.host || (local(flow.src) ? flow.dst : flow.src));
+            if (!app && !state.giveup) {
+                state.pending_in = (state.pending_in || 0) + incoming;
+                state.pending_out = (state.pending_out || 0) + outgoing;
+                state.pending_in_packets = (state.pending_in_packets || 0) + in_packets;
+                state.pending_out_packets = (state.pending_out_packets || 0) + out_packets;
+                state.pending_polls = (state.pending_polls || 0) + 1;
+                if (state.pending_polls < app_hold) {
+                    incoming = 0; outgoing = 0; in_packets = 0; out_packets = 0;
+                } else {
+                    app = fallback;
+                    state.giveup = true;
+                }
+            }
+            if (app && state.pending_polls) {
+                incoming += state.pending_in || 0;
+                outgoing += state.pending_out || 0;
+                in_packets += state.pending_in_packets || 0;
+                out_packets += state.pending_out_packets || 0;
+                state.pending_in = state.pending_out = 0;
+                state.pending_in_packets = state.pending_out_packets = 0;
+                state.pending_polls = 0;
+            }
+            if (!app) app = fallback;
+            if (mapped) { state.app = app; state.host = host; state.giveup = false; }
+            add(apps, app, incoming, in_packets, outgoing, out_packets);
+            add(devices, device, incoming, in_packets, outgoing, out_packets);
+            add(hosts, regdom(host), incoming, in_packets, outgoing, out_packets);
+            if (!class_totals[class_names[class_id]]) class_totals[class_names[class_id]] = { in_bytes: 0, in_packets: 0, out_bytes: 0, out_packets: 0 };
+            class_totals[class_names[class_id]].in_bytes += incoming;
+            class_totals[class_names[class_id]].in_packets += in_packets;
+            class_totals[class_names[class_id]].out_bytes += outgoing;
+            class_totals[class_names[class_id]].out_packets += out_packets;
+            if (device == 'router') {
+                router_pool[`${app}|in`] = (router_pool[`${app}|in`] || 0) + incoming;
+                router_pool[`${app}|out`] = (router_pool[`${app}|out`] || 0) + outgoing;
+            }
+        }
+        flows[key] = { ...state, b1: flow.b1, b2: flow.b2, p1: flow.p1, p2: flow.p2, bulk: bulk,
+                       last: poll_no, device: device, class_id: class_id, bytes: flow.b1 + flow.b2,
+                   dst: local(flow.src) ? flow.dst : flow.src, proto: flow.proto, dport: flow.dport,
+                   in_bps: incoming / max(1, +(getenv('INTERVAL') || '4')),
+                   out_bps: outgoing / max(1, +(getenv('INTERVAL') || '4')) };
+    }
+    for (let key in flows)
+        if (!seen[key] && poll_no - flows[key].last > gone_grace) delete flows[key];
+    attribute_router();
+    warm = false;
+    write_unresolved();
+    return true;
+}
+
+function top(table, limit) {
+    let rows = [];
+    for (let key in table) rows[length(rows)] = { key: key, total: (table[key].in_bytes || 0) + (table[key].out_bytes || 0) };
+    let result = [];
+    for (let i = 0; i < min(limit, length(rows)); i++) {
+        let best = i;
+        for (let j = i + 1; j < length(rows); j++) if (rows[j].total > rows[best].total) best = j;
+        if (best != i) { let row = rows[i]; rows[i] = rows[best]; rows[best] = row; }
+        result[length(result)] = [rows[i].key, table[rows[i].key].in_bytes || 0, table[rows[i].key].out_bytes || 0];
+    }
+    return result;
+}
+
+function emit() {
+    let result = { since: started_at, up: time() - started_at, flows: length(flows), classes: class_totals,
+                   rate: { win: +(getenv('RATE_WIN') || '10'), tc: tc_file ? 1 : 0, rx_bps: tc_state.rx_bps, tx_bps: tc_state.tx_bps, ct_rx_bps: 0, ct_tx_bps: 0, un_rx_bps: tc_state.un_rx_bps, un_tx_bps: tc_state.un_tx_bps, un_rx_bytes: 0, un_tx_bytes: 0, l2: +(getenv('L2_OVERHEAD') || '18'), l2_mode: 1, l2_n: 0, l2_min: 8, l2_raw: 0 },
+                   persist: { state: persist_dir ? 'ok' : 'off', sec: persist_sec, targets: persist_dir ? [{ dir: persist_dir, state: 'ok', saved: time(), pending: 0 }] : [] },
+                   apps: {}, devices: {}, hosts: hosts, top_flows: [] };
+    for (let key in apps) result.apps[key] = { ...apps[key], in_bps: apps[key].in_bps || 0, out_bps: apps[key].out_bps || 0, top: top(hosts, 10) };
+    for (let key in devices) {
+        devices[key].via_in = via_in[key] || devices[key].via_in || 0;
+        devices[key].via_out = via_out[key] || devices[key].via_out || 0;
+        result.devices[key] = { ...devices[key], name: key == 'router' ? 'Router' : (host_names[key] || key), ip: key, top: top(apps, 10) };
+    }
+    let busy = [];
+    for (let key in flows) if ((flows[key].in_bps || 0) + (flows[key].out_bps || 0) > 0) busy[length(busy)] = flows[key];
+    for (let i = 0; i < min(25, length(busy)); i++) {
+        let best = i;
+        for (let j = i + 1; j < length(busy); j++) if ((busy[j].in_bps + busy[j].out_bps) > (busy[best].in_bps + busy[best].out_bps)) best = j;
+        if (best != i) { let flow = busy[i]; busy[i] = busy[best]; busy[best] = flow; }
+        let f = busy[i];
+        result.top_flows[length(result.top_flows)] = { dev: f.device == 'router' ? 'Router' : f.device, ip: f.device, app: f.app || `[${class_names[f.class_id] || 'UNMARKED'}]`, host: f.host || '', dst: f.dst || '', port: f.dport || '', proto: f.proto || '', class: class_names[f.class_id] || 'UNMARKED', in_bps: f.in_bps || 0, out_bps: f.out_bps || 0, bytes: f.bytes || 0 };
+    }
+    json_write(`${out_dir}/classes.json`, result);
+}
+
+function reset() {
+    apps = {}; devices = {}; hosts = {}; class_totals = {}; via_in = {}; via_out = {}; history = []; last_history = time(); fs.unlink(reset_file);
+}
+
+fs.mkdir(out_dir);
+fs.writefile(pid_file, 'ucode\n');
+load_hosts();
+poll_no++;
+if (fs.readfile(reset_file) != null) reset();
+if (poll()) { load_tc(); emit(); history_tick(time()); }
+if (getenv('ONCE') != '1') {
+    while (true) {
+        sleep(+(getenv('INTERVAL') || '4'));
+        poll_no++;
+        if (fs.readfile(reset_file) != null) reset();
+        if (poll()) { load_tc(); emit(); history_tick(time()); }
+        if (fs.readfile(stop_file) != null) { history_tick(time() + hist_sec); break; }
+    }
+}
+fs.unlink(pid_file);
+fs.unlink(stop_file);
+

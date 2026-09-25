@@ -661,7 +661,71 @@ return view.extend({
             var REFRESH_MS = { '5m': 60000, '1h': 300000, '1d': 900000 };
             var TIER_SEC = { '5m': 300, '1h': 3600, '1d': 86400 };
             var TIER_ORDER = [ '5m', '1h', '1d' ];   // finest first
-            var st = { dim: 'a', dir: 'in', range: '24h', data: {}, cmp: false, hidden: {} };
+            var st = { dim: 'a', dir: 'both', range: '24h', data: {}, cmp: false, hidden: {} };
+            var historyPinned = null;
+
+            function historyTipKey(type, a, b, c) {
+                return type + ':' + String(a) + ':' + String(b || '') + ':' + String(c || '');
+            }
+
+            function historyTipHover(info, ev) {
+                if (historyPinned) return;
+                tipTrack(ev);
+                tipShow(info);
+            }
+
+            function historyTipMove(ev) {
+                if (!historyPinned) tipTrack(ev);
+            }
+
+            function historyTipLeave() {
+                if (!historyPinned) tipHide();
+            }
+
+            function historyTipClick(info, ev, key) {
+                ev.stopPropagation();
+
+                /*
+                 * Use the actual DOM element as the identity of the pin.
+                 * This makes unpinning reliable even when the same history
+                 * item is redrawn and receives a new/generated key.
+                 */
+                var target = ev.currentTarget || ev.target;
+
+                if (historyPinned &&
+                    (historyPinned.target === target || historyPinned.key === key)) {
+                    historyPinned = null;
+                    tipHide();
+                    return;
+                }
+
+                historyPinned = {
+                    key: key,
+                    target: target
+                };
+
+                tipTrack(ev);
+                tipShow(info);
+            }
+
+            /* Clicking the pinned tooltip itself releases the pin. */
+            tipEl.addEventListener('click', function(ev) {
+                if (!historyPinned) return;
+                ev.stopPropagation();
+                historyPinned = null;
+                tipHide();
+            });
+
+            if (!makeHistoryView._historyPinOutsideHandler) {
+                makeHistoryView._historyPinOutsideHandler = function(ev) {
+                    if (!historyPinned) return;
+                    if (ev.target === tipEl || tipEl.contains(ev.target)) return;
+                    historyPinned = null;
+                    tipHide();
+                };
+                document.addEventListener('click', makeHistoryView._historyPinOutsideHandler);
+            }
+
             var chartHost = E('div', { style: 'width:100%;' });
             var persistEl = E('div', { style: 'text-align:center; font-size:10.5px; color:var(--main-bright-color); margin-top:4px;' });
             var btnStyle = 'margin-right:6px;';
@@ -1113,9 +1177,12 @@ return view.extend({
                             detailTitle: '',
                             details: []
                         };
-                        gx.addEventListener('mouseenter', function(ev) { tipTrack(ev); tipShow(gapInfo); });
-                        gx.addEventListener('mousemove', tipTrack);
-                        gx.addEventListener('mouseleave', tipHide);
+                        (function(gapInfo_ref, gapKey) {
+                            gx.addEventListener('mouseenter', function(ev) { historyTipHover(gapInfo_ref, ev); });
+                            gx.addEventListener('mousemove', historyTipMove);
+                            gx.addEventListener('mouseleave', historyTipLeave);
+                            gx.addEventListener('click', function(ev) { historyTipClick(gapInfo_ref, ev, gapKey); });
+                        })(gapInfo, historyTipKey('gap', gr[0], gr[1], d));
                         svg.appendChild(gx);
                     });
 
@@ -1135,12 +1202,15 @@ return view.extend({
                             });
 
                             (function(c_ref, ci_ref, k_ref, vv_ref, d_ref) {
+                                var barKey = historyTipKey('bar', ci_ref, k_ref, d_ref);
                                 r.addEventListener('mouseenter', function(ev) {
-                                    tipTrack(ev);
-                                    tipShow(historyTip(c_ref, ci_ref, k_ref, vv_ref, d_ref));
+                                    historyTipHover(historyTip(c_ref, ci_ref, k_ref, vv_ref, d_ref), ev);
                                 });
-                                r.addEventListener('mousemove', tipTrack);
-                                r.addEventListener('mouseleave', tipHide);
+                                r.addEventListener('mousemove', historyTipMove);
+                                r.addEventListener('mouseleave', historyTipLeave);
+                                r.addEventListener('click', function(ev) {
+                                    historyTipClick(historyTip(c_ref, ci_ref, k_ref, vv_ref, d_ref), ev, barKey);
+                                });
                             })(c, ci, k, vv, d);
 
                             svg.appendChild(r);
@@ -1173,9 +1243,17 @@ return view.extend({
                             var op = 0.12 + frac * 0.45;
                             svg.appendChild(svgEl('rect', { x: pl + ci * bw + gap, y: dropTop, width: Math.max(bw - 2 * gap, 1), height: DROP_H, fill: 'rgba(220,38,38,' + op.toFixed(2) + ')' }));
                             var hit = svgEl('rect', { x: pl + ci * bw, y: dropTop - 3, width: Math.max(bw, 2), height: DROP_H + 6, fill: 'rgba(0,0,0,0)' });
-                            hit.addEventListener('mouseenter', function(ev) { tipTrack(ev); tipShow(dropTip(c, ci, d, rate, ecnRate)); });
-                            hit.addEventListener('mousemove', tipTrack);
-                            hit.addEventListener('mouseleave', tipHide);
+                            (function(c_ref, ci_ref, d_ref, rate_ref, ecnRate_ref) {
+                                var dropKey = historyTipKey('drop', ci_ref, '', d_ref);
+                                hit.addEventListener('mouseenter', function(ev) {
+                                    historyTipHover(dropTip(c_ref, ci_ref, d_ref, rate_ref, ecnRate_ref), ev);
+                                });
+                                hit.addEventListener('mousemove', historyTipMove);
+                                hit.addEventListener('mouseleave', historyTipLeave);
+                                hit.addEventListener('click', function(ev) {
+                                    historyTipClick(dropTip(c_ref, ci_ref, d_ref, rate_ref, ecnRate_ref), ev, dropKey);
+                                });
+                            })(c, ci, d, rate, ecnRate);
                             svg.appendChild(hit);
                         });
                         var dl = svgEl('text', { x: pl - 8, y: dropTop + DROP_H - 1, 'text-anchor': 'end', style: 'font-size:8.5px; fill:var(--main-bright-color);' });
@@ -1228,6 +1306,10 @@ return view.extend({
                 resizeTimer = setTimeout(render, 150);
             });
             v.stale = function() { return Date.now() - v.loadedAt > REFRESH_MS[rangeDef().tier]; };
+            v.clearPinned = function() {
+                historyPinned = null;
+                tipHide();
+            };
             v.load = function() {
                 var tier = rangeDef().tier, tiers = [ tier ];
                 if (st.cmp) tiers = tiers.concat(TIER_ORDER.slice(TIER_ORDER.indexOf(tier) + 1));
@@ -1441,6 +1523,7 @@ return view.extend({
             var tabBtns = [];
             function selectTab(idx) {
                 tipHide();
+                histView.clearPinned();
                 slotViews.forEach(function(sv) { sv.panelIn.clearPinned(); sv.panelOut.clearPinned(); });
                 groups.forEach(function(g, i) { g.style.display = (i === idx) ? '' : 'none'; });
                 tabBtns.forEach(function(li, i) { li.className = (i === idx) ? 'cbi-tab' : 'cbi-tab-disabled'; });
