@@ -299,9 +299,21 @@ tc_in_list() {
 tc_push() {
     local var="$1" item="$2" cur
     [ -n "$item" ] || return 0
-    eval "cur=\$$var"
+    case "$var" in
+        IFACE_LIST) cur="$IFACE_LIST" ;;
+        TX_DEVS) cur="$TX_DEVS" ;;
+        RX_DEVS) cur="$RX_DEVS" ;;
+        RX_RAW) cur="$RX_RAW" ;;
+        *) return 1 ;;
+    esac
     tc_in_list "$cur" "$item" && return 0
-    eval "$var=\"\${cur:+\$cur }\$item\""
+    cur="${cur:+$cur }$item"
+    case "$var" in
+        IFACE_LIST) IFACE_LIST="$cur" ;;
+        TX_DEVS) TX_DEVS="$cur" ;;
+        RX_DEVS) RX_DEVS="$cur" ;;
+        RX_RAW) RX_RAW="$cur" ;;
+    esac
 }
 
 tc_num() {
