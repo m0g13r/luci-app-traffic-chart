@@ -1,334 +1,1375 @@
-#!/usr/bin/env ucode
-
-/* Native Netify flow aggregator.  Counters come from flow events, not from a
- * conntrack polling loop.  The JSON file is intentionally compatible with the
- * shell aggregator's public contract. */
-
+#!/usr/bin/ucode
+/* Native ucode aggregator. ONCE=1 is the deterministic fixture mode.
+ * 1:1 functional port of trafficchart-agg.sh (awk). Every behaviour listed
+ * in that script's header comment is replicated here; where ucode offers a
+ * cleaner primitive (localtime() instead of forking "date", real idle-time
+ * eviction instead of poll-count buckets) that primitive is used, but the
+ * OBSERVABLE behaviour (classes.json / history*.json shape and semantics)
+ * matches the awk daemon exactly. */
 import * as fs from 'fs';
-import * as socket from 'socket';
-import * as uloop from 'uloop';
-import * as uci from 'uci';
-import * as ubus from 'ubus';
 
-let cfg = {
-	interval: 2,
-	rate_win: 10,
-	app_hold: 3,
-	app_max: 512,
-	device_max: 256,
-	host_max: 512,
-	top_flows: 25,
-	out_dir: '/tmp/trafficchart',
-	sock: '/var/run/netifyd/netifyd.sock',
-	bulk_bytes: 314572800,
-	flow_grace: 3,
-	profile: 'very-low-cpu'
-};
+/* ------------------------------------------------------------------ *
+ * Basic config (order matters: nothing below may read a variable that
+ * isn't assigned yet - ucode does not hoist top-level `let`s).
+ * ------------------------------------------------------------------ */
+
+let ct_file = getenv('CT_FILE') || '/proc/net/nf_conntrack';
+let out_dir = getenv('OUT_DIR') || '/tmp/trafficchart';
+let bulk_bytes = +(getenv('BULK_BYTES') || '314572800');
+let birth_max = +(getenv('BIRTH_MAX') || '1073741824');
+let gone_grace = +(getenv('GONE_GRACE') || '5');
+let app_hold = +(getenv('APP_HOLD') || '3');
+
+let sample_sec = max(1, +(getenv('INTERVAL') || '4'));
+let adapt_interval = +(getenv('ADAPT_INTERVAL') || '1') != 0;
+let interval_max = +(getenv('INTERVAL_MAX') || '20');
+if (interval_max < sample_sec) interval_max = sample_sec;
+let adapt_budget = +(getenv('ADAPT_BUDGET') || '0.30');
+if (adapt_budget <= 0 || adapt_budget >= 1) adapt_budget = 0.30;
+let poll_interval = sample_sec;
+
+let map_file = `${out_dir}/apps.map`;
+let map_ver_file = `${out_dir}/apps.map.ver`;
+let poll_no = 0;
+let warm = getenv('WARM') != '0';
 
 let flows = {};
-let digests = {};
 let apps = {};
-let classes = {};
 let devices = {};
 let hosts = {};
-let rates = { samples: [], last: 0 };
-let seq = 0;
-let since = time();
-let stopped = false;
-let dirty = true;
-let netify = null;
-let netify_fd = null;
-let ub = null;
-let rxbuf = '';
+let app_map = {};
+let app_hosts = {};
+let map_version = '';
+let class_names = [ 'UNMARKED', 'PRIO', 'VOIP', 'GAME', 'WEB', 'STREAM', 'BULK', 'P2P', 'BE', 'VPN', 'MAIL', 'NTP', 'FTP', 'REMOTE', 'DB', 'MGMT', 'CONTAINER', 'IOT' ];
 
-function logmsg(level, message) {
-	let out = fs.stderr;
-	out.write(`[${level}] ${message}\n`);
-	out.flush();
+let host_mac = {}, host_names = {}, router_ips = {}, v6seen = {};
+let device_ip = {};   // device key -> best-known IPv4 address for display (awk's dvip[])
+
+// via_in/via_out: cumulative raw "LAN device -> router service" volume per device.
+let via_in = {}, via_out = {};
+
+// Tooltip matrices (bounded, idle-evicted, straight discard - like awk's MX_MAX/PAIR_MAX).
+let app_hosts_mx = {}, device_apps_mx = {}, host_devices_mx = {};
+let mx_a_count = 0, mx_d_count = 0, mx_h_count = 0;
+
+function port_set(raw) {
+    let set = {};
+    for (let tok in split(raw, ' ')) { tok = trim(tok); if (length(tok)) set[+tok] = true; }
+    return set;
+}
+let attr_skip_ports = port_set(getenv('ATTR_SKIP_PORTS') || '22 53 67 68 80 123 443 853 5353 5355');
+let attr_ports_raw = trim(getenv('ATTR_PORTS') || '');
+let attr_ports = port_set(attr_ports_raw);
+let attr_ports_restrict = length(attr_ports_raw) > 0;
+
+let app_max = +(getenv('APP_MAX') || '400');
+let dev_max = +(getenv('DEV_MAX') || '256');
+let host_max = +(getenv('HOST_MAX') || '200');
+if (host_max < 20) host_max = 20;
+let mx_max = +(getenv('MX_MAX') || '2000');
+let pair_max = +(getenv('PAIR_MAX') || '1000');
+
+// Sliding-window rates (awk's wrate()/rate_one()).
+let rate_win = +(getenv('RATE_WIN') || '10');
+if (rate_win < 2 * sample_sec) rate_win = 2 * sample_sec;
+let rate_k = max(2, int(rate_win / sample_sec + 0.5));
+let rate_rings = { a: {}, d: {}, h: {} };
+
+let started_at = time();
+
+function ring_new(rk) {
+    let r = { t: [], i: [], o: [] };
+    for (let x = 0; x < rk; x++) { push(r.t, -1); push(r.i, 0); push(r.o, 0); }
+    return r;
 }
 
-function number(v, fallback) {
-	if (v == null || v == '') return fallback;
-	let n = +v;
-	return isNaN(n) ? fallback : n;
+// Returns [in_bps, out_bps]; ring slot holds the sample RATE_K polls ago
+// (or, before the ring has wrapped once, the daemon-start baseline).
+function ring_rate(r, slot, now, cum_in, cum_out) {
+    let valid = r.t[slot] >= 0;
+    let ot = valid ? r.t[slot] : started_at;
+    let oi = valid ? r.i[slot] : 0;
+    let oo = valid ? r.o[slot] : 0;
+    r.t[slot] = now; r.i[slot] = cum_in; r.o[slot] = cum_out;
+    let dt = now - ot;
+    if (dt <= 0) return [0, 0];
+    let ri = (cum_in - oi) / dt, ro = (cum_out - oo) / dt;
+    return [ ri > 0 ? ri : 0, ro > 0 ? ro : 0 ];
 }
 
-function read_config() {
-	let c = uci.cursor();
-	let section = c.get_all('trafficchart', 'global') || {};
-	if (!section) return;
-	for (let k in cfg) {
-		let v = section[k];
-		if (v == null) continue;
-		if (k == 'out_dir' || k == 'sock' || k == 'profile') cfg[k] = v;
-		else cfg[k] = number(v, cfg[k]);
-	}
-	if (section.agg_interval != null) cfg.interval = number(section.agg_interval, cfg.interval);
-	if (section.netify_socket != null) cfg.sock = section.netify_socket;
+// Generic single-value ring, used for the "not attributed" (un_*) rates,
+// which have their own window sizes independent of RATE_WIN.
+function uring_new(k) {
+    let r = { n: 0, t: [], v: [] };
+    for (let x = 0; x < k; x++) { push(r.t, -1); push(r.v, 0); }
+    return r;
+}
+function uring_rate(r, k, now, cur) {
+    r.n++;
+    let slot = r.n % k;
+    let full = r.n > k;
+    let ot = full ? r.t[slot] : started_at;
+    let ov = full ? r.v[slot] : 0;
+    r.t[slot] = now; r.v[slot] = cur;
+    let dt = now - ot;
+    if (dt <= 0) return 0;
+    let rr = (cur - ov) / dt;
+    return rr > 0 ? rr : 0;
 }
 
-function mkdir(path) {
-	fs.mkdir(path, 493);
+/* ------------------------------------------------------------------ *
+ * Hosts / GUA fixtures (periodically refreshed, matching awk's
+ * HOSTS_REFRESH_SEC / GUA_REFRESH_SEC - not just loaded once at start).
+ * ------------------------------------------------------------------ */
+
+let hosts_file = getenv('HOSTS_FILE') || `${out_dir}/hosts.fixture`;
+let hosts_refresh_sec = +(getenv('HOSTS_REFRESH_SEC') || '60');
+let last_hosts_refresh = -1e9;
+
+let v6helper = getenv('V6HELPER') || '';
+let v6prefix_file = getenv('V6PREFIX_FILE') || '';
+let gua_refresh_sec = +(getenv('GUA_REFRESH_SEC') || '120');
+let last_gua_refresh = -1e9;
+let gua_regex = null;
+let v6_stale_polls = max(2, int(60 / sample_sec + 0.5));
+
+let stop_file = `${out_dir}/stop.req`, reset_file = `${out_dir}/reset.req`, pid_file = `${out_dir}/agg.pid`;
+
+function json_write(path, value) {
+    let tmp = `${path}.tmp`;
+    fs.writefile(tmp, sprintf('%J\n', value));
+    fs.rename(tmp, path);
 }
 
-function clean(s) {
-	return replace('' + (s == null ? '' : s), /["\\\x00-\x1f]/g, '_');
+function regdom(host) {
+    host = lc(host || '');
+    if (match(host, /^[0-9.:]+$/)) return host;
+    let p = split(host, '.');
+    if (length(p) <= 2) return host;
+    let suffix = p[length(p) - 1], pen = p[length(p) - 2];
+    return (length(suffix) == 2 && (pen == 'co' || pen == 'com' || pen == 'org' || pen == 'net'))
+        ? `${p[length(p) - 3]}.${pen}.${suffix}` : `${pen}.${suffix}`;
 }
 
-function ip6short(ip) {
-	return replace('' + ip, /^::ffff:/i, '');
+// v6short: 2a00:1450:4001:0043:0000:... -> 2a00:1450:4001:43:0:... (awk's v6short()).
+function v6short(addr) {
+    if (index(addr, ':') < 0) return addr;
+    let groups = split(addr, ':');
+    let out = [];
+    for (let i = 0; i < length(groups); i++) {
+        let g = groups[i];
+        let m = match(g, /^0+([0-9a-fA-F]+)$/);
+        if (m) g = m[1];
+        if (!length(g)) g = '0';
+        push(out, g);
+    }
+    return join(':', out);
 }
 
-function local_ip(ip) {
-	ip = ip6short(ip);
-	return /^10\./.test(ip) || /^192\.168\./.test(ip) ||
-		/^172\.(1[6-9]|2[0-9]|3[01])\./.test(ip) ||
-	/^fd[0-9a-f]{2}:/i.test(ip) || ip == '::1' || ip == '127.0.0.1';
+function load_hosts() {
+    // Full replace, not merge - matches awk's refresh_hosts() clearing
+    // hmac/hname/rtr before reloading, so a device that dropped off the
+    // neighbour table stops being resolved instead of sticking forever.
+    host_mac = {}; host_names = {}; router_ips = {};
+    let text = fs.readfile(hosts_file) || '', lines = split(text, '\n');
+    for (let i = 0; i < length(lines); i++) {
+        let f = split(lines[i], '\t');
+        if (f[0] == 'I' && f[1] && f[2]) host_mac[f[1]] = f[2];
+        else if (f[0] == 'N' && f[1]) host_names[f[1]] = f[2] || f[1];
+        else if (f[0] == 'R' && f[1]) router_ips[f[1]] = true;
+    }
 }
 
-function class_name(c) {
-	let names = ['UNMARKED', 'PRIO', 'VOIP', 'GAME', 'WEB', 'STREAM',
-		'BULK', 'P2P', 'BE', 'VPN', 'MAIL', 'NTP', 'FTP', 'REMOTE',
-		'DB', 'MGMT', 'CONTAINER', 'IOT'];
-	return names[c] || 'UNMARKED';
+function refresh_gua() {
+    let text = null;
+    if (v6prefix_file) {
+        text = fs.readfile(v6prefix_file);
+    } else if (v6helper) {
+        try {
+            let fh = fs.popen(v6helper, 'r');
+            if (fh) { text = fh.read('all'); fh.close(); }
+        } catch (e) { text = null; }
+    }
+    text = text ? trim(text) : '';
+    if (!length(text)) { gua_regex = null; return; }
+    try { gua_regex = regexp(text, ''); } catch (e) { gua_regex = null; }
 }
 
-function event_value(e, names, fallback) {
-	for (let n in names) if (e[names[n]] != null) return e[names[n]];
-	return fallback;
+function write_unresolved() {
+    let text = '';
+    for (let address in v6seen)
+        if (poll_no - v6seen[address] <= v6_stale_polls && !host_mac[address]) text += `${address}\n`;
+    if (text) fs.writefile(`${out_dir}/unresolved_v6`, text);
+    else fs.unlink(`${out_dir}/unresolved_v6`);
 }
 
-function flow_tuple(e) {
-	let proto = event_value(e, ['protocol', 'detected_protocol_name'], 'ip');
-	let src = event_value(e, ['local_ip', 'source_ip', 'src_ip'], '');
-	let dst = event_value(e, ['other_ip', 'destination_ip', 'dst_ip'], '');
-	let sp = event_value(e, ['local_port', 'source_port', 'sport'], '');
-	let dp = event_value(e, ['other_port', 'destination_port', 'dport'], '');
-	return join('|', [lc('' + proto), ip6short(src), ip6short(dst), '' + sp, '' + dp]);
+// islocal(): RFC1918, loopback, link-local, multicast, ULA, LAN GUA prefix,
+// or an IPv6 address already known via the neighbour table. Deliberately
+// does NOT special-case router_ips - that belongs only in device_key(),
+// exactly as in awk (islocal() never consults rtr[]).
+function local(address) {
+    if (!address) return false;
+    if (match(address, /^(192\.168\.|10\.|127\.|169\.254\.|255\.)/) != null) return true;
+    if (match(address, /^172\.(1[6-9]|2[0-9]|3[01])\./) != null) return true;
+    if (match(address, /^(22[4-9]|23[0-9])\./) != null) return true;
+    if (match(address, /^(fd|fe[89ab]|ff)/) != null) return true;
+    if (address == '::1' || address == '0000:0000:0000:0000:0000:0000:0000:0001') return true;
+    if (gua_regex && match(address, gua_regex) != null) return true;
+    if (index(address, ':') >= 0 && host_mac[address]) return true;
+    return false;
 }
 
-function reverse_tuple(e) {
-	let proto = event_value(e, ['protocol', 'detected_protocol_name'], 'ip');
-	let src = event_value(e, ['local_ip', 'source_ip', 'src_ip'], '');
-	let dst = event_value(e, ['other_ip', 'destination_ip', 'dst_ip'], '');
-	let sp = event_value(e, ['local_port', 'source_port', 'sport'], '');
-	let dp = event_value(e, ['other_port', 'destination_port', 'dport'], '');
-	return join('|', [lc('' + proto), ip6short(dst), ip6short(src), '' + dp, '' + sp]);
+// device_key(): a device is always a LAN host. The router itself, OR any
+// address that is not local at all, is booked on "Router" instead of
+// becoming a fake device named after a remote IP (matches awk's dev_key()
+// exactly, including the "!islocal(addr) -> router" fallback that the
+// earlier version of this port was missing).
+function device_key(address) {
+    if (!address || router_ips[address]) return 'router';
+    if (!local(address)) return 'router';
+    if (host_mac[address]) return host_mac[address];
+    if (match(address, /:/) != null) v6seen[address] = poll_no;
+    return address;
+}
+function device_name(address) { return device_key(address); }
+
+function dev_label(k) {
+    if (k == 'router') return 'Router';
+    if (host_names[k]) return host_names[k];
+    if (device_ip[k]) return device_ip[k];
+    return k;
 }
 
-function app_name(name) {
-	name = replace(clean(name || 'Unknown'), /^netify\./, '');
-	if (!name || name == 'Unknown') return '';
-	if (apps[name] == null && length(keys(apps)) >= cfg.app_max) return '(other)';
-	return name;
+/* ------------------------------------------------------------------ *
+ * Bounded hosts table: idle eviction, then fold into "(other)".
+ * ------------------------------------------------------------------ */
+
+function add(table, key, ib, ip, ob, op) {
+    if (!table[key]) table[key] = { in_bytes: 0, in_packets: 0, out_bytes: 0, out_packets: 0, in_bps: 0, out_bps: 0 };
+    table[key].in_bytes += ib;
+    table[key].in_packets += ip;
+    table[key].out_bytes += ob;
+    table[key].out_packets += op;
+    table[key].last = time();
 }
 
-function host_name(e) {
-	let h = event_value(e, ['host_server_name', 'dns_host_name', 'host'], '');
-	if (!h) h = event_value(e, ['other_ip', 'destination_ip', 'dst_ip'], '');
-	h = lc(clean(h));
-	let p = split(h, '.');
-	if (length(p) > 2) h = p[length(p) - 2] + '.' + p[length(p) - 1];
-	return h;
+function host_fold(k) {
+    if (!hosts['(other)']) hosts['(other)'] = { in_bytes: 0, in_packets: 0, out_bytes: 0, out_packets: 0, in_bps: 0, out_bps: 0, last: time() };
+    let o = hosts['(other)'], e = hosts[k];
+    o.in_bytes += e.in_bytes; o.in_packets += e.in_packets;
+    o.out_bytes += e.out_bytes; o.out_packets += e.out_packets;
+    o.last = time();
+    delete hosts[k];
+    delete rate_rings.h[k];
+    delete host_devices_mx[k];
 }
 
-function device(e, src, dst) {
-	let ip = local_ip(src) ? src : (local_ip(dst) ? dst : 'router');
-	let mac = event_value(e, ['source_mac', 'client_mac', 'mac'], '');
-	return clean(mac || ip || 'Router');
+function host_gc() {
+    let victim = null, oldest = null;
+    for (let k in hosts) {
+        if (k == '(other)') continue;
+        let last = hosts[k].last || 0;
+        if (oldest == null || last < oldest) { oldest = last; victim = k; }
+    }
+    if (victim == null) return false;
+    host_fold(victim);
+    return true;
 }
 
-function bounded(table, key, limit) {
-	if (table[key] != null) return table[key];
-	if (length(keys(table)) >= limit) return table['(other)'] || (table['(other)'] = {});
-	return table[key] = {};
+let glog_last = {};
+function glog(fmt, ...args) {
+    fs.stderr.write(sprintf('trafficchart-agg: ' + fmt + '\n', ...args));
+}
+function glog_once(key, fmt, ...args) {
+    let now = time();
+    if (glog_last[key] && (now - glog_last[key]) < 3600) return;
+    glog_last[key] = now;
+    glog(fmt, ...args);
 }
 
-function bucket(table, key, limit) {
-	let b = bounded(table, key, limit);
-	if (b.in_bytes == null) b = table[key] = { in_bytes: 0, in_packets: 0, out_bytes: 0, out_packets: 0 };
-	return b;
+function host_key(h) {
+    if (!hosts[h] && length(hosts) >= host_max) {
+        if (!host_gc()) { glog_once('hostfull', 'hosts table full (%d) and nothing to fold', host_max); return '(other)'; }
+    }
+    return h;
 }
 
-function add_count(b, inbound, bytes, packets) {
-	if (bytes < 0) bytes = 0;
-	if (packets < 0) packets = 0;
-	if (inbound) { b.in_bytes += bytes; b.in_packets += packets; }
-	else { b.out_bytes += bytes; b.out_packets += packets; }
+/* ------------------------------------------------------------------ *
+ * Bounded tooltip matrices: idle eviction, straight discard.
+ * ------------------------------------------------------------------ */
+
+function mx_evict_oldest(outer_table) {
+    let vo = null, vi = null, oldest = null;
+    for (let ok in outer_table) {
+        let inner = outer_table[ok];
+        for (let ik in inner) {
+            let last = inner[ik].last || 0;
+            if (oldest == null || last < oldest) { oldest = last; vo = ok; vi = ik; }
+        }
+    }
+    if (vo == null) return false;
+    delete outer_table[vo][vi];
+    if (!length(outer_table[vo])) delete outer_table[vo];
+    return true;
 }
 
-function account(f, din, dout, pin, pout) {
-	if (din <= 0 && dout <= 0 && pin <= 0 && pout <= 0) return;
-	let inbound = f.local;
-	let a = f.app || ('[' + class_name(f.class) + ']');
-	let h = f.host || f.remote;
-	let d = f.device;
-	let ab = bucket(apps, a, cfg.app_max);
-	let cb = bucket(classes, class_name(f.class), 18);
-	let db = bucket(devices, d, cfg.device_max);
-	let hb = bucket(hosts, h, cfg.host_max);
-	add_count(ab, inbound, inbound ? din : dout, inbound ? pin : pout);
-	add_count(ab, !inbound, inbound ? dout : din, inbound ? pout : pin);
-	add_count(cb, inbound, inbound ? din : dout, inbound ? pin : pout);
-	add_count(cb, !inbound, inbound ? dout : din, inbound ? pout : pin);
-	add_count(db, inbound, inbound ? din : dout, inbound ? pin : pout);
-	add_count(db, !inbound, inbound ? dout : din, inbound ? pout : pin);
-	add_count(hb, inbound, inbound ? din : dout, inbound ? pin : pout);
-	add_count(hb, !inbound, inbound ? dout : din, inbound ? pout : pin);
-	dirty = true;
+function mx_insert(outer_table, count, limit, log_key, ok, ik, ib, ip, ob, op) {
+    let is_new = !outer_table[ok] || !outer_table[ok][ik];
+    if (is_new && count >= limit) {
+        if (mx_evict_oldest(outer_table)) count--;
+        else { glog_once(log_key, 'tooltip matrix full (%d) and nothing to evict', limit); return count; }
+    }
+    if (!outer_table[ok]) outer_table[ok] = {};
+    if (is_new) count++;
+    add(outer_table[ok], ik, ib, ip, ob, op);
+    return count;
 }
 
-function classify(e) {
-	let mark = number(event_value(e, ['mark', 'class', 'traffic_class'], 0), 0) & 255;
-	let total = number(event_value(e, ['bytes', 'total_bytes'], 0), 0);
-	let c = mark;
-	if ((c == 4 || c == 7 || c == 8) && total > cfg.bulk_bytes) c = 6;
-	return c > 17 || c == 64 ? 0 : c;
+// Top-K by total bytes. `label_fn`, if given, translates the inner key for
+// display (used for the host->device breakdown, awk's top_json(..., lab=1)).
+function top(table, limit, label_fn) {
+    let rows = [];
+    for (let key in table) push(rows, { key: key, total: (table[key].in_bytes || 0) + (table[key].out_bytes || 0) });
+    let result = [];
+    for (let i = 0; i < min(limit, length(rows)); i++) {
+        let best = i;
+        for (let j = i + 1; j < length(rows); j++) if (rows[j].total > rows[best].total) best = j;
+        if (best != i) { let row = rows[i]; rows[i] = rows[best]; rows[best] = row; }
+        let k = rows[i].key;
+        let label = label_fn ? label_fn(k) : k;
+        push(result, [label, table[k].in_bytes || 0, table[k].out_bytes || 0]);
+    }
+    return result;
 }
 
-function flow_event(e) {
-	let key = event_value(e, ['digest', 'flow_id', 'id'], '') || flow_tuple(e);
-	let tuple = flow_tuple(e);
-	let twin = digests[key] || digests[tuple] || digests[reverse_tuple(e)];
-	if (twin && twin != key) key = twin;
-	let f = flows[key];
-	if (!f) f = flows[key] = { bytes: 0, packets: 0, rbytes: 0, rpackets: 0, age: seq, class: classify(e) };
-	digests[tuple] = key;
-	if (event_value(e, ['digest'], '') != '') digests[event_value(e, ['digest'], '')] = key;
-	let bytes = number(event_value(e, ['bytes', 'total_bytes'], 0), 0);
-	let packets = number(event_value(e, ['packets', 'total_packets'], 0), 0);
-	let rbytes = number(event_value(e, ['reply_bytes', 'other_bytes'], 0), 0);
-	let rpackets = number(event_value(e, ['reply_packets', 'other_packets'], 0), 0);
-	let first = !f.seen;
-	let db = bytes - f.bytes, dp = packets - f.packets;
-	let rdb = rbytes - f.rbytes, rdp = rpackets - f.rpackets;
-	if (first) { db = 0; dp = 0; rdb = 0; rdp = 0; }
-	if (db < 0 || rdb < 0 || dp < 0 || rdp < 0) { db = max(db, 0); dp = max(dp, 0); rdb = max(rdb, 0); rdp = max(rdp, 0); }
-	f.bytes = bytes; f.packets = packets; f.rbytes = rbytes; f.rpackets = rpackets;
-	f.seen = true; f.age = seq; f.class = classify(e);
-	f.local = local_ip(event_value(e, ['local_ip', 'source_ip', 'src_ip'], ''));
-	f.remote = ip6short(event_value(e, ['other_ip', 'destination_ip', 'dst_ip'], ''));
-	f.device = device(e, event_value(e, ['local_ip', 'source_ip', 'src_ip'], ''), event_value(e, ['other_ip', 'destination_ip', 'dst_ip'], ''));
-	let candidate = app_name(event_value(e, ['detected_application_name', 'detected_protocol_name', 'application'], ''));
-	if (candidate) f.app = candidate;
-	f.host = host_name(e);
-	account(f, db, rdb, dp, rdp);
-	let now = time();
-	f.in_bps = (f.in_bps || 0) * 0.5 + ((f.local ? rdb : db) / max(now - (f.last || now), 1)) * 0.5;
-	f.out_bps = (f.out_bps || 0) * 0.5 + ((f.local ? db : rdb) / max(now - (f.last || now), 1)) * 0.5;
-	f.last = now;
+// Which keys of `table` are the top-N by total bytes (awk's keepa/keeph:
+// only the biggest 30 apps/hosts get a tooltip breakdown at all).
+function top_keys_by_total(table, k) {
+    let rows = [];
+    for (let key in table) push(rows, { key: key, total: (table[key].in_bytes || 0) + (table[key].out_bytes || 0) });
+    let picked = {};
+    for (let i = 0; i < min(k, length(rows)); i++) {
+        let best = i;
+        for (let j = i + 1; j < length(rows); j++) if (rows[j].total > rows[best].total) best = j;
+        if (best != i) { let r = rows[i]; rows[i] = rows[best]; rows[best] = r; }
+        picked[rows[i].key] = true;
+    }
+    return picked;
 }
 
-function purge_event(e) {
-	let key = event_value(e, ['digest', 'flow_id', 'id'], '');
-	if (!key || !flows[key]) return;
-	delete flows[key];
+/* ------------------------------------------------------------------ *
+ * Tooltip throttling (awk's TOOLTIPS / TOOLTIP_EVERY / tooltip_period).
+ * ------------------------------------------------------------------ */
+
+let tooltips_enabled = +(getenv('TOOLTIPS') || '1') != 0;
+let tooltip_every = +(getenv('TOOLTIP_EVERY') || '0');
+let tooltip_last = 0;
+let keep_apps = {}, keep_hosts = {};
+let last_top_a = {}, last_top_d = {}, last_top_h = {};
+
+function tooltip_due() {
+    if (!tooltips_enabled) return false;
+    if (tooltip_last == 0) return true;
+    if (tooltip_every > 0) return (poll_no - tooltip_last) >= tooltip_every;
+    let mx_size = mx_a_count + mx_d_count + mx_h_count;
+    let period = (mx_size > 6000) ? 10 : ((mx_size > 2000) ? 5 : 1);
+    return (poll_no - tooltip_last) >= period;
 }
 
-function parse_event(line) {
-	let e;
-	try { e = json(line); } catch (err) { return; }
-	if (!e) return;
-	let type = e.type || e.event || '';
-	if (type == 'flow' || type == 'flow_update' || e.detected_application_name != null) flow_event(e);
-	else if (type == 'flow_purge' || type == 'flow_end') purge_event(e);
+function refresh_tops() {
+    keep_apps = top_keys_by_total(apps, 30);
+    keep_hosts = top_keys_by_total(hosts, 30);
+    last_top_a = {}; last_top_d = {}; last_top_h = {};
+    for (let key in keep_apps) last_top_a[key] = top(app_hosts_mx[key] || {}, 10);
+    for (let key in devices) last_top_d[key] = top(device_apps_mx[key] || {}, 10);
+    for (let key in keep_hosts) last_top_h[key] = top(host_devices_mx[key] || {}, 10, dev_label);
+    tooltip_last = poll_no;
 }
 
-function consume(data) {
-	rxbuf += data;
-	while (index(rxbuf, '\n') >= 0) {
-		let p = index(rxbuf, '\n');
-		let line = substr(rxbuf, 0, p);
-		rxbuf = substr(rxbuf, p + 1);
-		if (length(line)) parse_event(line);
-	}
+/* ------------------------------------------------------------------ *
+ * Router-WAN-traffic attribution: sliding window (ATTR_WIN), matching
+ * awk's qr[]/qv[] pools + attr_match() greedy pairing, not a single-poll
+ * match. Unmatched router bytes simply stay on the "Router" device.
+ * ------------------------------------------------------------------ */
+
+let attr_win = +(getenv('ATTR_WIN') || '60');
+let attr_tol = +(getenv('ATTR_TOL') || '0.6');
+let attr_min = +(getenv('ATTR_MIN') || '262144');
+let attr_share = +(getenv('ATTR_SHARE') || '0.25');
+let attr_max_apps = +(getenv('ATTR_MAX_APPS') || '64');
+let attr_max_devices = +(getenv('ATTR_MAX_DEVICES') || '64');
+let attr_totals = +(getenv('ATTR_TOTALS') || '1') != 0;
+let attr_topapps = +(getenv('ATTR_TOPAPPS') || '0') != 0;
+let attr_polls = max(2, int(attr_win / sample_sec) + 1);
+
+let router_qr = []; // { poll, app, in_, out_, pin, pout } - router WAN volume, not yet attributed
+let router_qv = []; // { poll, device, in_, out_ }        - device volume "served by a router app"
+
+function attr_match(dir) {
+    let ra = {}, rap = {}, vd = {};
+    let R0 = 0;
+    for (let i = 0; i < length(router_qr); i++) {
+        let e = router_qr[i];
+        let val = dir == 0 ? e.in_ : e.out_;
+        let pk = dir == 0 ? e.pin : e.pout;
+        if (!val) continue;
+        ra[e.app] = (ra[e.app] || 0) + val;
+        rap[e.app] = (rap[e.app] || 0) + (pk || 0);
+        R0 += val;
+    }
+    for (let i = 0; i < length(router_qv); i++) {
+        let e = router_qv[i];
+        let val = dir == 0 ? e.in_ : e.out_;
+        if (!val) continue;
+        vd[e.device] = (vd[e.device] || 0) + val;
+    }
+
+    let picka = {}, sel = [], rem = {};
+    for (let n = 0; n < attr_max_apps; n++) {
+        let best = null, bv = -1;
+        for (let k in ra) if (!picka[k] && ra[k] >= attr_min && ra[k] >= R0 * attr_share && ra[k] > bv) { best = k; bv = ra[k]; }
+        if (best == null) break;
+        picka[best] = true; push(sel, best); rem[best] = ra[best];
+    }
+    let pickd = {}, devcands = [];
+    for (let n = 0; n < attr_max_devices; n++) {
+        let best = null, bv = -1;
+        for (let k in vd) if (!pickd[k] && vd[k] >= attr_min && vd[k] > bv) { best = k; bv = vd[k]; }
+        if (best == null) break;
+        pickd[best] = true; push(devcands, best);
+    }
+
+    // Greedy 1:1 pairing by smallest relative volume difference.
+    let used = {}, cr = {}, cv = {};
+    while (true) {
+        let best = 9, ba = null, bd = null;
+        for (let ai = 0; ai < length(sel); ai++) {
+            let a = sel[ai];
+            if (!rem[a] || rem[a] <= 0) continue;
+            for (let di = 0; di < length(devcands); di++) {
+                let d = devcands[di];
+                if (used[d]) continue;
+                let hi = max(rem[a], vd[d]);
+                if (hi <= 0) continue;
+                let diff = rem[a] > vd[d] ? rem[a] - vd[d] : vd[d] - rem[a];
+                let s = diff / hi;
+                if (s < best) { best = s; ba = a; bd = d; }
+            }
+        }
+        if (ba == null || best > attr_tol) break;
+        let x = min(rem[ba], vd[bd]);
+        let pk = ra[ba] > 0 ? rap[ba] * x / ra[ba] : 0;
+        let label = attr_topapps ? ba : 'Proxy-Stream (via Router)';
+
+        if (!devices[bd]) devices[bd] = { in_bytes: 0, in_packets: 0, out_bytes: 0, out_packets: 0 };
+        if (dir == 0) {
+            devices[bd].in_bytes += x; devices[bd].in_packets += pk;
+            if (devices['router']) {
+                devices['router'].in_bytes = max(0, devices['router'].in_bytes - x);
+                devices['router'].in_packets = max(0, devices['router'].in_packets - pk);
+            }
+        } else {
+            devices[bd].out_bytes += x; devices[bd].out_packets += pk;
+            if (devices['router']) {
+                devices['router'].out_bytes = max(0, devices['router'].out_bytes - x);
+                devices['router'].out_packets = max(0, devices['router'].out_packets - pk);
+            }
+        }
+
+        if (tooltips_enabled) {
+            let mvin = dir == 0 ? x : 0, mvout = dir == 1 ? x : 0;
+            mx_d_count = mx_insert(device_apps_mx, mx_d_count, pair_max, 'mxfull_d', bd, label, mvin, 0, mvout, 0);
+            let ri = device_apps_mx['router'] ? device_apps_mx['router'][ba] : null;
+            if (ri) { ri.in_bytes = max(0, ri.in_bytes - mvin); ri.out_bytes = max(0, ri.out_bytes - mvout); }
+        }
+
+        used[bd] = true; rem[ba] -= x; cr[ba] = (cr[ba] || 0) + x; cv[bd] = (cv[bd] || 0) + x;
+    }
+
+    // Consume only what was actually credited; the rest stays pooled.
+    for (let i = 0; i < length(router_qr); i++) {
+        let e = router_qr[i];
+        if (!cr[e.app] || !ra[e.app]) continue;
+        let f = 1 - cr[e.app] / ra[e.app];
+        if (f < 0) f = 0;
+        if (dir == 0) { e.in_ *= f; e.pin *= f; } else { e.out_ *= f; e.pout *= f; }
+    }
+    for (let i = 0; i < length(router_qv); i++) {
+        let e = router_qv[i];
+        if (!cv[e.device] || !vd[e.device]) continue;
+        let f = 1 - cv[e.device] / vd[e.device];
+        if (f < 0) f = 0;
+        if (dir == 0) e.in_ *= f; else e.out_ *= f;
+    }
 }
 
-function emit() {
-	let out = { since: since, up: time() - since, flows: length(keys(flows)), rate: { win: cfg.rate_win, tc: 0, rx_bps: 0, tx_bps: 0, ct_rx_bps: 0, ct_tx_bps: 0, un_rx_bps: 0, un_tx_bps: 0, un_rx_bytes: 0, un_tx_bytes: 0, l2: 0, l2_mode: 0, l2_n: 0, l2_min: 0, l2_raw: 0 }, persist: { state: 'off', sec: 0, targets: [] }, classes: {}, apps: {}, devices: {}, hosts: {}, top_flows: [] };
-	for (let k in classes) out.classes[k] = classes[k];
-	for (let k in apps) out.apps[k] = apps[k];
-	for (let k in devices) { out.devices[k] = devices[k]; out.devices[k].name = k; out.devices[k].ip = k; out.devices[k].via_in = 0; out.devices[k].via_out = 0; out.devices[k].top = []; }
-	for (let k in hosts) out.hosts[k] = hosts[k];
-	let top = [];
-	for (let k in flows) {
-		let f = flows[k];
-		if (!f.seen) continue;
-		push(top, { dev: f.device, ip: f.device, app: f.app || ('[' + class_name(f.class) + ']'), host: f.host, dst: f.remote, port: '', proto: '', class: class_name(f.class), in_bps: f.in_bps || 0, out_bps: f.out_bps || 0, bytes: f.bytes + f.rbytes });
-	}
-	sort(top, (a, b) => (b.in_bps + b.out_bps) - (a.in_bps + a.out_bps));
-	while (length(top) > cfg.top_flows) pop(top);
-	out.top_flows = top;
-	let tmp = cfg.out_dir + '/classes.json.tmp';
-	fs.writefile(tmp, sprintf('%J\n', out));
-	fs.rename(tmp, cfg.out_dir + '/classes.json');
-	dirty = false;
+function router_attribute(router_raw, device_raw) {
+    for (let app in router_raw) {
+        let e = router_raw[app];
+        if (e.in_ > 0 || e.out_ > 0) push(router_qr, { poll: poll_no, app: app, in_: e.in_, out_: e.out_, pin: e.pin, pout: e.pout });
+    }
+    for (let dev in device_raw) {
+        let e = device_raw[dev];
+        if (e.in_ > 0 || e.out_ > 0) push(router_qv, { poll: poll_no, device: dev, in_: e.in_, out_: e.out_ });
+    }
+    if (!attr_totals) return; // matches awk: feature off also skips expiry (pools just grow)
+    attr_match(0);
+    attr_match(1);
+    let nqr = [], nqv = [];
+    for (let i = 0; i < length(router_qr); i++) if (poll_no - router_qr[i].poll < attr_polls) push(nqr, router_qr[i]);
+    for (let i = 0; i < length(router_qv); i++) if (poll_no - router_qv[i].poll < attr_polls) push(nqv, router_qv[i]);
+    router_qr = nqr; router_qv = nqv;
 }
 
-function request_file(name) { return cfg.out_dir + '/' + name; }
+/* ------------------------------------------------------------------ *
+ * Link (tc) counters, L2-overhead calibration, "not attributed" rate.
+ * ------------------------------------------------------------------ */
 
-function tick() {
-	seq++;
-	for (let k in flows) if (seq - flows[k].age > cfg.flow_grace * max(cfg.interval, 1)) delete flows[k];
-	if (dirty) emit();
-	if (fs.stat(request_file('reset.req'))) { fs.unlink(request_file('reset.req')); apps = {}; devices = {}; hosts = {}; dirty = true; emit(); }
-	if (fs.stat(request_file('stop.req'))) {
-		fs.unlink(request_file('stop.req'));
-		stopped = true;
-		emit();
-		if (netify_fd) { netify_fd.delete(); netify_fd = null; }
-		if (netify) { netify.close(); netify = null; }
-		if (ub) ub.close();
-		return;
-	}
-	uloop.timer(tick, cfg.interval * 1000);
+let tc_file = getenv('TC_FILE') || '';
+let tc_have_prev = false;
+let tc_prev_raw = { rx: 0, tx: 0, drx: -1, dre: -1, dtx: -1, dte: -1 };
+let tc_ring = ring_new(rate_k);
+let tc_state = {
+    have: false, cum_rx: 0, cum_tx: 0, cum_drops_rx: 0, cum_ecn_rx: 0, cum_drops_tx: 0, cum_ecn_tx: 0,
+    rx_bps: 0, tx_bps: 0, un_rx_bps: 0, un_tx_bps: 0
+};
+
+let l2_overhead_cfg = getenv('L2_OVERHEAD') || 'auto';
+let l2_auto = (l2_overhead_cfg == 'auto' || l2_overhead_cfg == '');
+let l2_init = +(getenv('L2_INIT') || '18');
+let l2_est = l2_init;
+let l2_raw = 0;
+
+function parse_int_list(raw) {
+    let out = [];
+    for (let tok in split(raw, ' ')) { tok = trim(tok); if (length(tok)) push(out, +tok); }
+    return out;
+}
+let l2_candidates = parse_int_list(getenv('L2_CANDIDATES') || '0 14 18 22 26');
+sort(l2_candidates, (a, b) => a - b);
+if (!length(l2_candidates)) l2_candidates = [ l2_init ];
+
+let cal_win = +(getenv('CAL_WIN') || '30');
+let cal_keep = +(getenv('CAL_KEEP') || '60'); if (cal_keep < 4) cal_keep = 4;
+let cal_min = +(getenv('CAL_MIN') || '8'); if (cal_min > cal_keep) cal_min = cal_keep;
+let cal_pctl = +(getenv('CAL_PCTL') || '25');
+let cal_max_pkt = +(getenv('CAL_MAX_PKT') || '400');
+let cal_min_pkts = +(getenv('CAL_MIN_PKTS') || '500');
+let cal_tol = +(getenv('CAL_TOL') || '1');
+let cal_k = max(2, int(cal_win / sample_sec + 0.5));
+
+let cal_v = [], cal_ptr = 0, cal_n = 0, cal_polls = 0, cal_started = false;
+let cs_tc_rx = 0, cs_tc_tx = 0, cs_ct_rx = 0, cs_ct_tx = 0, cs_pk_rx = 0, cs_pk_tx = 0;
+
+let un_win = +(getenv('UN_WIN') || '30');
+if (un_win < rate_win) un_win = rate_win;
+let un_win_rx = +(getenv('UN_WIN_RX') || '60');
+if (un_win_rx < un_win) un_win_rx = un_win;
+let un_win_long = +(getenv('UN_WIN_LONG') || '300');
+if (un_win_long > 0 && un_win_long < un_win_rx) un_win_long = un_win_rx;
+
+let un_k_rx = max(2, int(un_win_rx / sample_sec + 0.5));
+let un_k_tx = max(2, int(un_win / sample_sec + 0.5));
+let un_k_long = max(2, int((un_win_long || un_win_rx) / sample_sec + 0.5));
+
+let uring_rx = uring_new(un_k_rx), uring_tx = uring_new(un_k_tx);
+let uring_rx_long = uring_new(un_k_long), uring_tx_long = uring_new(un_k_long);
+let un_cum_rx = 0, un_cum_tx = 0, un_init = false, un_prev = null;
+
+function load_tc(now) {
+    if (!tc_file) { tc_state.have = false; return; }
+    let raw = trim(fs.readfile(tc_file) || '');
+    if (!length(raw)) { tc_state.have = false; return; }
+    let fields = split(raw, ' ');
+    if (length(fields) < 2 || match(fields[0], /^[0-9]+$/) == null || match(fields[1], /^[0-9]+$/) == null) { tc_state.have = false; return; }
+    let rx = +fields[0], tx = +fields[1];
+    let rxd = (length(fields) > 2 && match(fields[2], /^[0-9]+$/)) ? +fields[2] : -1;
+    let rxe = (length(fields) > 3 && match(fields[3], /^[0-9]+$/)) ? +fields[3] : -1;
+    let txd = (length(fields) > 4 && match(fields[4], /^[0-9]+$/)) ? +fields[4] : -1;
+    let txe = (length(fields) > 5 && match(fields[5], /^[0-9]+$/)) ? +fields[5] : -1;
+    let rxb = (length(fields) > 6 && match(fields[6], /^[0-9]+$/)) ? +fields[6] : -1;
+    let txb = (length(fields) > 7 && match(fields[7], /^[0-9]+$/)) ? +fields[7] : -1;
+    tc_state.have = true;
+    if (rxb >= 0) for (let ti = 0; ti < length(hist_tier_names); ti++) { let t = hist_tier_names[ti]; if (rxb > hist_pk[t].rx) hist_pk[t].rx = rxb; }
+    if (txb >= 0) for (let ti = 0; ti < length(hist_tier_names); ti++) { let t = hist_tier_names[ti]; if (txb > hist_pk[t].tx) hist_pk[t].tx = txb; }
+    if (tc_have_prev) {
+        let dx = rx - tc_prev_raw.rx, dy = tx - tc_prev_raw.tx;
+        if (dx < 0) dx = 0;
+        if (dy < 0) dy = 0;
+        tc_state.cum_rx += dx; tc_state.cum_tx += dy;
+        if (rxd >= 0 && tc_prev_raw.drx >= 0) {
+            let dd = rxd - tc_prev_raw.drx; if (dd < 0) dd = 0; tc_state.cum_drops_rx += dd;
+            let de = rxe - tc_prev_raw.dre; if (de < 0) de = 0; tc_state.cum_ecn_rx += de;
+        }
+        if (txd >= 0 && tc_prev_raw.dtx >= 0) {
+            let dd = txd - tc_prev_raw.dtx; if (dd < 0) dd = 0; tc_state.cum_drops_tx += dd;
+            let de = txe - tc_prev_raw.dte; if (de < 0) de = 0; tc_state.cum_ecn_tx += de;
+        }
+    } else {
+        tc_have_prev = true;
+    }
+    tc_prev_raw.rx = rx; tc_prev_raw.tx = tx;
+    if (rxd >= 0 && txd >= 0) { tc_prev_raw.drx = rxd; tc_prev_raw.dre = rxe; tc_prev_raw.dtx = txd; tc_prev_raw.dte = txe; }
+    let slot = poll_no % rate_k;
+    let r = ring_rate(tc_ring, slot, now, tc_state.cum_rx, tc_state.cum_tx);
+    tc_state.rx_bps = r[0]; tc_state.tx_bps = r[1];
 }
 
-function on_data(s, data) { consume(data); if (dirty) emit(); }
+function l2_now() { return l2_auto ? l2_est : +l2_overhead_cfg; }
+function l2_mode() { return l2_auto ? (cal_n >= cal_min ? 2 : 1) : 0; }
 
-function on_readable() {
-	let data;
-	try {
-		data = netify.recv(16384, socket.MSG_DONTWAIT);
-	} catch (err) {
-		logmsg('warn', `netify read failed: ${err}`);
-		return;
-	}
-	if (data == null || length(data) == 0) {
-		logmsg('warn', `netify connection closed: ${cfg.sock}`);
-		if (netify_fd) { netify_fd.delete(); netify_fd = null; }
-		if (netify) { netify.close(); netify = null; }
-		if (!stopped) uloop.timer(connect_netify, 5000);
-		return;
-	}
-	consume(data);
-	if (dirty) emit();
+function cal_eval(dtc, dct, dpk) {
+    if (dpk < cal_min_pkts || (dpk > 0 && dct / dpk > cal_max_pkt)) return;
+    let e = (dtc - dct) / dpk;
+    if (e < 0 || e > 64) return;
+    cal_ptr = (cal_ptr % cal_keep) + 1;
+    cal_v[cal_ptr - 1] = e;
+    if (cal_n < cal_keep) cal_n++;
 }
 
-function connect_netify() {
-	try {
-		netify = socket.connect(cfg.sock);
-		netify_fd = uloop.handle(netify, on_readable, uloop.ULOOP_READ);
-		logmsg('info', `connected to netify: ${cfg.sock}`);
-	} catch (err) {
-		logmsg('warn', `netify connect failed: ${err}`);
-		uloop.timer(connect_netify, 5000);
-	}
+function cal_estimate() {
+    if (cal_n < cal_min) return;
+    let sorted = [];
+    for (let i = 0; i < cal_n; i++) push(sorted, cal_v[i]);
+    sort(sorted, (a, b) => a - b);
+    let k = int((cal_n - 1) * cal_pctl / 100);
+    l2_raw = sorted[k];
+    let best = null;
+    for (let i = 0; i < length(l2_candidates); i++) if (l2_candidates[i] <= l2_raw + cal_tol) best = l2_candidates[i];
+    l2_est = (best == null) ? l2_candidates[0] : best;
 }
 
-function status(req) { return { running: !stopped, socket: cfg.sock, flows: length(keys(flows)), applications: length(keys(apps)), devices: length(keys(devices)) }; }
+function cal_update(ct_in, ct_out, pk_in, pk_out) {
+    if (!l2_auto) return;
+    if (!cal_started) {
+        cal_started = true; cal_polls = 0;
+        cs_tc_rx = tc_state.cum_rx; cs_tc_tx = tc_state.cum_tx;
+        cs_ct_rx = ct_in; cs_ct_tx = ct_out; cs_pk_rx = pk_in; cs_pk_tx = pk_out;
+        return;
+    }
+    cal_polls++;
+    if (cal_polls < cal_k) return;
+    cal_polls = 0;
+    cal_eval(tc_state.cum_rx - cs_tc_rx, ct_in - cs_ct_rx, pk_in - cs_pk_rx);
+    cal_eval(tc_state.cum_tx - cs_tc_tx, ct_out - cs_ct_tx, pk_out - cs_pk_tx);
+    cs_tc_rx = tc_state.cum_rx; cs_tc_tx = tc_state.cum_tx;
+    cs_ct_rx = ct_in; cs_ct_tx = ct_out; cs_pk_rx = pk_in; cs_pk_tx = pk_out;
+    cal_estimate();
+}
 
-function reset(req) { fs.writefile(request_file('reset.req'), ''); return { result: 'reset requested' }; }
-function stop(req) { fs.writefile(request_file('stop.req'), ''); return { result: 'stop requested' }; }
+function un_update(now, ct_in, ct_out, pk_in, pk_out) {
+    cal_update(ct_in, ct_out, pk_in, pk_out);
+    if (!tc_state.have) { tc_state.un_rx_bps = 0; tc_state.un_tx_bps = 0; return; }
+    let oh = l2_now();
+    if (!un_init) {
+        un_init = true;
+        un_prev = { tc_rx: tc_state.cum_rx, tc_tx: tc_state.cum_tx, ct_in: ct_in, ct_out: ct_out, pk_in: pk_in, pk_out: pk_out };
+        tc_state.un_rx_bps = 0; tc_state.un_tx_bps = 0;
+        return;
+    }
+    un_cum_rx += (tc_state.cum_rx - un_prev.tc_rx) - (ct_in - un_prev.ct_in) - oh * (pk_in - un_prev.pk_in);
+    un_cum_tx += (tc_state.cum_tx - un_prev.tc_tx) - (ct_out - un_prev.ct_out) - oh * (pk_out - un_prev.pk_out);
+    un_prev = { tc_rx: tc_state.cum_rx, tc_tx: tc_state.cum_tx, ct_in: ct_in, ct_out: ct_out, pk_in: pk_in, pk_out: pk_out };
+    let rx_rate = uring_rate(uring_rx, un_k_rx, now, un_cum_rx);
+    let tx_rate = uring_rate(uring_tx, un_k_tx, now, un_cum_tx);
+    if (un_win_long > 0) {
+        let rx_long = uring_rate(uring_rx_long, un_k_long, now, un_cum_rx);
+        let tx_long = uring_rate(uring_tx_long, un_k_long, now, un_cum_tx);
+        if (rx_long < rx_rate) rx_rate = rx_long;
+        if (tx_long < tx_rate) tx_rate = tx_long;
+    }
+    tc_state.un_rx_bps = rx_rate;
+    tc_state.un_tx_bps = tx_rate;
+}
 
-read_config();
-mkdir(cfg.out_dir);
-emit();
-try {
-	ub = ubus.connect();
-	ub.publish('trafficchart-agg', { status: status, reset: reset, stop: stop });
-} catch (err) { ub = null; }
-uloop.init();
-connect_netify();
-uloop.timer(tick, 0);
-uloop.run();
+function ct_totals() {
+    let in_ = 0, out_ = 0, pin = 0, pout = 0;
+    for (let a in apps) { in_ += apps[a].in_bytes || 0; out_ += apps[a].out_bytes || 0; pin += apps[a].in_packets || 0; pout += apps[a].out_packets || 0; }
+    return { in_: in_, out_: out_, pin: pin, pout: pout };
+}
+function ct_rates() {
+    let ri = 0, ro = 0;
+    for (let a in apps) { ri += apps[a].in_bps || 0; ro += apps[a].out_bps || 0; }
+    return [ ri, ro ];
+}
+
+/* ------------------------------------------------------------------ *
+ * History: three real tiers (5m/1h/1d), each storing DELTAS per bucket
+ * with its own cumulative baseline, 1h/1d closed on real wall-clock
+ * boundaries (awk's hist_close()/hist_tick()/wall_refresh()).
+ * ------------------------------------------------------------------ */
+
+let hist_tier_names = [ '5m', '1h', '1d' ];
+let hist_sec = +(getenv('HIST_SEC') || '300');
+let hour_sec = +(getenv('HOUR_SEC') || '3600');
+let day_sec = +(getenv('DAY_SEC') || '86400');
+let hist_keep = {
+    '5m': +(getenv('HIST_KEEP') || '288'),
+    '1h': +(getenv('HIST_HOUR_KEEP') || '192'),
+    '1d': +(getenv('HIST_DAY_KEEP') || '400')
+};
+let hist_files = { '5m': `${out_dir}/history.json`, '1h': `${out_dir}/history_1h.json`, '1d': `${out_dir}/history_1d.json` };
+let hist_buckets = { '5m': [], '1h': [], '1d': [] };
+let hist_base_a = { '5m': {}, '1h': {}, '1d': {} };
+let hist_base_d = { '5m': {}, '1h': {}, '1d': {} };
+let hist_base_h = { '5m': {}, '1h': {}, '1d': {} };
+let hist_base_sh = {
+    '5m': { rxd: 0, rxe: 0, txd: 0, txe: 0 }, '1h': { rxd: 0, rxe: 0, txd: 0, txe: 0 }, '1d': { rxd: 0, rxe: 0, txd: 0, txe: 0 }
+};
+let hist_pk = { '5m': { rx: 0, tx: 0 }, '1h': { rx: 0, tx: 0 }, '1d': { rx: 0, tx: 0 } };
+let ht0 = { '5m': started_at, '1h': started_at, '1d': started_at };
+let hkey_h = null, hkey_d = null;
+let last_t = 0;
+let wall_ok = false, wall_at = -1000;
+
+let have_localtime = true;
+try { localtime(0); } catch (e) { have_localtime = false; }
+
+function wall_refresh(now) {
+    wall_at = now;
+    // Plausibility check like awk's "after 2023 and not older than the
+    // newest bucket" - based on epoch value alone, no shell-out needed.
+    wall_ok = (now >= 1700000000 && now >= last_t);
+}
+function local_epoch(t) {
+    if (!have_localtime) return t;
+    let lt;
+    try { lt = localtime(t); } catch (e) { return t; }
+    if (!lt) return t;
+    return t + (lt.gmtoff != null ? lt.gmtoff : 0);
+    // Note: if the runtime's localtime() has no gmtoff, 1h/1d buckets close
+    // on UTC boundaries instead of local time - a graceful degradation, not
+    // a crash.
+}
+
+function hist_topk(candidates, k, with_name) {
+    sort(candidates, (x, y) => (y.in_ + y.out_) - (x.in_ + x.out_));
+    let obj = {}, oi = 0, oo = 0, count = 0;
+    for (let i = 0; i < length(candidates); i++) {
+        let c = candidates[i];
+        if (count < k) { obj[c.name] = with_name ? [ c.in_, c.out_, c.extra ] : [ c.in_, c.out_ ]; count++; }
+        else { oi += c.in_; oo += c.out_; }
+    }
+    if (oi + oo > 0) obj['(other)'] = with_name ? [ oi, oo, '(other)' ] : [ oi, oo ];
+    return obj;
+}
+
+function hist_write(tier) { json_write(hist_files[tier], hist_buckets[tier]); }
+
+function hist_load(tier) {
+    let raw = fs.readfile(hist_files[tier]);
+    if (!raw) return;
+    let arr;
+    try { arr = json(raw); } catch (e) { arr = null; }
+    if (type(arr) != 'array') return;
+    hist_buckets[tier] = arr;
+    for (let i = 0; i < length(arr); i++) if (arr[i].t > last_t) last_t = arr[i].t;
+    while (length(hist_buckets[tier]) > hist_keep[tier]) hist_buckets[tier].shift();
+}
+
+function hist_close(tier, now) {
+    let elapsed = now - ht0[tier];
+    if (elapsed < 1) return;
+
+    let cand_a = [], tin = 0, tout = 0;
+    for (let a in apps) {
+        let base = hist_base_a[tier][a] || { in_: 0, out_: 0 };
+        let di = (apps[a].in_bytes || 0) - base.in_, dov = (apps[a].out_bytes || 0) - base.out_;
+        hist_base_a[tier][a] = { in_: apps[a].in_bytes || 0, out_: apps[a].out_bytes || 0 };
+        if (di + dov > 0) { push(cand_a, { name: a, in_: di, out_: dov }); tin += di; tout += dov; }
+    }
+    let as_ = hist_topk(cand_a, 12, false);
+
+    let cand_d = [];
+    for (let k in devices) {
+        let base = hist_base_d[tier][k] || { in_: 0, out_: 0 };
+        let di = (devices[k].in_bytes || 0) - base.in_, dov = (devices[k].out_bytes || 0) - base.out_;
+        hist_base_d[tier][k] = { in_: devices[k].in_bytes || 0, out_: devices[k].out_bytes || 0 };
+        if (di + dov > 0) push(cand_d, { name: k, in_: di, out_: dov, extra: dev_label(k) });
+    }
+    let ds_ = hist_topk(cand_d, 8, true);
+
+    let cand_h = [];
+    for (let k in hosts) {
+        let base = hist_base_h[tier][k] || { in_: 0, out_: 0 };
+        let di = (hosts[k].in_bytes || 0) - base.in_, dov = (hosts[k].out_bytes || 0) - base.out_;
+        hist_base_h[tier][k] = { in_: hosts[k].in_bytes || 0, out_: hosts[k].out_bytes || 0 };
+        if (di + dov > 0) push(cand_h, { name: k, in_: di, out_: dov });
+    }
+    let hs_ = hist_topk(cand_h, 12, false);
+
+    let shb = hist_base_sh[tier];
+    let rxdd = tc_state.cum_drops_rx - shb.rxd, rxde = tc_state.cum_ecn_rx - shb.rxe;
+    let txdd = tc_state.cum_drops_tx - shb.txd, txde = tc_state.cum_ecn_tx - shb.txe;
+    hist_base_sh[tier] = { rxd: tc_state.cum_drops_rx, rxe: tc_state.cum_ecn_rx, txd: tc_state.cum_drops_tx, txe: tc_state.cum_ecn_tx };
+    let rxbp = hist_pk[tier].rx, txbp = hist_pk[tier].tx;
+    hist_pk[tier] = { rx: 0, tx: 0 };
+
+    let ep = wall_ok ? local_epoch(now) : now;
+    if (ep > last_t) last_t = ep;
+    let bucket = { t: ep, dt: elapsed, in: tin, out: tout, a: as_, d: ds_, h: hs_,
+                   sh: { rx: [ rxdd, rxde, rxbp ], tx: [ txdd, txde, txbp ] } };
+    push(hist_buckets[tier], bucket);
+    while (length(hist_buckets[tier]) > hist_keep[tier]) hist_buckets[tier].shift();
+    hist_write(tier);
+    ht0[tier] = now;
+}
+
+function hist_tick(now) {
+    if (now - wall_at >= (wall_ok ? 60 : 15)) wall_refresh(now);
+    if (now - ht0['5m'] >= hist_sec) hist_close('5m', now);
+    if (!wall_ok) return;
+    let kh = int(local_epoch(now) / hour_sec);
+    let kd = int(local_epoch(now) / day_sec);
+    if (hkey_h == null) { hkey_h = kh; hkey_d = kd; }
+    if (kh != hkey_h) { hist_close('1h', now); hkey_h = kh; }
+    if (kd != hkey_d) { hist_close('1d', now); hkey_d = kd; }
+}
+
+function hist_final(now) {
+    wall_refresh(now);
+    for (let ti = 0; ti < length(hist_tier_names); ti++) {
+        let tier = hist_tier_names[ti];
+        if ((tier == '5m' || wall_ok) && now - ht0[tier] >= 30) hist_close(tier, now);
+    }
+    for (let i = 0; i < length(ptargets); i++) {
+        if (!ptargets[i].attached && ptargets[i].why != 'fs') persist_attach(ptargets[i], now);
+        persist_flush(ptargets[i], now);
+    }
+}
+
+/* ------------------------------------------------------------------ *
+ * Persistence: several mirror targets, mount guard, merge on (re-)attach,
+ * compaction once a file grew too long. PERSIST_TIMEOUT is accepted for
+ * compatibility but not enforced - ucode's synchronous fs calls have no
+ * timeout primitive here, unlike awk's "timeout N sh -c ...".
+ * ------------------------------------------------------------------ */
+
+function strip_trailing_slash(s) {
+    while (length(s) > 1 && substr(s, length(s) - 1, 1) == '/') s = substr(s, 0, length(s) - 1);
+    return s;
+}
+function clean_paths(raw) {
+    let out = [];
+    for (let tok in split(raw || '', ' ')) {
+        tok = strip_trailing_slash(trim(tok));
+        if (!length(tok)) continue;
+        if (match(tok, /^\/[A-Za-z0-9._\/-]*$/) == null) { glog('config: ignoring invalid persist path %s', tok); continue; }
+        push(out, tok);
+    }
+    return out;
+}
+
+let persist_dirs = clean_paths(getenv('PERSIST_DIR') || '');
+let persist_mounts = clean_paths(getenv('PERSIST_MOUNT') || '');
+let persist_sec = +(getenv('PERSIST_SEC') || '3600');
+if (persist_sec < 60) persist_sec = 60;
+let persist_timeout = +(getenv('PERSIST_TIMEOUT') || '10');
+if (persist_timeout < 3) persist_timeout = 3;
+if (persist_timeout > 120) persist_timeout = 120;
+let persist_last = 0;
+
+let ptargets = [];
+for (let i = 0; i < length(persist_dirs); i++) {
+    let dir = persist_dirs[i];
+    let mount = '';
+    for (let j = 0; j < length(persist_mounts); j++) {
+        let m = persist_mounts[j];
+        if ((dir == m || index(dir, m + '/') == 0) && length(m) > length(mount)) mount = m;
+    }
+    push(ptargets, { dir: dir, mount: mount, attached: false, state: 'wait', why: '', next_try: 0, saved: 0,
+                      written: { '5m': {}, '1h': {}, '1d': {} } });
+}
+
+function is_mounted(path) {
+    let mounts = fs.readfile('/proc/mounts') || '';
+    return index(mounts, ` ${path} `) >= 0;
+}
+
+function persist_attach(pt, now) {
+    if (pt.mount && !is_mounted(pt.mount)) { pt.state = 'wait'; pt.why = 'mount'; pt.next_try = now + 30; return false; }
+    fs.mkdir(pt.dir);
+    for (let ti = 0; ti < length(hist_tier_names); ti++) {
+        let tier = hist_tier_names[ti];
+        let f = `${pt.dir}/history-${tier}.jsonl`;
+        let raw = fs.readfile(f);
+        let lines = raw ? split(raw, '\n') : [];
+        let merged = {};
+        for (let j = 0; j < length(hist_buckets[tier]); j++) merged[hist_buckets[tier][j].t] = hist_buckets[tier][j];
+        for (let j = 0; j < length(lines); j++) {
+            if (!length(trim(lines[j]))) continue;
+            let b;
+            try { b = json(lines[j]); } catch (e) { continue; }
+            if (type(b) != 'object' || b.t == null) continue;
+            pt.written[tier][b.t] = true;
+            if (!merged[b.t]) merged[b.t] = b;
+            if (b.t > last_t) last_t = b.t;
+        }
+        let keys = [];
+        for (let k in merged) push(keys, +k);
+        sort(keys, (a, b) => a - b);
+        let arr = [];
+        for (let j = 0; j < length(keys); j++) push(arr, merged[keys[j]]);
+        while (length(arr) > hist_keep[tier]) arr.shift();
+        hist_buckets[tier] = arr;
+        hist_write(tier);
+    }
+    pt.attached = true; pt.state = 'ok'; pt.why = '';
+    glog('persistent history: target %s is available', pt.dir);
+    return true;
+}
+
+function persist_flush(pt, now) {
+    if (!pt.attached) return;
+    if (pt.mount && !is_mounted(pt.mount)) { pt.attached = false; pt.state = 'wait'; pt.why = 'mount'; pt.next_try = now + 30; return; }
+    let ok = true;
+    for (let ti = 0; ti < length(hist_tier_names) && ok; ti++) {
+        let tier = hist_tier_names[ti];
+        let f = `${pt.dir}/history-${tier}.jsonl`;
+        let pending = [];
+        for (let j = 0; j < length(hist_buckets[tier]); j++) {
+            let b = hist_buckets[tier][j];
+            if (!pt.written[tier][b.t]) push(pending, b);
+        }
+        let written_count = 0;
+        for (let k in pt.written[tier]) written_count++;
+        let compact = (written_count + length(pending)) > (2 * hist_keep[tier] + 16);
+        if (!length(pending) && !compact) continue;
+        if (compact) {
+            let text = '';
+            for (let j = 0; j < length(hist_buckets[tier]); j++) text += sprintf('%J\n', hist_buckets[tier][j]);
+            if (fs.writefile(`${f}.tmp`, text) == null || !fs.rename(`${f}.tmp`, f)) { ok = false; break; }
+            pt.written[tier] = {};
+            for (let j = 0; j < length(hist_buckets[tier]); j++) pt.written[tier][hist_buckets[tier][j].t] = true;
+        } else {
+            let text = '';
+            for (let j = 0; j < length(pending); j++) text += sprintf('%J\n', pending[j]);
+            let existing = fs.readfile(f) || '';
+            if (fs.writefile(f, existing + text) == null) { ok = false; break; }
+            for (let j = 0; j < length(pending); j++) pt.written[tier][pending[j].t] = true;
+        }
+    }
+    if (ok) { pt.state = 'ok'; pt.saved = wall_ok ? local_epoch(now) : 0; }
+    else { glog('cannot write history to %s - retrying, other targets unaffected', pt.dir); pt.attached = false; pt.state = 'err'; pt.why = 'fs'; pt.next_try = now + 60; }
+}
+
+function persist_tick(now) {
+    for (let i = 0; i < length(ptargets); i++) {
+        let pt = ptargets[i];
+        if (!pt.attached && now >= pt.next_try) { if (persist_attach(pt, now)) persist_flush(pt, now); }
+    }
+    if (now - persist_last >= persist_sec) { persist_last = now; for (let i = 0; i < length(ptargets); i++) persist_flush(ptargets[i], now); }
+}
+
+function persist_pending_count(pt, tier) {
+    let c = 0;
+    for (let j = 0; j < length(hist_buckets[tier]); j++) if (!pt.written[tier][hist_buckets[tier][j].t]) c++;
+    return c;
+}
+function persist_status() {
+    let nok = 0, nerr = 0, targets = [];
+    for (let i = 0; i < length(ptargets); i++) {
+        let pt = ptargets[i];
+        if (pt.attached) nok++;
+        else if (pt.state == 'err') nerr++;
+        let pending = 0;
+        for (let ti = 0; ti < length(hist_tier_names); ti++) pending += persist_pending_count(pt, hist_tier_names[ti]);
+        push(targets, { dir: pt.dir, state: pt.state, saved: pt.saved, pending: pending });
+    }
+    let overall = (length(ptargets) == 0) ? 'off' : (nok == length(ptargets) ? 'ok' : (nok > 0 ? 'partial' : (nerr > 0 ? 'err' : 'wait')));
+    return { state: overall, sec: persist_sec, targets: targets };
+}
+
+/* ------------------------------------------------------------------ *
+ * Conntrack field extraction.
+ * ------------------------------------------------------------------ */
+
+function field(line, name, occurrence) {
+    let found = 0;
+    let parts = split(line, ' ');
+    for (let i = 0; i < length(parts); i++) {
+        if (substr(parts[i], 0, length(name) + 1) == `${name}=`) {
+            found++;
+            if (found == occurrence) return substr(parts[i], length(name) + 1);
+        }
+    }
+    return '';
+}
+function number_field(line, name, occurrence) {
+    let value = field(line, name, occurrence);
+    return match(value, /^[0-9]+$/) != null ? +value : 0;
+}
+
+function load_map() {
+    let version = trim(fs.readfile(map_ver_file) || '');
+    if (version == map_version) return;
+    app_map = {}; app_hosts = {}; map_version = version;
+    let lines = split(fs.readfile(map_file) || '', '\n');
+    for (let i = 0; i < length(lines); i++) {
+        let fields = split(lines[i], '\t');
+        if (length(fields) < 2 || !fields[0] || !fields[1]) continue;
+        app_map[fields[0]] = fields[1];
+        app_hosts[fields[0]] = fields[2] || '';
+    }
+}
+
+function mapped_app(flow) {
+    let direct = `${flow.proto}|${flow.src}|${flow.dst}|${flow.sport}|${flow.dport}`;
+    if (app_map[direct]) return { name: app_map[direct], host: app_hosts[direct] || '' };
+    let reverse = `${flow.proto}|${flow.dst}|${flow.src}|${flow.dport}|${flow.sport}`;
+    if (app_map[reverse]) return { name: app_map[reverse], host: app_hosts[reverse] || '' };
+    return null;
+}
+
+function parse(line) {
+    let head = split(line, ' ');
+    if (length(head) < 3) return null;
+    let proto = head[2], src = field(line, 'src', 1), dst = field(line, 'dst', 1);
+    if (!src || !dst) return null;
+    let sport = field(line, 'sport', 1), dport = field(line, 'dport', 1);
+    let reply_src = field(line, 'src', 2);
+    let mark = number_field(line, 'mark', 1) & 255;
+    let p1 = number_field(line, 'packets', 1), b1 = number_field(line, 'bytes', 1);
+    let p2 = number_field(line, 'packets', 2), b2 = number_field(line, 'bytes', 2);
+    return { proto: proto, src: src, dst: dst, reply_src: reply_src, sport: sport, dport: dport,
+             p1: p1, b1: b1, p2: p2, b2: b2, mark: mark };
+}
+
+/* ------------------------------------------------------------------ *
+ * Core poll.
+ * ------------------------------------------------------------------ */
+
+let dtp = sample_sec; // actual elapsed seconds since the previous poll (awk's dtp)
+
+function poll(now) {
+    let text = fs.readfile(ct_file);
+    if (text == null) return false;
+    load_map();
+    let router_raw = {}, device_raw = {};
+    let seen = {};
+    let lines = split(text, '\n');
+    for (let i = 0; i < length(lines); i++) {
+        let flow = parse(lines[i]);
+        if (!flow || flow.mark == 64 || flow.mark > 17) continue;
+        let lan = local(flow.src);
+        let vflow = false;
+        if (flow.mark == 0) {
+            if (lan && router_ips[flow.dst] && !router_ips[flow.src]) {
+                vflow = true; // LAN device -> router service: not WAN traffic
+            } else if (!lan && flow.reply_src && local(flow.reply_src) && !router_ips[flow.reply_src]) {
+                // WAN-initiated flow to a LAN host (port forward, IPv6 inbound): keep.
+            } else if (!(lan && !local(flow.dst))) {
+                continue; // not LAN -> WAN and not a recognised special case
+            }
+        }
+        let key = `${flow.proto}|${flow.src}|${flow.dst}|${flow.sport}|${flow.dport}`;
+        seen[key] = true;
+        let old = flows[key], d1 = flow.b1, d2 = flow.b2, q1 = flow.p1, q2 = flow.p2;
+        if (old) {
+            d1 -= old.b1; d2 -= old.b2; q1 -= old.p1; q2 -= old.p2;
+            if (d1 < 0 || d2 < 0 || q1 < 0 || q2 < 0) {
+                if (flow.b1 + flow.b2 <= birth_max) { d1 = flow.b1; d2 = flow.b2; q1 = flow.p1; q2 = flow.p2; }
+                else { d1 = max(d1, 0); d2 = max(d2, 0); q1 = max(q1, 0); q2 = max(q2, 0); }
+            }
+        } else if (warm || flow.b1 + flow.b2 > birth_max) {
+            d1 = 0; d2 = 0; q1 = 0; q2 = 0;
+        }
+        if (vflow) {
+            if (d1 > 0 || d2 > 0) {
+                let device = device_name(flow.src);
+                if (device != 'router' && !devices[device] && length(devices) >= dev_max) device = '(other)';
+                if (flow.src && index(flow.src, ':') < 0) device_ip[device] = flow.src;
+                via_in[device] = (via_in[device] || 0) + d2;
+                via_out[device] = (via_out[device] || 0) + d1;
+                let dport_num = +flow.dport;
+                let eligible = (flow.proto == 'tcp' || flow.proto == 'udp') &&
+                    (attr_ports_restrict ? attr_ports[dport_num] : !attr_skip_ports[dport_num]);
+                if (eligible) {
+                    if (!device_raw[device]) device_raw[device] = { in_: 0, out_: 0 };
+                    device_raw[device].in_ += d2;
+                    device_raw[device].out_ += d1;
+                }
+            }
+            flows[key] = { b1: flow.b1, b2: flow.b2, p1: flow.p1, p2: flow.p2, bulk: false,
+                           last: poll_no, device: device_name(flow.src), class_id: flow.mark,
+                           bytes: flow.b1 + flow.b2, dst: flow.dst, proto: flow.proto, dport: flow.dport,
+                           in_bps: 0, out_bps: 0, vflow: true };
+            continue;
+        }
+        let bulk = old && old.bulk;
+        if (!bulk && (flow.mark == 4 || flow.mark == 7 || flow.mark == 8) && flow.b1 + flow.b2 > bulk_bytes) bulk = true;
+        let class_id = bulk ? 6 : flow.mark;
+        let device_address = lan ? flow.src : flow.reply_src;
+        let device = device_name(device_address);
+        if (device != 'router' && !devices[device] && length(devices) >= dev_max) device = '(other)';
+        if (device_address && index(device_address, ':') < 0) device_ip[device] = device_address;
+        let incoming = lan ? d2 : d1, outgoing = lan ? d1 : d2;
+        let in_packets = lan ? q2 : q1, out_packets = lan ? q1 : q2;
+        let state = old || {}, mapped = mapped_app(flow);
+        if (incoming || outgoing || in_packets || out_packets) {
+            let fallback = `[${class_names[class_id] || 'UNMARKED'}]`;
+            let app = mapped ? mapped.name : state.app;
+            let host = mapped && mapped.host ? mapped.host : (state.host || (local(flow.src) ? flow.dst : flow.src));
+            if (!app && !state.giveup) {
+                state.pending_in = (state.pending_in || 0) + incoming;
+                state.pending_out = (state.pending_out || 0) + outgoing;
+                state.pending_in_packets = (state.pending_in_packets || 0) + in_packets;
+                state.pending_out_packets = (state.pending_out_packets || 0) + out_packets;
+                state.pending_polls = (state.pending_polls || 0) + 1;
+                if (state.pending_polls < app_hold) {
+                    incoming = 0; outgoing = 0; in_packets = 0; out_packets = 0;
+                } else {
+                    app = fallback;
+                    state.giveup = true;
+                }
+            }
+            if (app && state.pending_polls) {
+                incoming += state.pending_in || 0;
+                outgoing += state.pending_out || 0;
+                in_packets += state.pending_in_packets || 0;
+                out_packets += state.pending_out_packets || 0;
+                state.pending_in = state.pending_out = 0;
+                state.pending_in_packets = state.pending_out_packets = 0;
+                state.pending_polls = 0;
+            }
+            if (!app) app = fallback;
+            if (mapped) { state.app = app; state.host = host; state.giveup = false; }
+            let agg_app = app;
+            if (!apps[agg_app] && length(apps) >= app_max) agg_app = '(other)';
+            let host_norm = host_key(regdom(host));
+            add(apps, agg_app, incoming, in_packets, outgoing, out_packets);
+            add(devices, device, incoming, in_packets, outgoing, out_packets);
+            add(hosts, host_norm, incoming, in_packets, outgoing, out_packets);
+            if (tooltips_enabled) {
+                mx_a_count = mx_insert(app_hosts_mx, mx_a_count, mx_max, 'mxfull_a', agg_app, host_norm, incoming, in_packets, outgoing, out_packets);
+                mx_d_count = mx_insert(device_apps_mx, mx_d_count, pair_max, 'mxfull_d', device, agg_app, incoming, in_packets, outgoing, out_packets);
+                mx_h_count = mx_insert(host_devices_mx, mx_h_count, mx_max, 'mxfull_h', host_norm, device, incoming, in_packets, outgoing, out_packets);
+            }
+            if (device == 'router') {
+                if (!router_raw[agg_app]) router_raw[agg_app] = { in_: 0, out_: 0, pin: 0, pout: 0 };
+                router_raw[agg_app].in_ += incoming;
+                router_raw[agg_app].out_ += outgoing;
+                router_raw[agg_app].pin += in_packets;
+                router_raw[agg_app].pout += out_packets;
+            }
+        }
+        // EMA (0.5/0.5, awk's fei/feo), against the ACTUAL elapsed time.
+        let raw_in_bps = incoming / max(1, dtp), raw_out_bps = outgoing / max(1, dtp);
+        let ei = state.in_bps != null ? state.in_bps * 0.5 + raw_in_bps * 0.5 : raw_in_bps;
+        let eo = state.out_bps != null ? state.out_bps * 0.5 + raw_out_bps * 0.5 : raw_out_bps;
+        flows[key] = { ...state, b1: flow.b1, b2: flow.b2, p1: flow.p1, p2: flow.p2, bulk: bulk,
+                       last: poll_no, device: device, class_id: class_id, bytes: flow.b1 + flow.b2,
+                       dst: local(flow.src) ? flow.dst : flow.src, proto: flow.proto, dport: flow.dport,
+                       in_bps: ei, out_bps: eo };
+    }
+    for (let key in flows)
+        if (!seen[key] && poll_no - flows[key].last > gone_grace) delete flows[key];
+    router_attribute(router_raw, device_raw);
+    warm = false;
+    write_unresolved();
+    return true;
+}
+
+function update_rates(now) {
+    let slot = poll_no % rate_k;
+    for (let key in apps) {
+        if (!rate_rings.a[key]) rate_rings.a[key] = ring_new(rate_k);
+        let r = ring_rate(rate_rings.a[key], slot, now, apps[key].in_bytes, apps[key].out_bytes);
+        apps[key].in_bps = r[0]; apps[key].out_bps = r[1];
+    }
+    for (let key in devices) {
+        if (!rate_rings.d[key]) rate_rings.d[key] = ring_new(rate_k);
+        let r = ring_rate(rate_rings.d[key], slot, now, devices[key].in_bytes, devices[key].out_bytes);
+        devices[key].in_bps = r[0]; devices[key].out_bps = r[1];
+    }
+    for (let key in hosts) {
+        if (!rate_rings.h[key]) rate_rings.h[key] = ring_new(rate_k);
+        let r = ring_rate(rate_rings.h[key], slot, now, hosts[key].in_bytes, hosts[key].out_bytes);
+        hosts[key].in_bps = r[0]; hosts[key].out_bps = r[1];
+    }
+}
+
+/* ------------------------------------------------------------------ *
+ * Emit.
+ * ------------------------------------------------------------------ */
+
+function emit(ctr, ct) {
+    if (tooltip_due()) refresh_tops();
+
+    let result = {
+        since: started_at, up: time() - started_at, flows: length(flows),
+        rate: {
+            win: rate_win, tc: tc_file ? 1 : 0, rx_bps: tc_state.rx_bps, tx_bps: tc_state.tx_bps,
+            ct_rx_bps: ctr[0], ct_tx_bps: ctr[1],
+            un_rx_bps: tc_state.un_rx_bps, un_tx_bps: tc_state.un_tx_bps,
+            un_rx_bytes: max(0, un_cum_rx), un_tx_bytes: max(0, un_cum_tx),
+            l2: l2_now(), l2_mode: l2_mode(), l2_n: cal_n, l2_min: cal_min, l2_raw: l2_raw
+        },
+        persist: persist_status(),
+        apps: {}, devices: {}, hosts: {}, top_flows: []
+    };
+
+    for (let key in apps) {
+        let e = apps[key];
+        let out = { in_bytes: e.in_bytes || 0, in_packets: e.in_packets || 0, out_bytes: e.out_bytes || 0,
+                    out_packets: e.out_packets || 0, in_bps: e.in_bps || 0, out_bps: e.out_bps || 0 };
+        if (last_top_a[key]) out.top = last_top_a[key];
+        result.apps[key] = out;
+    }
+
+    for (let key in devices) {
+        let e = devices[key];
+        result.devices[key] = {
+            name: dev_label(key), ip: device_ip[key] || '',
+            in_bytes: e.in_bytes || 0, in_packets: e.in_packets || 0, out_bytes: e.out_bytes || 0, out_packets: e.out_packets || 0,
+            in_bps: e.in_bps || 0, out_bps: e.out_bps || 0,
+            via_in: via_in[key] || 0, via_out: via_out[key] || 0,
+            top: last_top_d[key] || []
+        };
+    }
+
+    for (let key in hosts) {
+        let e = hosts[key];
+        let out = { in_bytes: e.in_bytes || 0, in_packets: e.in_packets || 0, out_bytes: e.out_bytes || 0,
+                    out_packets: e.out_packets || 0, in_bps: e.in_bps || 0, out_bps: e.out_bps || 0 };
+        if (last_top_h[key]) out.top = last_top_h[key];
+        result.hosts[key] = out;
+    }
+
+    // 25 busiest flows by smoothed rate.
+    let busy = [];
+    for (let key in flows) if ((flows[key].in_bps || 0) + (flows[key].out_bps || 0) > 0) push(busy, flows[key]);
+    for (let i = 0; i < min(25, length(busy)); i++) {
+        let best = i;
+        for (let j = i + 1; j < length(busy); j++) if ((busy[j].in_bps + busy[j].out_bps) > (busy[best].in_bps + busy[best].out_bps)) best = j;
+        if (best != i) { let flow = busy[i]; busy[i] = busy[best]; busy[best] = flow; }
+        let f = busy[i];
+        push(result.top_flows, {
+            dev: dev_label(f.device), ip: device_ip[f.device] || '',
+            app: f.app || `[${class_names[f.class_id] || 'UNMARKED'}]`,
+            host: f.host || '', dst: v6short(f.dst || ''), port: f.dport || '', proto: f.proto || '',
+            class: class_names[f.class_id] || 'UNMARKED', in_bps: f.in_bps || 0, out_bps: f.out_bps || 0, bytes: f.bytes || 0
+        });
+    }
+
+    json_write(`${out_dir}/classes.json`, result);
+}
+
+function reset() {
+    apps = {}; devices = {}; hosts = {}; via_in = {}; via_out = {};
+    app_hosts_mx = {}; device_apps_mx = {}; host_devices_mx = {};
+    mx_a_count = 0; mx_d_count = 0; mx_h_count = 0;
+    router_qr = []; router_qv = [];
+    rate_rings = { a: {}, d: {}, h: {} };
+    for (let ti = 0; ti < length(hist_tier_names); ti++) {
+        let tier = hist_tier_names[ti];
+        hist_buckets[tier] = [];
+        hist_base_a[tier] = {}; hist_base_d[tier] = {}; hist_base_h[tier] = {};
+        hist_base_sh[tier] = { rxd: 0, rxe: 0, txd: 0, txe: 0 };
+        hist_pk[tier] = { rx: 0, tx: 0 };
+        ht0[tier] = time();
+        hist_write(tier);
+    }
+    hkey_h = null; hkey_d = null;
+    tooltip_last = 0;
+    started_at = time();
+    fs.unlink(reset_file);
+    glog('history and cumulative totals cleared on request (reset_history)');
+}
+
+/* ------------------------------------------------------------------ *
+ * main
+ * ------------------------------------------------------------------ */
+
+function self_pid() {
+    try {
+        let link = fs.readlink('/proc/self');
+        if (link) { let m = match(link, /([0-9]+)$/); if (m) return +m[1]; }
+    } catch (e) {}
+    return 0;
+}
+
+fs.mkdir(out_dir);
+
+let mypid = self_pid();
+let old_pid_raw = trim(fs.readfile(pid_file) || '');
+if (match(old_pid_raw, /^[0-9]+$/) && (+old_pid_raw != mypid || mypid == 0)) {
+    let old = +old_pid_raw;
+    let waited = 0;
+    while (waited < 20) {
+        let cmdline = fs.readfile(`/proc/${old}/cmdline`);
+        if (!cmdline || index(cmdline, 'trafficchart-agg') < 0) break;
+        sleep(1);
+        waited++;
+    }
+}
+fs.unlink(stop_file);
+fs.unlink(reset_file);
+fs.writefile(pid_file, `${mypid}\n`);
+
+load_hosts();
+refresh_gua();
+last_hosts_refresh = time();
+last_gua_refresh = time();
+
+for (let ti = 0; ti < length(hist_tier_names); ti++) hist_load(hist_tier_names[ti]);
+wall_refresh(time());
+ht0 = { '5m': time(), '1h': time(), '1d': time() };
+for (let i = 0; i < length(ptargets); i++) if (persist_attach(ptargets[i], time())) persist_flush(ptargets[i], time());
+persist_last = time();
+
+function do_poll_cycle(t0) {
+    if (t0 - last_gua_refresh >= gua_refresh_sec) { refresh_gua(); last_gua_refresh = t0; }
+    if (t0 - last_hosts_refresh >= hosts_refresh_sec) { write_unresolved(); load_hosts(); last_hosts_refresh = t0; }
+    let ok = poll(t0);
+    if (ok) {
+        let ct = ct_totals();
+        update_rates(t0);
+        let ctr = ct_rates();
+        load_tc(t0);
+        un_update(t0, ct.in_, ct.out_, ct.pin, ct.pout);
+        emit(ctr, ct);
+        hist_tick(t0);
+        persist_tick(t0);
+    }
+    return ok;
+}
+
+let t0prev = -1;
+
+poll_no++;
+let t0 = time();
+if (t0prev >= 0 && t0 > t0prev) dtp = t0 - t0prev;
+t0prev = t0;
+do_poll_cycle(t0);
+let work_elapsed = time() - t0;
+if (adapt_interval) {
+    if (work_elapsed > poll_interval * adapt_budget && poll_interval < interval_max) poll_interval += 1;
+    else if (work_elapsed < poll_interval * adapt_budget * 0.5 && poll_interval > sample_sec) poll_interval -= 1;
+} else poll_interval = sample_sec;
+
+if (getenv('ONCE') != '1') {
+    while (true) {
+        let sleep_for = int(poll_interval - work_elapsed + 0.999);
+        if (sleep_for < 1) sleep_for = 1;
+        sleep(sleep_for);
+
+        if (fs.readfile(stop_file) != null) { hist_final(time()); break; }
+        if (fs.readfile(reset_file) != null) reset();
+        let pl = trim(fs.readfile(pid_file) || '');
+        if (length(pl) && +pl != mypid) break; // a newer instance took over
+
+        poll_no++;
+        t0 = time();
+        if (t0 > t0prev) dtp = t0 - t0prev;
+        t0prev = t0;
+        do_poll_cycle(t0);
+        work_elapsed = time() - t0;
+        if (adapt_interval) {
+            if (work_elapsed > poll_interval * adapt_budget && poll_interval < interval_max) poll_interval += 1;
+            else if (work_elapsed < poll_interval * adapt_budget * 0.5 && poll_interval > sample_sec) poll_interval -= 1;
+        } else poll_interval = sample_sec;
+    }
+}
+fs.unlink(pid_file);
+fs.unlink(stop_file);
