@@ -65,11 +65,15 @@ tc_load_config() {
     TC_CFG_LOADED=1
     command -v uci >/dev/null 2>&1 || return 0
     local opt key val
-    for opt in interval persist_dir persist_mount persist_sec persist_timeout hist_hour_keep hist_day_keep         bulk_bytes app_hold v6_reresolve unresolved_max backend attr_win attr_tol attr_topapps attr_totals         attr_skip_ports attr_ports attr_min attr_share attr_max_apps attr_max_devices l2_overhead l2_init         l2_candidates cal_tol cal_win cal_keep cal_min cal_pctl cal_max_pkt cal_min_pkts host_max un_win_rx         un_win_long app_max mx_max pair_max tbl_idle_long tbl_idle_short; do
+    for opt in interval persist_dir persist_mount persist_sec persist_timeout hist_hour_keep hist_day_keep \
+        bulk_bytes app_hold v6_reresolve unresolved_max backend attr_win attr_tol attr_topapps attr_totals \
+        attr_skip_ports attr_ports attr_min attr_share attr_max_apps attr_max_devices l2_overhead l2_init \
+        l2_candidates cal_tol cal_win cal_keep cal_min cal_pctl cal_max_pkt cal_min_pkts host_max un_win_rx \
+        un_win_long app_max mx_max pair_max tbl_idle_long tbl_idle_short; do
         key="CFG_$opt"
         val=$(uci -q get "trafficchart.global.$opt" 2>/dev/null) || continue
         eval "$key=\"\$val\""
-    done"
+    done
 }
 
 tc_cfg_valid() {
