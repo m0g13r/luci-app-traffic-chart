@@ -406,10 +406,10 @@ if ! mkdir "$LOCKDIR" 2>/dev/null; then
     rm -rf "$LOCKDIR"
     mkdir "$LOCKDIR" 2>/dev/null || exit 1
 fi
-echo $ > "$LOCKDIR/pid"
+echo "$" > "$LOCKDIR/pid"
 # Never remove reset.req here: a reset issued during a restart belongs to the
 # next daemon instance and must not be lost.
-echo $ > "$PIDFILE"
+echo "$" > "$PIDFILE"
 
 # The byte/packet counters in /proc/net/nf_conntrack only exist with conntrack
 # accounting. It is usually already on (NSS builds), but not on every stock
