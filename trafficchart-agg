@@ -1029,7 +1029,11 @@ function parse_pass(   line, r, h, proto, mark, pp, t, sp, b1, b2, p1, p2,
         # Do not depend on a fixed prefix width: nf_conntrack prefixes can
         # gain fields on different kernel/userspace combinations.
         proto = ""
-        if (match(line, /^[^ ]+ [0-9]+ ([^ ]+)/)) proto = substr(line, RSTART + 1 + index(substr(line, RSTART), " "))
+        r = line
+        if (match(r, /^[^ ]+ [0-9]+ /)) {
+            r = substr(r, RSTART + RLENGTH)
+            if (match(r, /^[^ ]+/)) proto = substr(r, RSTART, RLENGTH)
+        }
         if (proto == "") continue
         src = ""; dst = ""; pp = ""; mark = -1
         b1 = 0; b2 = 0; p1 = 0; p2 = 0
