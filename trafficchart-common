@@ -14,7 +14,7 @@
 #
 # tc_resolve sets:
 #   BACKEND        nss | generic
-#                    nss     NSS hardware offload: nsstbl/nssfq_codel, download
+#                    nss     NSS hardware offload: nsstbl/nsfq_codel, download
 #                            shaper on nssifb
 #                    generic stock kernel shaper set up by sqm-scripts: cake or
 #                            htb+fq_codel, download shaper on ifb4<wan>
@@ -58,13 +58,18 @@
 
 SYSNET="${TC_SYSNET:-/sys/class/net}"
 
-# Reads the whole section with ONE uci call into CFG_<option> variables. List
-# options ("a" "b") are skipped, values are shell-quoted by uci itself.
+# Quote one shell value for the single assignment performed by tc_cfg().
+# The value itself is never interpreted as shell syntax by eval.
+tc_shell_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+# Read one UCI option when requested by tc_cfg().
+# No UCI output is evaluated as shell code.
 tc_load_config() {
     [ -n "$TC_CFG_LOADED" ] && return 0
     TC_CFG_LOADED=1
     command -v uci >/dev/null 2>&1 || return 0
-    eval "$(uci -q show trafficchart.global 2>/dev/null | sed -n "/' '/d; s/^trafficchart\.global\.\([a-z0-9_]*\)='\(.*\)'\$/CFG_\1='\2'/p")"
 }
 
 tc_cfg_valid() {
@@ -79,21 +84,87 @@ tc_cfg_valid() {
 }
 
 tc_cfg() {
-    local var="$1" def="$2" type="$3" key isset val
-    eval "isset=\${$var+x}"
-    [ -n "$isset" ] && return 0
+    local var="$1" def="$2" type="$3" key isset val qval
+
+    case "$var" in
+        ''|*[!A-Za-z0-9_]*)
+            return 1
+            ;;
+    esac
+
+    # Keep explicitly supplied environment variables unchanged.
+    case "$var" in
+        PROFILE)            [ -n "${PROFILE+x}" ] && return 0 ;;
+        INTERVAL)           [ -n "${INTERVAL+x}" ] && return 0 ;;
+        ADAPT_INTERVAL)     [ -n "${ADAPT_INTERVAL+x}" ] && return 0 ;;
+        INTERVAL_MAX)       [ -n "${INTERVAL_MAX+x}" ] && return 0 ;;
+        ADAPT_BUDGET)       [ -n "${ADAPT_BUDGET+x}" ] && return 0 ;;
+        TOOLTIP_EVERY)      [ -n "${TOOLTIP_EVERY+x}" ] && return 0 ;;
+        HOSTS_REFRESH_SEC)  [ -n "${HOSTS_REFRESH_SEC+x}" ] && return 0 ;;
+        GUA_REFRESH_SEC)    [ -n "${GUA_REFRESH_SEC+x}" ] && return 0 ;;
+        RATE_WIN)           [ -n "${RATE_WIN+x}" ] && return 0 ;;
+        BULK_BYTES)         [ -n "${BULK_BYTES+x}" ] && return 0 ;;
+        HIST_SEC)           [ -n "${HIST_SEC+x}" ] && return 0 ;;
+        HIST_KEEP)          [ -n "${HIST_KEEP+x}" ] && return 0 ;;
+        HIST_HOUR_KEEP)     [ -n "${HIST_HOUR_KEEP+x}" ] && return 0 ;;
+        HIST_DAY_KEEP)      [ -n "${HIST_DAY_KEEP+x}" ] && return 0 ;;
+        PERSIST_DIR)        [ -n "${PERSIST_DIR+x}" ] && return 0 ;;
+        PERSIST_MOUNT)      [ -n "${PERSIST_MOUNT+x}" ] && return 0 ;;
+        PERSIST_SEC)        [ -n "${PERSIST_SEC+x}" ] && return 0 ;;
+        PERSIST_TIMEOUT)    [ -n "${PERSIST_TIMEOUT+x}" ] && return 0 ;;
+        HOST_MAX)           [ -n "${HOST_MAX+x}" ] && return 0 ;;
+        APP_HOLD)           [ -n "${APP_HOLD+x}" ] && return 0 ;;
+        APP_MAX)            [ -n "${APP_MAX+x}" ] && return 0 ;;
+        MX_MAX)             [ -n "${MX_MAX+x}" ] && return 0 ;;
+        PAIR_MAX)           [ -n "${PAIR_MAX+x}" ] && return 0 ;;
+        TBL_IDLE_LONG)      [ -n "${TBL_IDLE_LONG+x}" ] && return 0 ;;
+        TBL_IDLE_SHORT)     [ -n "${TBL_IDLE_SHORT+x}" ] && return 0 ;;
+        BIRTH_MAX)          [ -n "${BIRTH_MAX+x}" ] && return 0 ;;
+        GONE_GRACE)         [ -n "${GONE_GRACE+x}" ] && return 0 ;;
+        L2_OVERHEAD)        [ -n "${L2_OVERHEAD+x}" ] && return 0 ;;
+        L2_INIT)            [ -n "${L2_INIT+x}" ] && return 0 ;;
+        L2_CANDIDATES)      [ -n "${L2_CANDIDATES+x}" ] && return 0 ;;
+        CAL_WIN)            [ -n "${CAL_WIN+x}" ] && return 0 ;;
+        CAL_KEEP)           [ -n "${CAL_KEEP+x}" ] && return 0 ;;
+        CAL_MIN)            [ -n "${CAL_MIN+x}" ] && return 0 ;;
+        CAL_PCTL)           [ -n "${CAL_PCTL+x}" ] && return 0 ;;
+        CAL_MAX_PKT)        [ -n "${CAL_MAX_PKT+x}" ] && return 0 ;;
+        CAL_MIN_PKTS)       [ -n "${CAL_MIN_PKTS+x}" ] && return 0 ;;
+        CAL_TOL)            [ -n "${CAL_TOL+x}" ] && return 0 ;;
+        UN_WIN)             [ -n "${UN_WIN+x}" ] && return 0 ;;
+        UN_WIN_RX)          [ -n "${UN_WIN_RX+x}" ] && return 0 ;;
+        UN_WIN_LONG)        [ -n "${UN_WIN_LONG+x}" ] && return 0 ;;
+        TOOLTIPS)           [ -n "${TOOLTIPS+x}" ] && return 0 ;;
+        TC_STATS)           [ -n "${TC_STATS+x}" ] && return 0 ;;
+        ATTR_TOTALS)        [ -n "${ATTR_TOTALS+x}" ] && return 0 ;;
+        ATTR_TOPAPPS)       [ -n "${ATTR_TOPAPPS+x}" ] && return 0 ;;
+        ATTR_PORTS)         [ -n "${ATTR_PORTS+x}" ] && return 0 ;;
+        ATTR_SKIP_PORTS)    [ -n "${ATTR_SKIP_PORTS+x}" ] && return 0 ;;
+        ATTR_WIN)           [ -n "${ATTR_WIN+x}" ] && return 0 ;;
+        ATTR_TOL)           [ -n "${ATTR_TOL+x}" ] && return 0 ;;
+        ATTR_MIN)           [ -n "${ATTR_MIN+x}" ] && return 0 ;;
+        ATTR_SHARE)         [ -n "${ATTR_SHARE+x}" ] && return 0 ;;
+        ATTR_MAX_APPS)      [ -n "${ATTR_MAX_APPS+x}" ] && return 0 ;;
+        ATTR_MAX_DEVICES)   [ -n "${ATTR_MAX_DEVICES+x}" ] && return 0 ;;
+        AGG_MAX_AGE)        [ -n "${AGG_MAX_AGE+x}" ] && return 0 ;;
+        CACHE_TTL_SEC)      [ -n "${CACHE_TTL_SEC+x}" ] && return 0 ;;
+    esac
+
     tc_load_config
     key=$(echo "$var" | tr 'A-Z' 'a-z')
-    eval "isset=\${CFG_$key+x}"
-    if [ -n "$isset" ]; then
-        eval "val=\$CFG_$key"
+    val=$(uci -q get "trafficchart.global.$key" 2>/dev/null)
+
+    if [ -n "$val" ] || uci -q get "trafficchart.global.$key" >/dev/null 2>&1; then
         if tc_cfg_valid "$key" "$type" "$val"; then
-            eval "$var=\$val"
+            qval=$(tc_shell_quote "$val")
+            eval "$var=$qval"
             return 0
         fi
         logger -t trafficchart "config: invalid value '$val' for option $key - using default '$def'" 2>/dev/null
     fi
-    eval "$var=\$def"
+
+    qval=$(tc_shell_quote "$def")
+    eval "$var=$qval"
 }
 
 tc_detect_backend() {
@@ -173,11 +244,11 @@ tc_shaper_drops() {
             if (BACKEND == "nss") {
                 for (i = 1; i <= q; i++) if (nm[i] == "nssfq_codel") { D = dr[i]; E = ecn[i] }
                 if (!D) for (i = 1; i <= q; i++) if (nm[i] == "nsstbl") D = dr[i]
-                for (i = 1; i <= q; i++) if (nm[i] == "nssfq_codel" || nm[i] == "nsstbl") B += bl[i]   # leaf + token bucket, same as the live shaper line
+                for (i = 1; i <= q; i++) if (nm[i] == "nssfq_codel" || nm[i] == "nsstbl") B += bl[i]
             } else {
                 for (i = 1; i <= q; i++) if (nm[i] ~ /fq_codel$/) { D += dr[i]; E += ecn[i] }
-                if (!D && q >= 1) D = dr[1] + 0   # cake (or a root with no fq_codel leaf): its own drops
-                B = bl[1] + 0                     # the root reports what is queued below it
+                if (!D && q >= 1) D = dr[1] + 0
+                B = bl[1] + 0
             }
             printf "%d %d %.0f\n", D + 0, E + 0, B + 0
         }'

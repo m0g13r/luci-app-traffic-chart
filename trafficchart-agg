@@ -391,7 +391,7 @@ if [ -r "$PIDFILE" ]; then
         done
     fi
 fi
-rm -f "$STOPFILE" "$RESETFILE"
+rm -f "$STOPFILE"
 echo $$ > "$PIDFILE"
 
 # The byte/packet counters in /proc/net/nf_conntrack only exist with conntrack
@@ -1869,7 +1869,7 @@ stop_agg() {
     _i=0
     while [ "$_i" -lt 14 ] && kill -0 "$APID" 2>/dev/null; do sleep 1; _i=$((_i + 1)); done
     kill "$APID" 2>/dev/null
-    rm -f "$PIDFILE" "$STOPFILE" "$RESETFILE"
+    rm -f "$PIDFILE" "$STOPFILE"
     exit 0
 }
 trap stop_agg TERM INT HUP

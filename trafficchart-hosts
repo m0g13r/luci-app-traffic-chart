@@ -97,6 +97,22 @@ ip -o addr show 2>/dev/null | awk '
     }
     { for (i = 1; i < NF; i++) if ($i == "inet" || $i == "inet6") { a = $(i + 1); sub(/\/.*/, "", a); print "R\t" v6full(a) } }'
 
+# DSA/FDB identity: map a learned MAC to its physical switch port and bridge.
+# This is metadata only; accounting remains keyed by MAC. "bridge" is optional.
+if command -v bridge >/dev/null 2>&1; then
+    bridge fdb show 2>/dev/null | awk '
+        {
+            mac = tolower($1); dev = ""; master = ""; vlan = ""
+            for (i = 2; i <= NF; i++) {
+                if ($i == "dev" && i < NF) dev = $(i + 1)
+                else if ($i == "master" && i < NF) master = $(i + 1)
+                else if ($i == "vlan" && i < NF) vlan = $(i + 1)
+            }
+            if (mac ~ /^[0-9a-f][0-9a-f](:[0-9a-f][0-9a-f]){5}$/ && dev != "" && master != "" && dev != master)
+                print "P\t" mac "\t" dev "\t" master "\t" vlan
+        }'
+fi
+
 [ -r /tmp/dhcp.leases ] && awk '$4 != "" && $4 != "*" { print "N\t" tolower($2) "\t" $4 }' /tmp/dhcp.leases
 
 command -v uci >/dev/null 2>&1 && uci -q show dhcp 2>/dev/null | awk -F"[.=]" '
