@@ -1026,8 +1026,11 @@ function parse_pass(   line, r, h, proto, mark, pp, t, sp, b1, b2, p1, p2,
         # Line layout: "<fam> <n> <proto> <n> <timeout> [state] src= dst=
         # sport= dport= packets= bytes= [flags] src= dst= sport= dport=
         # packets= bytes= [flags] mark=N ..."
-        split(substr(line, 1, 48), h, " ")
-        proto = h[3]
+        # Do not depend on a fixed prefix width: nf_conntrack prefixes can
+        # gain fields on different kernel/userspace combinations.
+        proto = ""
+        if (match(line, /^[^ ]+ [0-9]+ ([^ ]+)/)) proto = substr(line, RSTART + 1 + index(substr(line, RSTART), " "))
+        if (proto == "") continue
         src = ""; dst = ""; pp = ""; mark = -1
         b1 = 0; b2 = 0; p1 = 0; p2 = 0
 
@@ -1835,6 +1838,7 @@ BEGIN {
     if (INTERVAL_MAX < INTERVAL) INTERVAL_MAX = INTERVAL
     if (ADAPT_BUDGET <= 0 || ADAPT_BUDGET >= 1) ADAPT_BUDGET = 0.30
     poll_interval = INTERVAL
+    last_tc_poll = -999
     last_hosts_refresh = -1e9; last_gua_refresh = -1e9; tooltip_last = 0
     BIRTH_MAX += 0; GONE_GRACE += 0
     RATE_WIN += 0; UN_WIN += 0
@@ -1908,7 +1912,13 @@ BEGIN {
         load_map()
         parse_pass()
         tn = (t0 + uptime()) / 2
-        tc_update()
+        # tc -s qdisc is comparatively expensive on low-end routers. Keep
+        # conntrack accounting at the configured cadence, but sample tc at
+        # most once every 5 seconds; rate/history code retains the last sample.
+        if (tn - last_tc_poll >= 5) {
+            tc_update()
+            last_tc_poll = tn
+        }
         rates_update(tn)
         un_update(tn)
         emit(tn)
