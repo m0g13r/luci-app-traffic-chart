@@ -64,46 +64,7 @@ tc_load_config() {
     [ -n "$TC_CFG_LOADED" ] && return 0
     TC_CFG_LOADED=1
     command -v uci >/dev/null 2>&1 || return 0
-    local opt val
-    # Avoid eval entirely: validate the option name, then assign only the
-    # explicitly supported configuration variables.
-    for opt in interval profile tc_stats adapt_interval interval_max persist_dir persist_mount persist_sec persist_timeout \
-        hist_sec hist_keep hist_hour_keep hist_day_keep bulk_bytes app_hold v6_reresolve unresolved_max backend \
-        attr_win attr_tol attr_topapps attr_totals attr_skip_ports attr_ports attr_min attr_share attr_max_apps \
-        attr_max_devices l2_overhead l2_init l2_candidates cal_tol cal_win cal_keep cal_min cal_pctl cal_max_pkt \
-        cal_min_pkts host_max un_win un_win_rx un_win_long app_max mx_max pair_max tbl_idle_long tbl_idle_short \
-        rate_win tooltips tooltip_every hosts_refresh_sec gua_refresh_sec gone_grace birth_max; do
-        val=$(uci -q get "trafficchart.global.$opt" 2>/dev/null) || continue
-        case "$opt" in
-            interval) INTERVAL="$val" ;; profile) PROFILE="$val" ;;
-            tc_stats) TC_STATS="$val" ;; adapt_interval) ADAPT_INTERVAL="$val" ;;
-            interval_max) INTERVAL_MAX="$val" ;; persist_dir) PERSIST_DIR="$val" ;;
-            persist_mount) PERSIST_MOUNT="$val" ;; persist_sec) PERSIST_SEC="$val" ;;
-            persist_timeout) PERSIST_TIMEOUT="$val" ;; hist_sec) HIST_SEC="$val" ;;
-            hist_keep) HIST_KEEP="$val" ;; hist_hour_keep) HIST_HOUR_KEEP="$val" ;;
-            hist_day_keep) HIST_DAY_KEEP="$val" ;; bulk_bytes) BULK_BYTES="$val" ;;
-            app_hold) APP_HOLD="$val" ;; v6_reresolve) V6_RERESOLVE="$val" ;;
-            unresolved_max) UNRESOLVED_MAX="$val" ;; backend) BACKEND="$val" ;;
-            attr_win) ATTR_WIN="$val" ;; attr_tol) ATTR_TOL="$val" ;;
-            attr_topapps) ATTR_TOPAPPS="$val" ;; attr_totals) ATTR_TOTALS="$val" ;;
-            attr_skip_ports) ATTR_SKIP_PORTS="$val" ;; attr_ports) ATTR_PORTS="$val" ;;
-            attr_min) ATTR_MIN="$val" ;; attr_share) ATTR_SHARE="$val" ;;
-            attr_max_apps) ATTR_MAX_APPS="$val" ;; attr_max_devices) ATTR_MAX_DEVICES="$val" ;;
-            l2_overhead) L2_OVERHEAD="$val" ;; l2_init) L2_INIT="$val" ;;
-            l2_candidates) L2_CANDIDATES="$val" ;; cal_tol) CAL_TOL="$val" ;;
-            cal_win) CAL_WIN="$val" ;; cal_keep) CAL_KEEP="$val" ;;
-            cal_min) CAL_MIN="$val" ;; cal_pctl) CAL_PCTL="$val" ;;
-            cal_max_pkt) CAL_MAX_PKT="$val" ;; cal_min_pkts) CAL_MIN_PKTS="$val" ;;
-            host_max) HOST_MAX="$val" ;; un_win) UN_WIN="$val" ;;
-            un_win_rx) UN_WIN_RX="$val" ;; un_win_long) UN_WIN_LONG="$val" ;;
-            app_max) APP_MAX="$val" ;; mx_max) MX_MAX="$val" ;;
-            pair_max) PAIR_MAX="$val" ;; tbl_idle_long) TBL_IDLE_LONG="$val" ;;
-            tbl_idle_short) TBL_IDLE_SHORT="$val" ;; rate_win) RATE_WIN="$val" ;;
-            tooltips) TOOLTIPS="$val" ;; tooltip_every) TOOLTIP_EVERY="$val" ;;
-            hosts_refresh_sec) HOSTS_REFRESH_SEC="$val" ;; gua_refresh_sec) GUA_REFRESH_SEC="$val" ;;
-            gone_grace) GONE_GRACE="$val" ;; birth_max) BIRTH_MAX="$val" ;;
-        esac
-    done
+    eval "$(uci -q show trafficchart.global 2>/dev/null | sed -n "/' '/d; s/^trafficchart\.global\.\([a-z0-9_]*\)='\(.*\)'\$/CFG_\1='\2'/p")"
 }
 
 tc_cfg_valid() {
@@ -118,90 +79,21 @@ tc_cfg_valid() {
 }
 
 tc_cfg() {
-    local var="$1" def="$2" type="$3" isset= val=
+    local var="$1" def="$2" type="$3" key isset val
+    eval "isset=\${$var+x}"
+    [ -n "$isset" ] && return 0
     tc_load_config
-    case "$var" in
-        INTERVAL) isset=${INTERVAL+x}; val="${INTERVAL-}" ;;
-        PROFILE) isset=${PROFILE+x}; val="${PROFILE-}" ;;
-        TC_STATS) isset=${TC_STATS+x}; val="${TC_STATS-}" ;;
-        ADAPT_INTERVAL) isset=${ADAPT_INTERVAL+x}; val="${ADAPT_INTERVAL-}" ;;
-        INTERVAL_MAX) isset=${INTERVAL_MAX+x}; val="${INTERVAL_MAX-}" ;;
-        PERSIST_DIR) isset=${PERSIST_DIR+x}; val="${PERSIST_DIR-}" ;;
-        PERSIST_MOUNT) isset=${PERSIST_MOUNT+x}; val="${PERSIST_MOUNT-}" ;;
-        PERSIST_SEC) isset=${PERSIST_SEC+x}; val="${PERSIST_SEC-}" ;;
-        PERSIST_TIMEOUT) isset=${PERSIST_TIMEOUT+x}; val="${PERSIST_TIMEOUT-}" ;;
-        HIST_SEC) isset=${HIST_SEC+x}; val="${HIST_SEC-}" ;;
-        HIST_KEEP) isset=${HIST_KEEP+x}; val="${HIST_KEEP-}" ;;
-        HIST_HOUR_KEEP) isset=${HIST_HOUR_KEEP+x}; val="${HIST_HOUR_KEEP-}" ;;
-        HIST_DAY_KEEP) isset=${HIST_DAY_KEEP+x}; val="${HIST_DAY_KEEP-}" ;;
-        BULK_BYTES) isset=${BULK_BYTES+x}; val="${BULK_BYTES-}" ;;
-        APP_HOLD) isset=${APP_HOLD+x}; val="${APP_HOLD-}" ;;
-        V6_RERESOLVE) isset=${V6_RERESOLVE+x}; val="${V6_RERESOLVE-}" ;;
-        UNRESOLVED_MAX) isset=${UNRESOLVED_MAX+x}; val="${UNRESOLVED_MAX-}" ;;
-        BACKEND) isset=${BACKEND+x}; val="${BACKEND-}" ;;
-        ATTR_WIN) isset=${ATTR_WIN+x}; val="${ATTR_WIN-}" ;;
-        ATTR_TOL) isset=${ATTR_TOL+x}; val="${ATTR_TOL-}" ;;
-        ATTR_TOPAPPS) isset=${ATTR_TOPAPPS+x}; val="${ATTR_TOPAPPS-}" ;;
-        ATTR_TOTALS) isset=${ATTR_TOTALS+x}; val="${ATTR_TOTALS-}" ;;
-        ATTR_SKIP_PORTS) isset=${ATTR_SKIP_PORTS+x}; val="${ATTR_SKIP_PORTS-}" ;;
-        ATTR_PORTS) isset=${ATTR_PORTS+x}; val="${ATTR_PORTS-}" ;;
-        ATTR_MIN) isset=${ATTR_MIN+x}; val="${ATTR_MIN-}" ;;
-        ATTR_SHARE) isset=${ATTR_SHARE+x}; val="${ATTR_SHARE-}" ;;
-        ATTR_MAX_APPS) isset=${ATTR_MAX_APPS+x}; val="${ATTR_MAX_APPS-}" ;;
-        ATTR_MAX_DEVICES) isset=${ATTR_MAX_DEVICES+x}; val="${ATTR_MAX_DEVICES-}" ;;
-        L2_OVERHEAD) isset=${L2_OVERHEAD+x}; val="${L2_OVERHEAD-}" ;;
-        L2_INIT) isset=${L2_INIT+x}; val="${L2_INIT-}" ;;
-        L2_CANDIDATES) isset=${L2_CANDIDATES+x}; val="${L2_CANDIDATES-}" ;;
-        CAL_TOL) isset=${CAL_TOL+x}; val="${CAL_TOL-}" ;;
-        CAL_WIN) isset=${CAL_WIN+x}; val="${CAL_WIN-}" ;;
-        CAL_KEEP) isset=${CAL_KEEP+x}; val="${CAL_KEEP-}" ;;
-        CAL_MIN) isset=${CAL_MIN+x}; val="${CAL_MIN-}" ;;
-        CAL_PCTL) isset=${CAL_PCTL+x}; val="${CAL_PCTL-}" ;;
-        CAL_MAX_PKT) isset=${CAL_MAX_PKT+x}; val="${CAL_MAX_PKT-}" ;;
-        CAL_MIN_PKTS) isset=${CAL_MIN_PKTS+x}; val="${CAL_MIN_PKTS-}" ;;
-        HOST_MAX) isset=${HOST_MAX+x}; val="${HOST_MAX-}" ;;
-        UN_WIN) isset=${UN_WIN+x}; val="${UN_WIN-}" ;;
-        UN_WIN_RX) isset=${UN_WIN_RX+x}; val="${UN_WIN_RX-}" ;;
-        UN_WIN_LONG) isset=${UN_WIN_LONG+x}; val="${UN_WIN_LONG-}" ;;
-        APP_MAX) isset=${APP_MAX+x}; val="${APP_MAX-}" ;;
-        MX_MAX) isset=${MX_MAX+x}; val="${MX_MAX-}" ;;
-        PAIR_MAX) isset=${PAIR_MAX+x}; val="${PAIR_MAX-}" ;;
-        TBL_IDLE_LONG) isset=${TBL_IDLE_LONG+x}; val="${TBL_IDLE_LONG-}" ;;
-        TBL_IDLE_SHORT) isset=${TBL_IDLE_SHORT+x}; val="${TBL_IDLE_SHORT-}" ;;
-        RATE_WIN) isset=${RATE_WIN+x}; val="${RATE_WIN-}" ;;
-        TOOLTIPS) isset=${TOOLTIPS+x}; val="${TOOLTIPS-}" ;;
-        TOOLTIP_EVERY) isset=${TOOLTIP_EVERY+x}; val="${TOOLTIP_EVERY-}" ;;
-        HOSTS_REFRESH_SEC) isset=${HOSTS_REFRESH_SEC+x}; val="${HOSTS_REFRESH_SEC-}" ;;
-        GUA_REFRESH_SEC) isset=${GUA_REFRESH_SEC+x}; val="${GUA_REFRESH_SEC-}" ;;
-        GONE_GRACE) isset=${GONE_GRACE+x}; val="${GONE_GRACE-}" ;;
-        BIRTH_MAX) isset=${BIRTH_MAX+x}; val="${BIRTH_MAX-}" ;;
-        *) return 0 ;;
-    esac
-    [ -n "$isset" ] || return 0
-    if tc_cfg_valid "$var" "$type" "$val"; then return 0; fi
-    logger -t trafficchart "config: invalid value '$val' - using default '$def'" 2>/dev/null
-    case "$var" in
-        INTERVAL) INTERVAL="$def" ;; PROFILE) PROFILE="$def" ;; TC_STATS) TC_STATS="$def" ;;
-        ADAPT_INTERVAL) ADAPT_INTERVAL="$def" ;; INTERVAL_MAX) INTERVAL_MAX="$def" ;;
-        PERSIST_DIR) PERSIST_DIR="$def" ;; PERSIST_MOUNT) PERSIST_MOUNT="$def" ;;
-        PERSIST_SEC) PERSIST_SEC="$def" ;; PERSIST_TIMEOUT) PERSIST_TIMEOUT="$def" ;;
-        HIST_SEC) HIST_SEC="$def" ;; HIST_KEEP) HIST_KEEP="$def" ;; HIST_HOUR_KEEP) HIST_HOUR_KEEP="$def" ;;
-        HIST_DAY_KEEP) HIST_DAY_KEEP="$def" ;; BULK_BYTES) BULK_BYTES="$def" ;; APP_HOLD) APP_HOLD="$def" ;;
-        V6_RERESOLVE) V6_RERESOLVE="$def" ;; UNRESOLVED_MAX) UNRESOLVED_MAX="$def" ;; BACKEND) BACKEND="$def" ;;
-        ATTR_WIN) ATTR_WIN="$def" ;; ATTR_TOL) ATTR_TOL="$def" ;; ATTR_TOPAPPS) ATTR_TOPAPPS="$def" ;;
-        ATTR_TOTALS) ATTR_TOTALS="$def" ;; ATTR_SKIP_PORTS) ATTR_SKIP_PORTS="$def" ;; ATTR_PORTS) ATTR_PORTS="$def" ;;
-        ATTR_MIN) ATTR_MIN="$def" ;; ATTR_SHARE) ATTR_SHARE="$def" ;; ATTR_MAX_APPS) ATTR_MAX_APPS="$def" ;;
-        ATTR_MAX_DEVICES) ATTR_MAX_DEVICES="$def" ;; L2_OVERHEAD) L2_OVERHEAD="$def" ;; L2_INIT) L2_INIT="$def" ;;
-        L2_CANDIDATES) L2_CANDIDATES="$def" ;; CAL_TOL) CAL_TOL="$def" ;; CAL_WIN) CAL_WIN="$def" ;;
-        CAL_KEEP) CAL_KEEP="$def" ;; CAL_MIN) CAL_MIN="$def" ;; CAL_PCTL) CAL_PCTL="$def" ;;
-        CAL_MAX_PKT) CAL_MAX_PKT="$def" ;; CAL_MIN_PKTS) CAL_MIN_PKTS="$def" ;; HOST_MAX) HOST_MAX="$def" ;;
-        UN_WIN) UN_WIN="$def" ;; UN_WIN_RX) UN_WIN_RX="$def" ;; UN_WIN_LONG) UN_WIN_LONG="$def" ;;
-        APP_MAX) APP_MAX="$def" ;; MX_MAX) MX_MAX="$def" ;; PAIR_MAX) PAIR_MAX="$def" ;;
-        TBL_IDLE_LONG) TBL_IDLE_LONG="$def" ;; TBL_IDLE_SHORT) TBL_IDLE_SHORT="$def" ;; RATE_WIN) RATE_WIN="$def" ;;
-        TOOLTIPS) TOOLTIPS="$def" ;; TOOLTIP_EVERY) TOOLTIP_EVERY="$def" ;;
-        HOSTS_REFRESH_SEC) HOSTS_REFRESH_SEC="$def" ;; GUA_REFRESH_SEC) GUA_REFRESH_SEC="$def" ;;
-        GONE_GRACE) GONE_GRACE="$def" ;; BIRTH_MAX) BIRTH_MAX="$def" ;;
-    esac
+    key=$(echo "$var" | tr 'A-Z' 'a-z')
+    eval "isset=\${CFG_$key+x}"
+    if [ -n "$isset" ]; then
+        eval "val=\$CFG_$key"
+        if tc_cfg_valid "$key" "$type" "$val"; then
+            eval "$var=\$val"
+            return 0
+        fi
+        logger -t trafficchart "config: invalid value '$val' for option $key - using default '$def'" 2>/dev/null
+    fi
+    eval "$var=\$def"
 }
 
 tc_detect_backend() {
@@ -299,21 +191,9 @@ tc_in_list() {
 tc_push() {
     local var="$1" item="$2" cur
     [ -n "$item" ] || return 0
-    case "$var" in
-        IFACE_LIST) cur="$IFACE_LIST" ;;
-        TX_DEVS) cur="$TX_DEVS" ;;
-        RX_DEVS) cur="$RX_DEVS" ;;
-        RX_RAW) cur="$RX_RAW" ;;
-        *) return 1 ;;
-    esac
+    eval "cur=\$$var"
     tc_in_list "$cur" "$item" && return 0
-    cur="${cur:+$cur }$item"
-    case "$var" in
-        IFACE_LIST) IFACE_LIST="$cur" ;;
-        TX_DEVS) TX_DEVS="$cur" ;;
-        RX_DEVS) RX_DEVS="$cur" ;;
-        RX_RAW) RX_RAW="$cur" ;;
-    esac
+    eval "$var=\"\${cur:+\$cur }\$item\""
 }
 
 tc_num() {

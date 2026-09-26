@@ -556,11 +556,7 @@ return view.extend({
             function(n) { return _('Other (%d applications)').format(n); },
             function(e) { return (e.top && e.top.length) ? e.top : null; }, _('Top destinations'));
         var devicesView = makeSlotView(MAX_ROWS - 1, _('Devices'),
-            function(key, e) {
-                var nm = e.name || key;
-                if (e.ip && e.ip !== nm) nm += ' (' + e.ip + ')';
-                return nm;
-            },
+            function(key, e) { var nm = e.name || key; return (e.ip && e.ip !== nm) ? nm + ' (' + e.ip + ')' : nm; },
             function(n) { return _('Other (%d devices)').format(n); },
             function(e) {
                 var t = (e.top || []).slice();

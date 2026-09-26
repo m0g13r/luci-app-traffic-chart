@@ -381,35 +381,18 @@ STOPFILE="$OUT_DIR/stop.req"
 # see the "History reset" header comment above).
 RESETFILE="$OUT_DIR/reset.req"
 PIDFILE="$OUT_DIR/agg.pid"
-LOCKDIR="$OUT_DIR/agg.lock"
-if ! mkdir "$LOCKDIR" 2>/dev/null; then
-    _old=$(cat "$LOCKDIR/pid" 2>/dev/null)
-    _child=$(cat "$LOCKDIR/child" 2>/dev/null)
+if [ -r "$PIDFILE" ]; then
+    _old=$(cat "$PIDFILE" 2>/dev/null)
     case "$_old" in ''|*[!0-9]*) _old="" ;; esac
-    case "$_child" in ''|*[!0-9]*) _child="" ;; esac
-    _i=0
-    while [ "$_i" -lt 20 ]; do
-        _live=0
-        [ -n "$_old" ] && kill -0 "$_old" 2>/dev/null && _live=1
-        [ -n "$_child" ] && kill -0 "$_child" 2>/dev/null && _live=1
-        [ "$_live" = 0 ] && break
-        sleep 1
-        _i=$((_i + 1))
-    done
-    _live=0
-    [ -n "$_old" ] && kill -0 "$_old" 2>/dev/null && _live=1
-    [ -n "$_child" ] && kill -0 "$_child" 2>/dev/null && _live=1
-    if [ "$_live" = 1 ]; then
-        logger -t trafficchart "aggregator already running; refusing a second instance" 2>/dev/null
-        exit 1
+    if [ -n "$_old" ] && [ "$_old" != "$$" ]; then
+        _i=0
+        while [ "$_i" -lt 20 ] && grep -q trafficchart-agg "/proc/$_old/cmdline" 2>/dev/null; do
+            sleep 1; _i=$((_i + 1))
+        done
     fi
-    rm -rf "$LOCKDIR"
-    mkdir "$LOCKDIR" 2>/dev/null || exit 1
 fi
-echo "$" > "$LOCKDIR/pid"
-# Never remove reset.req here: a reset issued during a restart belongs to the
-# next daemon instance and must not be lost.
-echo "$" > "$PIDFILE"
+rm -f "$STOPFILE" "$RESETFILE"
+echo $$ > "$PIDFILE"
 
 # The byte/packet counters in /proc/net/nf_conntrack only exist with conntrack
 # accounting. It is usually already on (NSS builds), but not on every stock
@@ -479,61 +462,16 @@ function write_unresolved(   k, tmp, wrote) {
 }
 
 # ip -> mac, mac -> name (refreshed every few polls, see BEGIN)
-function refresh_hosts(   l, f, nm, k, mac) {
-    split("", hmac); split("", hname); split("", rtr); split("", hport); split("", hbridge); split("", hvlan)
+function refresh_hosts(   l, f, nm) {
+    split("", hmac); split("", hname); split("", rtr)
     nm = 0
     while ((HOSTS_HELPER | getline l) > 0) {
         split(l, f, "\t")
-        if (f[1] == "I") { hmac[f[2]] = tolower(f[3]); nm++ }
-        else if (f[1] == "N") hname[tolower(f[2])] = f[3]
+        if (f[1] == "I") { hmac[f[2]] = f[3]; nm++ }
+        else if (f[1] == "N") hname[f[2]] = f[3]
         else if (f[1] == "R") rtr[f[2]] = 1
-        else if (f[1] == "P") {
-            hport[tolower(f[2])] = f[3]
-            hbridge[tolower(f[2])] = f[4]
-            hvlan[tolower(f[2])] = f[5]
-        }
     }
     close(HOSTS_HELPER)
-    for (k in dseen) if (index(k, ":") > 0 && (k in hmac)) {
-        mac = hmac[k]
-        if (mac != "" && mac != k) merge_device(k, mac)
-    }
-}
-
-function merge_device(old, new,   i, T) {
-    if (old == new || !(old in dseen)) return
-    if (!(new in dseen)) { dseen[new] = 1; ndev++ }
-    dib[new] += dib[old]; dob[new] += dob[old]
-    dipk[new] += dipk[old]; dopk[new] += dopk[old]
-    dib_rt[new] += dib_rt[old]; dob_rt[new] += dob_rt[old]
-    dvi[new] += dvi[old]; dvo[new] += dvo[old]
-    if (!(new in dname) && (old in dname)) dname[new] = dname[old]
-    if (!(new in dvip) && (old in dvip)) dvip[new] = dvip[old]
-    rt_in["d" SUBSEP new] += rt_in["d" SUBSEP old]
-    rt_out["d" SUBSEP new] += rt_out["d" SUBSEP old]
-    for (T = 1; T <= 3; T++) {
-        sd_in[T, new] += sd_in[T, old]
-        sd_out[T, new] += sd_out[T, old]
-    }
-    delete rt_in["d" SUBSEP old]; delete rt_out["d" SUBSEP old]
-    for (i = 1; i <= npair; i++) if ((i in pdv) && pdv[i] == old) {
-        pair_add(new, pap[i], 0, pin[i], pout[i])
-        delete pidx[old SUBSEP pap[i]]
-        delete pdv[i]; delete pap[i]; delete pin[i]; delete pout[i]; delete plast[i]
-        pfree[++npfree] = i; npair_live--
-    }
-    for (i = 1; i <= mxcnt; i++) if ((i in mxt) && mxt[i] == "h" && mxb[i] == old) {
-        mx_add("h", mxa[i], new, 0, mxin[i], mxout[i])
-        delete mxidx["h" SUBSEP mxa[i] SUBSEP old]
-        delete mxt[i]; delete mxa[i]; delete mxb[i]; delete mxin[i]; delete mxout[i]; delete mxlast[i]
-        mxfree[++nmxfree] = i; mxtn["h"]--
-    }
-    delete dseen[old]; delete dname[old]; delete dvip[old]
-    delete dib[old]; delete dob[old]; delete dipk[old]; delete dopk[old]
-    delete dib_rt[old]; delete dob_rt[old]; delete dvi[old]; delete dvo[old]
-    delete rt_in["d" SUBSEP old]; delete rt_out["d" SUBSEP old]
-    if (ndev > 0) ndev--
-    delete v6seen[old]
 }
 
 function dev_key(lan, src, rsrc,   addr, mac, key, nm) {
@@ -565,17 +503,8 @@ function dev_add(key, lan, d1, d2, q1, q2) {
     else     { dib[key] += d1; dipk[key] += q1; dob[key] += d2; dopk[key] += q2; dib_rt[key] += d1; dob_rt[key] += d2 }
 }
 
-# display name of a device key; DSA metadata is appended when known.
-function dev_label(k,   s, p) {
-    s = (k in dname) ? dname[k] : ((k in dvip) ? dvip[k] : k)
-    if (k in hport) {
-        p = hport[k]
-        if (k in hvlan && hvlan[k] != "") p = p " [vlan " hvlan[k] "]"
-        if (k in hbridge && hbridge[k] != "") p = p " @ " hbridge[k]
-        s = s " (" p ")"
-    }
-    return s
-}
+# display name of a device key
+function dev_label(k) { return (k in dname) ? dname[k] : ((k in dvip) ? dvip[k] : k) }
 
 # registrable domain guess: a.b.googlevideo.com -> googlevideo.com,
 # x.example.co.uk -> example.co.uk; IP literals unchanged
@@ -758,7 +687,7 @@ function top_json(t, name, lab,   key, j, r) {
     key = t SUBSEP name
     r = ""
     for (j = 1; j <= xn[key] + 0; j++)
-        r = r sprintf("%s[%s,%.0f,%.0f]", (j > 1 ? "," : ""), jstr(lab ? dev_label(xa[key, j]) : xa[key, j]), xi[key, j], xo[key, j])
+        r = r sprintf("%s[\"%s\",%.0f,%.0f]", (j > 1 ? "," : ""), (lab ? dev_label(xa[key, j]) : xa[key, j]), xi[key, j], xo[key, j])
     return ",\"top\":[" r "]"
 }
 
@@ -1026,15 +955,8 @@ function parse_pass(   line, r, h, proto, mark, pp, t, sp, b1, b2, p1, p2,
         # Line layout: "<fam> <n> <proto> <n> <timeout> [state] src= dst=
         # sport= dport= packets= bytes= [flags] src= dst= sport= dport=
         # packets= bytes= [flags] mark=N ..."
-        # Do not depend on a fixed prefix width: nf_conntrack prefixes can
-        # gain fields on different kernel/userspace combinations.
-        proto = ""
-        r = line
-        if (match(r, /^[^ ]+ [0-9]+ /)) {
-            r = substr(r, RSTART + RLENGTH)
-            if (match(r, /^[^ ]+/)) proto = substr(r, RSTART, RLENGTH)
-        }
-        if (proto == "") continue
+        split(substr(line, 1, 48), h, " ")
+        proto = h[3]
         src = ""; dst = ""; pp = ""; mark = -1
         b1 = 0; b2 = 0; p1 = 0; p2 = 0
 
@@ -1447,7 +1369,7 @@ function hist_topk(K, withname, nc,   i, u, best, bi, s, oi, oo, picked, tot) {
         for (i = 1; i <= nc; i++) if (!(i in cused) && cn[i] != "(other)" && ci[i] + co[i] > best) { best = ci[i] + co[i]; bi = i }
         if (!bi) break
         cused[bi] = 1
-        s = s sprintf("%s%s:[%.0f,%.0f%s]", (s == "" ? "" : ","), jstr(cn[bi]), ci[bi], co[bi], (withname ? "," jstr(cx[bi]) : ""))
+        s = s sprintf("%s\"%s\":[%.0f,%.0f%s]", (s == "" ? "" : ","), cn[bi], ci[bi], co[bi], (withname ? ",\"" cx[bi] "\"" : ""))
     }
     for (i = 1; i <= nc; i++) if (!(i in cused)) { oi += ci[i]; oo += co[i] }
     if (oi + oo > 0) s = s sprintf("%s\"(other)\":[%.0f,%.0f%s]", (s == "" ? "" : ","), oi, oo, (withname ? ",\"(other)\"" : ""))
@@ -1708,10 +1630,10 @@ function persist_json(   i, nok, nerr, s, ov) {
     for (i = 1; i <= NP; i++) {
         if (p_att[i]) nok++
         else if (p_st[i] == "err") nerr++
-        s = s sprintf("%s{\"dir\":%s,\"state\":%s,\"saved\":%.0f,\"pending\":%d}", (i > 1 ? "," : ""), jstr(ptd[i]), jstr(p_st[i]), p_saved[i] + 0, ppend[i] + 0)
+        s = s sprintf("%s{\"dir\":\"%s\",\"state\":\"%s\",\"saved\":%.0f,\"pending\":%d}", (i > 1 ? "," : ""), ptd[i], p_st[i], p_saved[i] + 0, ppend[i] + 0)
     }
     ov = (NP == 0) ? "off" : (nok == NP ? "ok" : (nok > 0 ? "partial" : (nerr > 0 ? "err" : "wait")))
-    return sprintf("\"persist\":{\"state\":%s,\"sec\":%d,\"targets\":[%s]}", jstr(ov), PERSIST_SEC, s)
+    return sprintf("\"persist\":{\"state\":\"%s\",\"sec\":%d,\"targets\":[%s]}", ov, PERSIST_SEC, s)
 }
 
 # stop request (init script stopped the service): close the open buckets as partial
@@ -1723,17 +1645,6 @@ function hist_final(t,   T, i) {
     tout_cur = TOUT4
     for (i = 1; i <= NP; i++) if (!p_att[i] && p_why[i] != "fs") persist_attach1(i, t)
     persist_flush(t)
-}
-
-# Quote arbitrary text for JSON.
-function jstr(s,   q) {
-    q = s ""
-    gsub(/\\/, "\\\\", q)
-    gsub(/"/, "\\\"", q)
-    gsub(/\t/, "\\t", q)
-    gsub(/\r/, "\\r", q)
-    gsub(/\n/, "\\n", q)
-    return "\"" q "\""
 }
 
 # JSON object body {"in_bytes":..,"in_packets":..,"out_bytes":..,"out_packets":..}
@@ -1776,17 +1687,17 @@ function emit(t,   s, tmp, a, first, k, nm, i, j, sc, nt, tsc, tky, pd, tot, n2,
 
     first = 1
     for (a in aseen) {
-        s = s sprintf("%s%s:{%s%s%s}", (first ? "" : ","), jstr(a), jcnt(aib[a], aip[a], aob[a], aop[a]), jrate("a", a), ((a in keepa) ? top_json("a", a, 0) : ""))
+        s = s sprintf("%s\"%s\":{%s%s%s}", (first ? "" : ","), a, jcnt(aib[a], aip[a], aob[a], aop[a]), jrate("a", a), ((a in keepa) ? top_json("a", a, 0) : ""))
         first = 0
     }
 
     s = s "},\"devices\":{"
     first = 1
     for (k in dseen) {
-        s = s sprintf("%s%s:{\"name\":%s,\"ip\":%s,%s%s,\"via_in\":%.0f,\"via_out\":%.0f,\"top\":[", (first ? "" : ","), jstr(k), jstr(dev_label(k)), jstr((k in dvip) ? dvip[k] : ""), \
+        s = s sprintf("%s\"%s\":{\"name\":\"%s\",\"ip\":\"%s\",%s%s,\"via_in\":%.0f,\"via_out\":%.0f,\"top\":[", (first ? "" : ","), k, dev_label(k), ((k in dvip) ? dvip[k] : ""), \
                       jcnt(dib[k], dipk[k], dob[k], dopk[k]), jrate("d", k), dvi[k] + 0, dvo[k] + 0)
         for (j = 1; j <= tdn[k]; j++)
-            s = s sprintf("%s[%s,%.0f,%.0f]", (j > 1 ? "," : ""), jstr(tda[k, j]), tdi[k, j], tdo[k, j])
+            s = s sprintf("%s[\"%s\",%.0f,%.0f]", (j > 1 ? "," : ""), tda[k, j], tdi[k, j], tdo[k, j])
         s = s "]}"
         first = 0
     }
@@ -1794,7 +1705,7 @@ function emit(t,   s, tmp, a, first, k, nm, i, j, sc, nt, tsc, tky, pd, tot, n2,
     s = s "},\"hosts\":{"
     first = 1
     for (k in hseen) {
-        s = s sprintf("%s%s:{%s%s%s}", (first ? "" : ","), jstr(k), jcnt(hib[k], hip[k], hob[k], hop[k]), jrate("h", k), ((k in keeph) ? top_json("h", k, 1) : ""))
+        s = s sprintf("%s\"%s\":{%s%s%s}", (first ? "" : ","), k, jcnt(hib[k], hip[k], hob[k], hop[k]), jrate("h", k), ((k in keeph) ? top_json("h", k, 1) : ""))
         first = 0
     }
 
@@ -1817,11 +1728,11 @@ function emit(t,   s, tmp, a, first, k, nm, i, j, sc, nt, tsc, tky, pd, tot, n2,
         if (match(kp[4], /dport=[0-9]+/)) dp = substr(kp[4], RSTART + 6, RLENGTH - 6)
         rem = v6short(islocal(kp[2]) ? kp[3] : kp[2])
         ap = (k in lab) ? lab[k] : fbname(kp[1] "|" dp, fcls[k])
-        # Preserve application text; jstr() performs JSON escaping.
+        gsub(/["\\]/, "_", ap)
         hh = ((k in lhost) && lhost[k] != "") ? lhost[k] : ""
-        # Preserve host text; jstr() performs JSON escaping.
-        s = s sprintf("%s{\"dev\":%s,\"ip\":%s,\"app\":%s,\"host\":%s,\"dst\":%s,\"port\":%s,\"proto\":%s,\"class\":%s,\"in_bps\":%.0f,\"out_bps\":%.0f,\"bytes\":%.0f}", \
-                      (i > 1 ? "," : ""), jstr(dev_label(fdev[k])), jstr((fdev[k] in dvip) ? dvip[fdev[k]] : ""), jstr(ap), jstr(hh), jstr(rem), jstr(dp), jstr(kp[1]), jstr(cname[fcls[k]]), fei[k], feo[k], ftot[k])
+        gsub(/[^A-Za-z0-9._:-]/, "_", hh)
+        s = s sprintf("%s{\"dev\":\"%s\",\"ip\":\"%s\",\"app\":\"%s\",\"host\":\"%s\",\"dst\":\"%s\",\"port\":\"%s\",\"proto\":\"%s\",\"class\":\"%s\",\"in_bps\":%.0f,\"out_bps\":%.0f,\"bytes\":%.0f}", \
+                      (i > 1 ? "," : ""), dev_label(fdev[k]), ((fdev[k] in dvip) ? dvip[fdev[k]] : ""), ap, hh, rem, dp, kp[1], cname[fcls[k]], fei[k], feo[k], ftot[k])
     }
     s = s "]}"
     tmp = OUT "/classes.json.tmp"
@@ -1842,7 +1753,6 @@ BEGIN {
     if (INTERVAL_MAX < INTERVAL) INTERVAL_MAX = INTERVAL
     if (ADAPT_BUDGET <= 0 || ADAPT_BUDGET >= 1) ADAPT_BUDGET = 0.30
     poll_interval = INTERVAL
-    last_tc_poll = -999
     last_hosts_refresh = -1e9; last_gua_refresh = -1e9; tooltip_last = 0
     BIRTH_MAX += 0; GONE_GRACE += 0
     RATE_WIN += 0; UN_WIN += 0
@@ -1916,13 +1826,7 @@ BEGIN {
         load_map()
         parse_pass()
         tn = (t0 + uptime()) / 2
-        # tc -s qdisc is comparatively expensive on low-end routers. Keep
-        # conntrack accounting at the configured cadence, but sample tc at
-        # most once every 5 seconds; rate/history code retains the last sample.
-        if (tn - last_tc_poll >= 5) {
-            tc_update()
-            last_tc_poll = tn
-        }
+        tc_update()
         rates_update(tn)
         un_update(tn)
         emit(tn)
@@ -1956,7 +1860,6 @@ BEGIN {
 }
 ' &
 APID=$!
-echo "$APID" > "$LOCKDIR/child"
 
 # SIGTERM/INT/HUP from procd: ask the daemon to flush (stop.req), give it up to 14 s
 # (the init script sets term_timeout 20), then make sure it is gone
@@ -1965,19 +1868,12 @@ stop_agg() {
     : > "$STOPFILE"
     _i=0
     while [ "$_i" -lt 14 ] && kill -0 "$APID" 2>/dev/null; do sleep 1; _i=$((_i + 1)); done
-    if kill -0 "$APID" 2>/dev/null; then
-        kill "$APID" 2>/dev/null
-        _i=0
-        while [ "$_i" -lt 3 ] && kill -0 "$APID" 2>/dev/null; do sleep 1; _i=$((_i + 1)); done
-    fi
-    if kill -0 "$APID" 2>/dev/null; then kill -9 "$APID" 2>/dev/null; fi
-    rm -f "$PIDFILE" "$STOPFILE"
-    rm -rf "$LOCKDIR"
+    kill "$APID" 2>/dev/null
+    rm -f "$PIDFILE" "$STOPFILE" "$RESETFILE"
     exit 0
 }
 trap stop_agg TERM INT HUP
 wait "$APID"
 _rc=$?
 rm -f "$PIDFILE"
-rm -rf "$LOCKDIR"
 exit $_rc
