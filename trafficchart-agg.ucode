@@ -122,7 +122,13 @@ function uring_rate(r, k, now, cur) {
  * HOSTS_REFRESH_SEC / GUA_REFRESH_SEC - not just loaded once at start).
  * ------------------------------------------------------------------ */
 
-let hosts_file = getenv('HOSTS_FILE') || `${out_dir}/hosts.fixture`;
+// HOSTS_HELPER is a PROGRAM (neighbour table + DHCP names, one "I"/"N"/"R"
+// tagged line per entry - see trafficchart-hosts), piped every refresh
+// cycle in awk (`HOSTS_HELPER | getline`), exactly like V6HELPER/TC_HELPER.
+// HOSTS_FILE is an explicit override for deterministic fixture-mode testing
+// (see this file's header comment) - when unset, the real helper runs.
+let hosts_helper = getenv('HOSTS_HELPER') || '/usr/libexec/trafficchart-hosts';
+let hosts_file = getenv('HOSTS_FILE') || '';
 let hosts_refresh_sec = +(getenv('HOSTS_REFRESH_SEC') || '60');
 let last_hosts_refresh = -1e9;
 
@@ -171,7 +177,16 @@ function load_hosts() {
     // hmac/hname/rtr before reloading, so a device that dropped off the
     // neighbour table stops being resolved instead of sticking forever.
     host_mac = {}; host_names = {}; router_ips = {};
-    let text = fs.readfile(hosts_file) || '', lines = split(text, '\n');
+    let text = null;
+    if (hosts_file) {
+        text = fs.readfile(hosts_file);
+    } else if (hosts_helper) {
+        try {
+            let fh = fs.popen(hosts_helper, 'r');
+            if (fh) { text = fh.read('all'); fh.close(); }
+        } catch (e) { text = null; }
+    }
+    let lines = split(text || '', '\n');
     for (let i = 0; i < length(lines); i++) {
         let f = split(lines[i], '\t');
         if (f[0] == 'I' && f[1] && f[2]) host_mac[f[1]] = f[2];
@@ -251,6 +266,31 @@ function add(table, key, ib, ip, ob, op) {
     table[key].out_bytes += ob;
     table[key].out_packets += op;
     table[key].last = time();
+}
+
+// Register a device (awk's dev_key() side effect: dseen[key]=1, ndev++) even
+// with zero bytes so far - a device seen only via vflow traffic (LAN->router
+// service) must still appear in the emitted devices{} object.
+function ensure_device(key) {
+    if (!devices[key]) devices[key] = { in_bytes: 0, in_packets: 0, out_bytes: 0, out_packets: 0, in_bps: 0, out_bps: 0, last: time() };
+    return devices[key];
+}
+
+// Learned service names (awk's plab[]/pamb[]/learn()/fbname()): a flow
+// netifyd never labels lands in "[<class>]" by default, but if the SAME
+// proto|port was seen labelled UNAMBIGUOUSLY by netifyd elsewhere (e.g.
+// udp|123 -> "ntp"), unlabelled flows on that port get that name instead -
+// unless the port has been seen with two different (case-insensitive) names,
+// in which case it is permanently ambiguous and falls back to "[<class>]".
+let plab = {}, pamb = {};
+function learn(sv, a) {
+    if (!sv || a == 'Unknown' || pamb[sv]) return;
+    if (!plab[sv]) plab[sv] = a;
+    else if (lc(plab[sv]) != lc(a)) { pamb[sv] = 1; delete plab[sv]; }
+}
+function fbname(sv, class_id) {
+    if (sv && plab[sv]) return plab[sv];
+    return `[${class_names[class_id] || 'UNMARKED'}]`;
 }
 
 function host_fold(k) {
@@ -525,7 +565,20 @@ function router_attribute(router_raw, device_raw) {
  * Link (tc) counters, L2-overhead calibration, "not attributed" rate.
  * ------------------------------------------------------------------ */
 
-let tc_file = getenv('TC_FILE') || '';
+// TC_STATS (default 1, matches awk): 0 disables the helper entirely, same
+// effect as a missing binary - no link rate, no "not attributed" ring, no
+// shaper drop/ECN/backlog row in history. The live drops/ECN sparkline at
+// the top of the page is unaffected either way (that one comes from
+// luci.trafficchart's own per-request tc call, not from this daemon).
+let tc_stats = +(getenv('TC_STATS') || '1') != 0;
+// TC_HELPER is a PROGRAM (prints "<rx> <tx> <rx_drop> <rx_ecn> <tx_drop>
+// <tx_ecn> [rx_backlog] [tx_backlog]" on stdout, once per invocation - see
+// trafficchart-tc), not a file to read. awk pipes it every poll
+// (`TC_HELPER | getline`); mirror that here with fs.popen(), the same
+// pattern already used for v6helper below. A missing/non-executable helper
+// is checked once at start-up, exactly like awk's `[ -x "$TC_HELPER" ] ||
+// TC_HELPER=""`, so a bad path does not retry a failing exec every poll.
+let tc_helper = tc_stats ? (getenv('TC_HELPER') || '/usr/libexec/trafficchart-tc') : '';
 let tc_have_prev = false;
 let tc_prev_raw = { rx: 0, tx: 0, drx: -1, dre: -1, dtx: -1, dte: -1 };
 let tc_ring = ring_new(rate_k);
@@ -577,8 +630,12 @@ let uring_rx_long = uring_new(un_k_long), uring_tx_long = uring_new(un_k_long);
 let un_cum_rx = 0, un_cum_tx = 0, un_init = false, un_prev = null;
 
 function load_tc(now) {
-    if (!tc_file) { tc_state.have = false; return; }
-    let raw = trim(fs.readfile(tc_file) || '');
+    if (!tc_helper) { tc_state.have = false; return; }
+    let raw = '';
+    try {
+        let fh = fs.popen(tc_helper, 'r');
+        if (fh) { raw = trim(fh.read('all') || ''); fh.close(); }
+    } catch (e) { raw = ''; }
     if (!length(raw)) { tc_state.have = false; return; }
     let fields = split(raw, ' ');
     if (length(fields) < 2 || match(fields[0], /^[0-9]+$/) == null || match(fields[1], /^[0-9]+$/) == null) { tc_state.have = false; return; }
@@ -658,8 +715,8 @@ function cal_update(ct_in, ct_out, pk_in, pk_out) {
 }
 
 function un_update(now, ct_in, ct_out, pk_in, pk_out) {
-    cal_update(ct_in, ct_out, pk_in, pk_out);
     if (!tc_state.have) { tc_state.un_rx_bps = 0; tc_state.un_tx_bps = 0; return; }
+    cal_update(ct_in, ct_out, pk_in, pk_out);
     let oh = l2_now();
     if (!un_init) {
         un_init = true;
@@ -984,9 +1041,21 @@ function persist_status() {
  * Conntrack field extraction.
  * ------------------------------------------------------------------ */
 
+// awk's split(str, arr, " ") treats a literal single space as "split on
+// runs of whitespace" (POSIX special case), collapsing repeated spaces and
+// dropping empty fields - ucode's split() does a literal character split
+// instead. This normalises a line the same way before splitting, so an
+// unexpected run of whitespace in the input can never shift field positions.
+function wsplit(line) {
+    let parts = split(line, ' ');
+    let out = [];
+    for (let i = 0; i < length(parts); i++) if (length(parts[i])) push(out, parts[i]);
+    return out;
+}
+
 function field(line, name, occurrence) {
     let found = 0;
-    let parts = split(line, ' ');
+    let parts = wsplit(line);
     for (let i = 0; i < length(parts); i++) {
         if (substr(parts[i], 0, length(name) + 1) == `${name}=`) {
             found++;
@@ -1022,7 +1091,7 @@ function mapped_app(flow) {
 }
 
 function parse(line) {
-    let head = split(line, ' ');
+    let head = wsplit(line);
     if (length(head) < 3) return null;
     let proto = head[2], src = field(line, 'src', 1), dst = field(line, 'dst', 1);
     if (!src || !dst) return null;
@@ -1075,10 +1144,11 @@ function poll(now) {
             d1 = 0; d2 = 0; q1 = 0; q2 = 0;
         }
         if (vflow) {
+            let device = device_name(flow.src);
+            if (device != 'router' && !devices[device] && length(devices) >= dev_max) device = '(other)';
+            ensure_device(device);   // dseen[]-equivalent: register even with 0 bytes
+            if (flow.src && index(flow.src, ':') < 0) device_ip[device] = flow.src;
             if (d1 > 0 || d2 > 0) {
-                let device = device_name(flow.src);
-                if (device != 'router' && !devices[device] && length(devices) >= dev_max) device = '(other)';
-                if (flow.src && index(flow.src, ':') < 0) device_ip[device] = flow.src;
                 via_in[device] = (via_in[device] || 0) + d2;
                 via_out[device] = (via_out[device] || 0) + d1;
                 let dport_num = +flow.dport;
@@ -1091,7 +1161,7 @@ function poll(now) {
                 }
             }
             flows[key] = { b1: flow.b1, b2: flow.b2, p1: flow.p1, p2: flow.p2, bulk: false,
-                           last: poll_no, device: device_name(flow.src), class_id: flow.mark,
+                           last: poll_no, device: device, class_id: flow.mark,
                            bytes: flow.b1 + flow.b2, dst: flow.dst, proto: flow.proto, dport: flow.dport,
                            in_bps: 0, out_bps: 0, vflow: true };
             continue;
@@ -1102,65 +1172,100 @@ function poll(now) {
         let device_address = lan ? flow.src : flow.reply_src;
         let device = device_name(device_address);
         if (device != 'router' && !devices[device] && length(devices) >= dev_max) device = '(other)';
+        ensure_device(device);   // dseen[]-equivalent: register even with 0 bytes this poll
         if (device_address && index(device_address, ':') < 0) device_ip[device] = device_address;
+
         let incoming = lan ? d2 : d1, outgoing = lan ? d1 : d2;
         let in_packets = lan ? q2 : q1, out_packets = lan ? q1 : q2;
-        let state = old || {}, mapped = mapped_app(flow);
-        if (incoming || outgoing || in_packets || out_packets) {
-            let fallback = `[${class_names[class_id] || 'UNMARKED'}]`;
-            let app = mapped ? mapped.name : state.app;
+        let act = (d1 > 0 || d2 > 0 || q1 > 0 || q2 > 0);
+        let state = old || {};
+        let sv = (flow.proto == 'tcp' || flow.proto == 'udp') && flow.dport ? `${flow.proto}|${flow.dport}` : '';
+
+        // Device totals: booked unconditionally on real traffic this poll,
+        // independent of whether the application is identified yet (awk's
+        // dev_add(), called unconditionally on `act`, separate from and NOT
+        // gated by the held-back app_account()/acct() below).
+        if (act) add(devices, device, incoming, in_packets, outgoing, out_packets);
+
+        // Application / host / tooltip accounting: held for up to APP_HOLD polls
+        // while waiting for a netifyd label (awk's app_account()/acct()). Ticks
+        // forward even on a poll with no new bytes as long as the flow already
+        // has a pending hold (awk: `if (act || (key in pdage)) app_account(...)`),
+        // so a flow that goes idle before being identified still eventually
+        // gives up instead of holding its slot forever.
+        if (act || state.pending_polls) {
+            // Only a literal tcp/udp flow with both ports extracted can ever
+            // appear in apps.map (netifyd/trafficchart-apps only name
+            // tcp/udp 5-tuples) - only those are worth holding for. Anything
+            // else (icmp, icmpv6, udplite, sctp, dccp, or a malformed
+            // tcp/udp line) gives up immediately, same poll, no map lookup.
+            let holdable = (flow.proto == 'tcp' || flow.proto == 'udp') && flow.sport && flow.dport;
+            let mapped = holdable ? mapped_app(flow) : null;
+            let fallback = fbname(sv, class_id);
+            let app = !holdable ? fallback : (mapped ? mapped.name : (state.giveup ? fallback : state.app));
             let host = mapped && mapped.host ? mapped.host : (state.host || (local(flow.src) ? flow.dst : flow.src));
-            if (!app && !state.giveup) {
-                state.pending_in = (state.pending_in || 0) + incoming;
-                state.pending_out = (state.pending_out || 0) + outgoing;
-                state.pending_in_packets = (state.pending_in_packets || 0) + in_packets;
-                state.pending_out_packets = (state.pending_out_packets || 0) + out_packets;
+            let acc_in = incoming, acc_out = outgoing, acc_inp = in_packets, acc_outp = out_packets;
+
+            if (mapped && sv) learn(sv, mapped.name);
+
+            if (holdable && !app && !state.giveup) {
+                state.pending_in = (state.pending_in || 0) + acc_in;
+                state.pending_out = (state.pending_out || 0) + acc_out;
+                state.pending_in_packets = (state.pending_in_packets || 0) + acc_inp;
+                state.pending_out_packets = (state.pending_out_packets || 0) + acc_outp;
                 state.pending_polls = (state.pending_polls || 0) + 1;
-                if (state.pending_polls < app_hold) {
-                    incoming = 0; outgoing = 0; in_packets = 0; out_packets = 0;
-                } else {
+                if (state.pending_polls >= app_hold) {
                     app = fallback;
                     state.giveup = true;
                 }
             }
-            if (app && state.pending_polls) {
-                incoming += state.pending_in || 0;
-                outgoing += state.pending_out || 0;
-                in_packets += state.pending_in_packets || 0;
-                out_packets += state.pending_out_packets || 0;
-                state.pending_in = state.pending_out = 0;
-                state.pending_in_packets = state.pending_out_packets = 0;
-                state.pending_polls = 0;
-            }
-            if (!app) app = fallback;
-            if (mapped) { state.app = app; state.host = host; state.giveup = false; }
-            let agg_app = app;
-            if (!apps[agg_app] && length(apps) >= app_max) agg_app = '(other)';
-            let host_norm = host_key(regdom(host));
-            add(apps, agg_app, incoming, in_packets, outgoing, out_packets);
-            add(devices, device, incoming, in_packets, outgoing, out_packets);
-            add(hosts, host_norm, incoming, in_packets, outgoing, out_packets);
-            if (tooltips_enabled) {
-                mx_a_count = mx_insert(app_hosts_mx, mx_a_count, mx_max, 'mxfull_a', agg_app, host_norm, incoming, in_packets, outgoing, out_packets);
-                mx_d_count = mx_insert(device_apps_mx, mx_d_count, pair_max, 'mxfull_d', device, agg_app, incoming, in_packets, outgoing, out_packets);
-                mx_h_count = mx_insert(host_devices_mx, mx_h_count, mx_max, 'mxfull_h', host_norm, device, incoming, in_packets, outgoing, out_packets);
-            }
-            if (device == 'router') {
-                if (!router_raw[agg_app]) router_raw[agg_app] = { in_: 0, out_: 0, pin: 0, pout: 0 };
-                router_raw[agg_app].in_ += incoming;
-                router_raw[agg_app].out_ += outgoing;
-                router_raw[agg_app].pin += in_packets;
-                router_raw[agg_app].pout += out_packets;
+
+            if (app) {
+                if (state.pending_polls) {
+                    acc_in = state.pending_in || 0; acc_out = state.pending_out || 0;
+                    acc_inp = state.pending_in_packets || 0; acc_outp = state.pending_out_packets || 0;
+                    state.pending_in = 0; state.pending_out = 0;
+                    state.pending_in_packets = 0; state.pending_out_packets = 0;
+                    state.pending_polls = 0;
+                }
+                if (mapped) { state.app = app; state.host = host; state.giveup = false; }
+
+                // agg_app: the AGGREGATE bucket name, which folds into "(other)"
+                // once app_max is exceeded. The flow's own true identity
+                // (state.app) is kept unfolded so top_flows and next-poll app
+                // recognition stay accurate; only the totals/tooltip rows collapse.
+                let agg_app = app;
+                if (!apps[agg_app] && length(apps) >= app_max) agg_app = '(other)';
+                let host_norm = host_key(regdom(host));
+                add(apps, agg_app, acc_in, acc_inp, acc_out, acc_outp);
+                add(hosts, host_norm, acc_in, acc_inp, acc_out, acc_outp);
+                if (tooltips_enabled) {
+                    mx_a_count = mx_insert(app_hosts_mx, mx_a_count, mx_max, 'mxfull_a', agg_app, host_norm, acc_in, acc_inp, acc_out, acc_outp);
+                    mx_d_count = mx_insert(device_apps_mx, mx_d_count, pair_max, 'mxfull_d', device, agg_app, acc_in, acc_inp, acc_out, acc_outp);
+                    mx_h_count = mx_insert(host_devices_mx, mx_h_count, mx_max, 'mxfull_h', host_norm, device, acc_in, acc_inp, acc_out, acc_outp);
+                }
+                if (device == 'router') {
+                    if (!router_raw[agg_app]) router_raw[agg_app] = { in_: 0, out_: 0, pin: 0, pout: 0 };
+                    router_raw[agg_app].in_ += acc_in;
+                    router_raw[agg_app].out_ += acc_out;
+                    router_raw[agg_app].pin += acc_inp;
+                    router_raw[agg_app].pout += acc_outp;
+                }
             }
         }
-        // EMA (0.5/0.5, awk's fei/feo), against the ACTUAL elapsed time.
+
+        // EMA (0.5/0.5, awk's fei/feo), against the ACTUAL elapsed time. Fed from
+        // the real per-poll deltas (incoming/outgoing), never from the held/
+        // accumulated acc_in/acc_out - top_flows must reflect live throughput
+        // even while the application label is still pending, exactly as awk's
+        // fei/feo are fed from d1/d2 directly, never from the pending buffers.
         let raw_in_bps = incoming / max(1, dtp), raw_out_bps = outgoing / max(1, dtp);
         let ei = state.in_bps != null ? state.in_bps * 0.5 + raw_in_bps * 0.5 : raw_in_bps;
         let eo = state.out_bps != null ? state.out_bps * 0.5 + raw_out_bps * 0.5 : raw_out_bps;
         flows[key] = { ...state, b1: flow.b1, b2: flow.b2, p1: flow.p1, p2: flow.p2, bulk: bulk,
                        last: poll_no, device: device, class_id: class_id, bytes: flow.b1 + flow.b2,
                        dst: local(flow.src) ? flow.dst : flow.src, proto: flow.proto, dport: flow.dport,
-                       in_bps: ei, out_bps: eo };
+                       in_bps: ei, out_bps: eo, sv: sv };
     }
     for (let key in flows)
         if (!seen[key] && poll_no - flows[key].last > gone_grace) delete flows[key];
@@ -1199,7 +1304,7 @@ function emit(ctr, ct) {
     let result = {
         since: started_at, up: time() - started_at, flows: length(flows),
         rate: {
-            win: rate_win, tc: tc_file ? 1 : 0, rx_bps: tc_state.rx_bps, tx_bps: tc_state.tx_bps,
+            win: rate_win, tc: tc_state.have ? 1 : 0, rx_bps: tc_state.rx_bps, tx_bps: tc_state.tx_bps,
             ct_rx_bps: ctr[0], ct_tx_bps: ctr[1],
             un_rx_bps: tc_state.un_rx_bps, un_tx_bps: tc_state.un_tx_bps,
             un_rx_bytes: max(0, un_cum_rx), un_tx_bytes: max(0, un_cum_tx),
@@ -1246,7 +1351,7 @@ function emit(ctr, ct) {
         let f = busy[i];
         push(result.top_flows, {
             dev: dev_label(f.device), ip: device_ip[f.device] || '',
-            app: f.app || `[${class_names[f.class_id] || 'UNMARKED'}]`,
+            app: f.app || fbname(f.sv || '', f.class_id),
             host: f.host || '', dst: v6short(f.dst || ''), port: f.dport || '', proto: f.proto || '',
             class: class_names[f.class_id] || 'UNMARKED', in_bps: f.in_bps || 0, out_bps: f.out_bps || 0, bytes: f.bytes || 0
         });
@@ -1288,6 +1393,7 @@ function self_pid() {
     } catch (e) {}
     return 0;
 }
+
 
 fs.mkdir(out_dir);
 
