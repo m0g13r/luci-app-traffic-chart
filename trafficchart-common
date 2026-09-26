@@ -64,16 +64,45 @@ tc_load_config() {
     [ -n "$TC_CFG_LOADED" ] && return 0
     TC_CFG_LOADED=1
     command -v uci >/dev/null 2>&1 || return 0
-    local opt key val
+    local opt val
+    # Avoid eval entirely: validate the option name, then assign only the
+    # explicitly supported configuration variables.
     for opt in interval profile tc_stats adapt_interval interval_max persist_dir persist_mount persist_sec persist_timeout \
         hist_sec hist_keep hist_hour_keep hist_day_keep bulk_bytes app_hold v6_reresolve unresolved_max backend \
         attr_win attr_tol attr_topapps attr_totals attr_skip_ports attr_ports attr_min attr_share attr_max_apps \
         attr_max_devices l2_overhead l2_init l2_candidates cal_tol cal_win cal_keep cal_min cal_pctl cal_max_pkt \
         cal_min_pkts host_max un_win un_win_rx un_win_long app_max mx_max pair_max tbl_idle_long tbl_idle_short \
         rate_win tooltips tooltip_every hosts_refresh_sec gua_refresh_sec gone_grace birth_max; do
-        key="CFG_$opt"
         val=$(uci -q get "trafficchart.global.$opt" 2>/dev/null) || continue
-        eval "$key=\"\$val\""
+        case "$opt" in
+            interval) INTERVAL="$val" ;; profile) PROFILE="$val" ;;
+            tc_stats) TC_STATS="$val" ;; adapt_interval) ADAPT_INTERVAL="$val" ;;
+            interval_max) INTERVAL_MAX="$val" ;; persist_dir) PERSIST_DIR="$val" ;;
+            persist_mount) PERSIST_MOUNT="$val" ;; persist_sec) PERSIST_SEC="$val" ;;
+            persist_timeout) PERSIST_TIMEOUT="$val" ;; hist_sec) HIST_SEC="$val" ;;
+            hist_keep) HIST_KEEP="$val" ;; hist_hour_keep) HIST_HOUR_KEEP="$val" ;;
+            hist_day_keep) HIST_DAY_KEEP="$val" ;; bulk_bytes) BULK_BYTES="$val" ;;
+            app_hold) APP_HOLD="$val" ;; v6_reresolve) V6_RERESOLVE="$val" ;;
+            unresolved_max) UNRESOLVED_MAX="$val" ;; backend) BACKEND="$val" ;;
+            attr_win) ATTR_WIN="$val" ;; attr_tol) ATTR_TOL="$val" ;;
+            attr_topapps) ATTR_TOPAPPS="$val" ;; attr_totals) ATTR_TOTALS="$val" ;;
+            attr_skip_ports) ATTR_SKIP_PORTS="$val" ;; attr_ports) ATTR_PORTS="$val" ;;
+            attr_min) ATTR_MIN="$val" ;; attr_share) ATTR_SHARE="$val" ;;
+            attr_max_apps) ATTR_MAX_APPS="$val" ;; attr_max_devices) ATTR_MAX_DEVICES="$val" ;;
+            l2_overhead) L2_OVERHEAD="$val" ;; l2_init) L2_INIT="$val" ;;
+            l2_candidates) L2_CANDIDATES="$val" ;; cal_tol) CAL_TOL="$val" ;;
+            cal_win) CAL_WIN="$val" ;; cal_keep) CAL_KEEP="$val" ;;
+            cal_min) CAL_MIN="$val" ;; cal_pctl) CAL_PCTL="$val" ;;
+            cal_max_pkt) CAL_MAX_PKT="$val" ;; cal_min_pkts) CAL_MIN_PKTS="$val" ;;
+            host_max) HOST_MAX="$val" ;; un_win) UN_WIN="$val" ;;
+            un_win_rx) UN_WIN_RX="$val" ;; un_win_long) UN_WIN_LONG="$val" ;;
+            app_max) APP_MAX="$val" ;; mx_max) MX_MAX="$val" ;;
+            pair_max) PAIR_MAX="$val" ;; tbl_idle_long) TBL_IDLE_LONG="$val" ;;
+            tbl_idle_short) TBL_IDLE_SHORT="$val" ;; rate_win) RATE_WIN="$val" ;;
+            tooltips) TOOLTIPS="$val" ;; tooltip_every) TOOLTIP_EVERY="$val" ;;
+            hosts_refresh_sec) HOSTS_REFRESH_SEC="$val" ;; gua_refresh_sec) GUA_REFRESH_SEC="$val" ;;
+            gone_grace) GONE_GRACE="$val" ;; birth_max) BIRTH_MAX="$val" ;;
+        esac
     done
 }
 
