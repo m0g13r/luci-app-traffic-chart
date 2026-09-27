@@ -15,6 +15,24 @@
 #     crossing count as BULK
 #   - totals survive page reloads and are shared by all open tabs
 #
+# Flow-tuple reuse: /proc/net/nf_conntrack exposes no connection-generation
+# id, only a 5-tuple, so a brand new connection that reuses the exact same
+# tuple as a just-closed one (common for short HTTP/API connections, made
+# more likely by GONE_GRACE keeping a "gone" tuple's baseline around for a
+# few more polls) looks identical to the old one continuing - counted as a
+# jump backward (handled below) only if the new connection happens to have
+# fewer bytes than the old one's last known total; if it already has MORE by
+# the time we see it, the old connection's total is silently lost. For TCP,
+# parse_pass() also tracks the conntrack state word per tuple and forces a
+# reset whenever a tuple that was last seen winding down (TIME_WAIT/CLOSE/...)
+# is seen active again (see tcp_state_closing()) - a real single connection
+# can never make that transition, so this catches the common short-TCP-flow
+# case regardless of the byte counts involved. It does NOT help UDP/ICMP
+# (no state field) or a TCP reuse that lands squarely within one still-active
+# state (e.g. two connections both caught mid-ESTABLISHED). Short of conntrack
+# netlink events (a bigger architectural change) this residual gap cannot be
+# fully closed from procfs snapshots alone.
+#
 # Classification of a flow, per poll:
 #   mark & 0xff in 1..17   -> that class (0x40 = router self-traffic, ignored)
 #   mark & 0xff == 0       -> "0x0 UNMARKED": only if the flow is LAN client ->
@@ -1050,8 +1068,18 @@ function app_account(key, dk, lan, ecls, proto, src, dst, pp, d1, d2, q1, q2,   
     }
 }
 
+# True for the TCP conntrack states that mean a connection is winding down.
+# A real single connections conntrack entry can never transition FROM one
+# of these BACK to an active state (ESTABLISHED/SYN_SENT/SYN_RECV) - only a
+# brand new entry that happens to reuse the same tuple can, which is exactly
+# the tuple-reuse ambiguity parse_pass() uses this for (audit #1).
+function tcp_state_closing(s) {
+    return (s == "TIME_WAIT" || s == "CLOSE" || s == "CLOSE_WAIT" || s == "LAST_ACK" || s == "FIN_WAIT")
+}
+
 function parse_pass(   line, r, h, proto, mark, pp, t, sp, b1, b2, p1, p2,
-                       src, dst, rsrc, key, m, lan, elig, d1, d2, q1, q2, ecls, k, flows, act, dk, ri, ro, rflow, vflow) {
+                       src, dst, rsrc, key, m, lan, elig, d1, d2, q1, q2, ecls, k, flows, act, dk, ri, ro, rflow, vflow,
+                       tcpstate, forced_reset) {
     flows = 0
     split("", rti); split("", rto); split("", rtip); split("", rtop); split("", vdl); split("", vul)
     while ((r = (getline line < CT_FILE)) > 0) {
@@ -1062,6 +1090,12 @@ function parse_pass(   line, r, h, proto, mark, pp, t, sp, b1, b2, p1, p2,
         # packets= bytes= [flags] mark=N ..."
         split(substr(line, 1, 48), h, " ")
         proto = h[3]
+        # TCP conntrack lines carry a state word here (ESTABLISHED,
+        # TIME_WAIT, ...); UDP/ICMP lines do not, so only trust h[6] as a
+        # state for tcp, and only when it looks like a state word at all
+        # (an all-caps/underscore token, not part of a truncated "src=..."
+        # field that happened to land in that column) - see tcp_state_closing().
+        tcpstate = (proto == "tcp" && h[6] ~ /^[A-Z_]+$/) ? h[6] : ""
         src = ""; dst = ""; pp = ""; mark = -1
         b1 = 0; b2 = 0; p1 = 0; p2 = 0
 
@@ -1122,8 +1156,22 @@ function parse_pass(   line, r, h, proto, mark, pp, t, sp, b1, b2, p1, p2,
         if (key in gen) {
             d1 = b1 - pb1[key]; d2 = b2 - pb2[key]
             q1 = p1 - pp1[key]; q2 = p2 - pp2[key]
-            if (d1 < 0 || d2 < 0 || q1 < 0 || q2 < 0) {
-                if (b1 + b2 <= BIRTH_MAX) {
+            forced_reset = 0
+            if (tcpstate != "" && (key in laststate) && tcp_state_closing(laststate[key]) && !tcp_state_closing(tcpstate)) {
+                # The old entry for this tuple was already winding down
+                # (TIME_WAIT/CLOSE/...) and is now back in an active state -
+                # impossible for one real connection, so this can only be a
+                # brand new connection that reused the tuple. Force the
+                # reset even if the byte/packet deltas happen to look like
+                # ordinary non-negative growth, which is exactly the case
+                # the counter-went-backward check below cannot catch: a
+                # short new connection whose counters, once we finally see
+                # it again (possibly several GONE_GRACE polls later), have
+                # already grown past the old connections last known total.
+                forced_reset = 1
+            }
+            if (d1 < 0 || d2 < 0 || q1 < 0 || q2 < 0 || forced_reset) {
+                if (forced_reset || b1 + b2 <= BIRTH_MAX) {
                     # same tuple reused by a new connection: counters restarted
                     d1 = b1; d2 = b2; q1 = p1; q2 = p2; bulk[key] = 0
                 } else {
@@ -1159,6 +1207,7 @@ function parse_pass(   line, r, h, proto, mark, pp, t, sp, b1, b2, p1, p2,
                 if (attr_port_ok(proto, pp)) { vdl[dk] += d2; vul[dk] += d1; dib_rt[dk] += d2; dob_rt[dk] += d1 }
             }
             pb1[key] = b1; pb2[key] = b2; pp1[key] = p1; pp2[key] = p2; gen[key] = n
+            if (tcpstate != "") laststate[key] = tcpstate; else delete laststate[key]
             continue
         }
         elig = (m == 4 || m == 7 || m == 8)          # WEB / P2P / BE
@@ -1183,6 +1232,7 @@ function parse_pass(   line, r, h, proto, mark, pp, t, sp, b1, b2, p1, p2,
         if (key in fei) ftot[key] = b1 + b2
 
         pb1[key] = b1; pb2[key] = b2; pp1[key] = p1; pp2[key] = p2; gen[key] = n
+        if (tcpstate != "") laststate[key] = tcpstate; else delete laststate[key]
     }
     close(CT_FILE)
     if (r < 0) return      # unreadable: keep state, do not sweep
@@ -1196,6 +1246,7 @@ function parse_pass(   line, r, h, proto, mark, pp, t, sp, b1, b2, p1, p2,
             delete pp1[k]; delete pp2[k]; delete bulk[k]
             delete lab[k]; delete lhost[k]; delete giveup[k]
             delete fei[k]; delete feo[k]; delete fact[k]; delete fdev[k]; delete fcls[k]; delete ftot[k]
+            delete laststate[k]
         }
     }
     # flows that were busy earlier but quiet in this pass: let their rate decay
