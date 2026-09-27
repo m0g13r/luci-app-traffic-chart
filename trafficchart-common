@@ -35,6 +35,15 @@
 #   RX_DEV / TX_IFACE   first entry of RX_DEVS / TX_DEVS (used for the shaper
 #                  health line of the page, which shows one device per direction)
 #   QTXT SYSNOTE   wording for the counter source strings
+#   WAN_INFO       one line per enabled queue: "iface<TAB>tx_dev<TAB>rx_dev<TAB>
+#                  upload_kbit<TAB>download_kbit" - feeds tc_wan_json() below
+#
+# tc_wan_json() prints a JSON array with one object per configured WAN queue
+# (iface, rx_bytes, tx_bytes, download_kbit, upload_kbit), or "[]" when there
+# is only one queue. Summing everything into one rate/one configured-rate
+# figure (as FOUND_UPLOAD/FOUND_DOWNLOAD/RX_BYTES/TX_BYTES already do) is fine
+# for a single WAN but blends together very different links in a multi-WAN
+# setup; this lets the page optionally show a per-WAN breakdown instead.
 #
 # tc_read_counters sets:
 #   RX_BYTES TX_BYTES   sum over all devices; EMPTY if nothing could be read
@@ -173,7 +182,17 @@ tc_detect_backend() {
     case "$b" in
         nss|generic) echo "$b"; return ;;
     esac
-    if [ -e "$SYSNET/nssifb" ]; then echo nss; else echo generic; fi
+    # An interface merely named "nssifb" existing is not proof the NSS shaper
+    # is actually in use (it only proves *something* created a device by that
+    # name); also require the nss_ifb kernel module to be loaded, a stronger
+    # and still-cheap signal. Downstream code is self-correcting either way
+    # (the shaper JSON helpers just return {} if the expected qdisc is not
+    # there), but this avoids picking the wrong backend's shaper reader.
+    if [ -e "$SYSNET/nssifb" ] && [ -d /sys/module/nss_ifb ]; then
+        echo nss
+    else
+        echo generic
+    fi
 }
 
 # ifb device that sqm-scripts created for a WAN device: ifb4<wan> (name
@@ -273,18 +292,20 @@ tc_num() {
 
 # config_foreach callback: every enabled queue counts (multi-WAN)
 tc_add_queue() {
-    local cfg="$1" enabled iface upload download tx ifb
+    local cfg="$1" enabled iface upload download tx ifb rxdev
     config_get enabled "$cfg" enabled 0
     [ "$enabled" = "1" ] || return
     config_get iface "$cfg" interface
     [ -n "$iface" ] || return
     config_get upload "$cfg" upload 0
     config_get download "$cfg" download 0
+    upload=$(tc_num "$upload")
+    download=$(tc_num "$download")
 
     tc_push IFACE_LIST "$iface"
     [ -n "$FOUND_IFACE" ] || FOUND_IFACE="$iface"
-    FOUND_UPLOAD=$((FOUND_UPLOAD + $(tc_num "$upload")))
-    FOUND_DOWNLOAD=$((FOUND_DOWNLOAD + $(tc_num "$download")))
+    FOUND_UPLOAD=$((FOUND_UPLOAD + upload))
+    FOUND_DOWNLOAD=$((FOUND_DOWNLOAD + download))
 
     if [ "$BACKEND" = "nss" ]; then
         # nss-rk.qos strips any VLAN suffix ("eth0.7" -> "eth0") before
@@ -299,16 +320,56 @@ tc_add_queue() {
     tc_push TX_DEVS "$tx"
     if [ -n "$ifb" ] && [ -e "$SYSNET/$ifb" ]; then
         tc_push RX_DEVS "$ifb"
+        rxdev="$ifb"
     else
         tc_push RX_RAW "$iface"
+        rxdev="$iface"
     fi
+    # Per-queue record (iface, tx dev, rx dev, upload kbit, download kbit),
+    # tab separated, one line per enabled queue. Summing everything into
+    # FOUND_UPLOAD/FOUND_DOWNLOAD/RX_BYTES/TX_BYTES (above, and in
+    # tc_read_counters) is fine for a single WAN but silently blends together
+    # very different links in a multi-WAN setup (e.g. "1100/120" hides a
+    # 100/20 and a 1000/100 WAN). tc_wan_json() below turns this back into a
+    # per-WAN breakdown for the page to optionally show.
+    WAN_INFO="${WAN_INFO}$(printf '%s\t%s\t%s\t%s\t%s\n' "$iface" "$tx" "$rxdev" "$upload" "$download")"
+}
+
+# JSON array of per-queue counters, built from WAN_INFO (set by tc_resolve /
+# tc_add_queue). Prints "[]" when there is 0 or 1 configured queue, so the
+# common single-WAN case stays exactly as before and the page does not need
+# to show a breakdown for it.
+tc_wan_json() {
+    local n oldifs
+    n=$(printf '%s\n' "$WAN_INFO" | grep -c .)
+    if [ -z "$n" ] || [ "$n" -le 1 ]; then echo "[]"; return; fi
+    oldifs="$IFS"
+    printf '%s\n' "$WAN_INFO" | {
+        first=1
+        printf '['
+        while IFS="$(printf '\t')" read -r iface tx rxdev up down; do
+            [ -n "$iface" ] || continue
+            rb=$(tc_qdisc_bytes "$rxdev")
+            [ -z "$rb" ] && rb=$(cat "$SYSNET/${rxdev}/statistics/rx_bytes" 2>/dev/null)
+            tb=$(tc_qdisc_bytes "$tx")
+            [ -z "$tb" ] && tb=$(cat "$SYSNET/${tx}/statistics/tx_bytes" 2>/dev/null)
+            case "$rb" in ''|*[!0-9]*) rb=0 ;; esac
+            case "$tb" in ''|*[!0-9]*) tb=0 ;; esac
+            [ "$first" = "1" ] || printf ','
+            first=0
+            printf '{"iface":"%s","rx_bytes":%s,"tx_bytes":%s,"download_kbit":%s,"upload_kbit":%s}' \
+                "$iface" "$rb" "$tb" "${down:-0}" "${up:-0}"
+        done
+        printf ']'
+    }
+    IFS="$oldifs"
 }
 
 tc_resolve() {
     . "${TC_FUNCTIONS:-/lib/functions.sh}"
     BACKEND=$(tc_detect_backend)
     IFACE_LIST=""; FOUND_IFACE=""; FOUND_UPLOAD=0; FOUND_DOWNLOAD=0
-    TX_DEVS=""; RX_DEVS=""; RX_RAW=""
+    TX_DEVS=""; RX_DEVS=""; RX_RAW=""; WAN_INFO=""
     config_load sqm
     config_foreach tc_add_queue queue
     RX_DEV="${RX_DEVS%% *}"

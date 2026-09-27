@@ -535,10 +535,18 @@ return view.extend({
                     if (names.length > top)
                         res.meta[d][slots[top]] = { label: otherLabelOf(names.length - top), color: 'hsl(210,8%,62%)' };
                     if (rateInfo && rateInfo.tc) {
-                        var un = (d === 'in') ? { rate: rateInfo.un_rx_bps || 0, bytes: rateInfo.un_rx_bytes || 0, link: link.rx || 0 }
-                                              : { rate: rateInfo.un_tx_bps || 0, bytes: rateInfo.un_tx_bytes || 0, link: link.tx || 0 };
+                        var un = (d === 'in') ? { rate: rateInfo.un_rx_bps || 0, bytes: rateInfo.un_rx_bytes || 0, link: link.rx || 0, conf: rateInfo.un_rx_conf }
+                                              : { rate: rateInfo.un_tx_bps || 0, bytes: rateInfo.un_tx_bytes || 0, link: link.tx || 0, conf: rateInfo.un_tx_conf };
                         if (un.rate >= Math.max(UN_MIN_BPS, UN_MIN_SHARE * un.link)) {
-                            res.meta[d][UN_SLOT] = { label: _('Not attributed (not counted by conntrack)'), color: 'hsl(0,0%,55%)', details: null };
+                            // un.conf === 0: the aggregator's short-window estimate disagreed
+                            // sharply with its steadier long-window one, meaning this figure is
+                            // likely mostly counter-sync jitter rather than real missing
+                            // traffic (see un_update() in trafficchart-agg) - label it as such
+                            // instead of presenting it with the same confidence as a normal row.
+                            var unLabel = (un.conf === 0)
+                                ? _('Not attributed (uncertain - counter sync jitter, not necessarily real traffic)')
+                                : _('Not attributed (not counted by conntrack)');
+                            res.meta[d][UN_SLOT] = { label: unLabel, color: 'hsl(0,0%,55%)', details: null };
                             res[d].rate[UN_SLOT] = un.rate;
                             res[d].bytes[UN_SLOT] = Math.max(un.bytes, 1);
                         }
@@ -994,9 +1002,19 @@ return view.extend({
                 while (chartHost.firstChild) chartHost.removeChild(chartHost.firstChild);
                 tipHide();
                 var R = rangeDef(), B = st.data[R.tier];
+                var errored = st.err && st.err[R.tier];
                 if (!B) {
-                    chartHost.appendChild(E('div', { style: 'text-align:center; color:var(--main-bright-color); padding:30px 0;' }, _('Loading...')));
+                    if (errored) {
+                        chartHost.appendChild(E('div', { style: 'text-align:center; color:var(--danger-color); padding:30px 0;' },
+                            _('History could not be loaded (request to the aggregator failed). Retrying automatically.')));
+                    } else {
+                        chartHost.appendChild(E('div', { style: 'text-align:center; color:var(--main-bright-color); padding:30px 0;' }, _('Loading...')));
+                    }
                     return;
+                }
+                if (errored) {
+                    chartHost.appendChild(E('div', { style: 'text-align:center; color:var(--danger-color); font-size:11px; padding:4px 0;' },
+                        _('The last refresh of this history failed - showing the most recently loaded data, which may be outdated. Retrying automatically.')));
                 }
                 if (!B.length) {
                     chartHost.appendChild(E('div', { style: 'text-align:center; color:var(--main-bright-color); padding:30px 0;' },
@@ -1345,8 +1363,27 @@ return view.extend({
                 var tier = rangeDef().tier, tiers = [ tier ];
                 if (st.cmp) tiers = tiers.concat(TIER_ORDER.slice(TIER_ORDER.indexOf(tier) + 1));
                 v.loadedAt = Date.now();
+                if (!st.err) st.err = {};
                 return Promise.all(tiers.map(function(t) {
-                    return callHistory(1, t).then(function(d) { st.data[t] = (d && d.buckets) ? d.buckets : []; }).catch(function() {});
+                    return callHistory(1, t).then(function(d) {
+                        st.data[t] = (d && d.buckets) ? d.buckets : [];
+                        st.err[t] = false;
+                    }).catch(function() {
+                        // Previously this silently left st.data[t] untouched
+                        // via an empty .catch(), which for a FIRST failed load
+                        // (st.data[t] still undefined) rendered as ordinary
+                        // "Loading..." forever, indistinguishable from a slow
+                        // but working request - and for a failure after a
+                        // successful load, whatever was already in st.data[t]
+                        // happened to stay (silently stale) with no error
+                        // shown either way (audit #10). Now: keep whatever
+                        // data is already there (do NOT clear it), and set an
+                        // explicit per-tier error flag render() checks so the
+                        // page can say "history unavailable" instead of
+                        // quietly showing nothing, or quietly showing
+                        // possibly-outdated data with no indication.
+                        st.err[t] = true;
+                    });
                 })).then(render);
             };
             mark();
@@ -1359,6 +1396,33 @@ return view.extend({
         var histView = makeHistoryView();
 
         var shaperEl = E('div', { style: 'font-size:11.5px; color:var(--secondary-dark-color); margin:0 0 12px; line-height:1.55; font-variant-numeric: tabular-nums;' });
+
+        // Per-WAN breakdown (audit #12): the main link line above sums every
+        // enabled SQM queue into one rate and one configured-rate figure,
+        // which hides very asymmetric multi-WAN setups (e.g. "1100/120 Mbit/s"
+        // obscuring a 100/20 link and a 1000/100 link). data.wan (from
+        // tc_wan_json() in trafficchart-common) has one entry per queue when
+        // there is more than one; this stays empty and hidden for the common
+        // single-WAN case.
+        var wanEl = E('div', { style: 'display:none; font-size:11px; color:var(--main-bright-color); margin:0 0 10px; line-height:1.5; font-variant-numeric: tabular-nums; text-align:center;' });
+        var prevWan = {};
+        function wanUpdate(wan, dt) {
+            while (wanEl.firstChild) wanEl.removeChild(wanEl.firstChild);
+            if (!wan || wan.length < 2) { wanEl.style.display = 'none'; return; }
+            wanEl.style.display = '';
+            wan.forEach(function(w, i) {
+                var prev = prevWan[w.iface];
+                var rxBps = (prev && dt > 0) ? Math.max(0, (w.rx_bytes - prev.rx_bytes) / dt) : null;
+                var txBps = (prev && dt > 0) ? Math.max(0, (w.tx_bytes - prev.tx_bytes) / dt) : null;
+                var downMbit = (w.download_kbit || 0) / 1000, upMbit = (w.upload_kbit || 0) / 1000;
+                var txt = w.iface + ': ';
+                txt += (rxBps !== null ? formatRate(rxBps * 8) : '?') + (downMbit > 0 ? ' / ' + downMbit.toFixed(0) + ' Mbit/s' : '') + ' \u2193, ';
+                txt += (txBps !== null ? formatRate(txBps * 8) : '?') + (upMbit > 0 ? ' / ' + upMbit.toFixed(0) + ' Mbit/s' : '') + ' \u2191';
+                if (i > 0) wanEl.appendChild(document.createTextNode('  \u2022  '));
+                wanEl.appendChild(E('span', {}, txt));
+                prevWan[w.iface] = { rx_bytes: w.rx_bytes, tx_bytes: w.tx_bytes };
+            });
+        }
         var prevShaper = { rx: null, tx: null };
         var LIVE_DROP_LEN = 60;
         var liveDropHist = { rx: { d: [], e: [], scale: 0 }, tx: { d: [], e: [], scale: 0 } };
@@ -1590,6 +1654,7 @@ return view.extend({
             }, hintText);
 
             container.appendChild(staleEl);
+            container.appendChild(wanEl);
             container.appendChild(shaperEl);
             container.appendChild(l2El);
             container.appendChild(toolbar);
@@ -1628,6 +1693,17 @@ return view.extend({
             return baselineTime ? (_('since %s').format(baselineTime.toLocaleString())) : _('since start');
         }
         var pollInFlight = false;
+        var pollRequestId = 0;
+        // Far longer than any normal rpc/ubus timeout - this only exists to
+        // recover if a request NEVER settles at all (should not normally
+        // happen). The previous 8s watchdog unconditionally cleared
+        // pollInFlight, so a request that was merely slow (not actually stuck)
+        // kept running while a second poll started - two get_stats calls in
+        // flight at once (audit #9). This timer instead advances
+        // pollRequestId, so if the abandoned request eventually does resolve,
+        // its response is recognised as stale (myPollId mismatch) and
+        // discarded rather than applied on top of newer data.
+        var POLL_HARD_TIMEOUT = 30000;
 
         var tabHidden = (typeof document.hidden === 'boolean') ? document.hidden : false;
         document.addEventListener('visibilitychange', function() { tabHidden = document.hidden; });
@@ -1636,16 +1712,19 @@ return view.extend({
             if (tabHidden) return Promise.resolve();
             if (pollInFlight) return Promise.resolve();
             pollInFlight = true;
+            var myPollId = ++pollRequestId;
 
             if (histView.active && histView.stale()) histView.load();
 
-            var watchdog = setTimeout(function() {
-                pollInFlight = false;
-            }, 8000);
+            var hardTimer = setTimeout(function() {
+                if (pollRequestId === myPollId) { pollRequestId++; pollInFlight = false; }
+            }, POLL_HARD_TIMEOUT);
 
             return callTrafficStats().then(function(data) {
-                clearTimeout(watchdog);
+                clearTimeout(hardTimer);
+                var stale = (pollRequestId !== myPollId);
                 pollInFlight = false;
+                if (stale) return;   // superseded by the hard-timeout fallback above
                 if (!document.getElementById('qos_container')) return;
 
                 if (data.error || !data.apps || !data.rate) {
@@ -1690,6 +1769,7 @@ return view.extend({
 
                 flowsView.update(data.top_flows || [], sqmDownloadKbit, sqmUploadKbit);
                 shaperUpdate(data.shaper, dt);
+                wanUpdate(data.wan, dt);
                 l2Update(rateInfo);
                 lastData = data;
                 histView.setPersist(data.persist || null);
@@ -1705,10 +1785,13 @@ return view.extend({
 
                 haveRenderedOnce = true;
             }).catch(function(err) {
-                clearTimeout(watchdog);
+                clearTimeout(hardTimer);
+                var stale = (pollRequestId !== myPollId);
                 pollInFlight = false;
-                consecutiveFailures++;
-                if (haveRenderedOnce) updateStaleIndicator();
+                if (!stale) {
+                    consecutiveFailures++;
+                    if (haveRenderedOnce) updateStaleIndicator();
+                }
                 throw err;
             });
         }, 2);

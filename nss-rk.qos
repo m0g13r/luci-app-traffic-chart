@@ -119,6 +119,15 @@ calc_limit() {
 ###############################################################################
 
 # class mark (hex, without 0x) : DSCP
+#
+# This mapping is duplicated in trafficchart-agg (its "cn0"/cname mark-name
+# table, same 17 classes in the same mark order 1-17/0x1-0x11) because
+# nss-rk.qos deliberately does not source trafficchart-common or any other
+# file from the traffic-chart app (it is a standalone SQM shaper script that
+# has to keep working even without that app installed at all). If you add,
+# remove or renumber a class here, make the matching change in
+# trafficchart-agg's cn0 string too - the two are content-verified identical
+# as of 2026-09-27, not just "should be".
 QOS_DSCP="1:ef 2:af41 3:cs4 4:af21 5:af21 6:cs1 7:cs0 8:cs0 9:af31 a:af11 b:cs2 c:cs1 d:af21 e:af21 f:cs2 10:cs0 11:af21"
 
 # DSCP of a class mark ($1, e.g. 0x4)

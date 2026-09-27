@@ -35,10 +35,34 @@ run_reader() {
     # TMPID: private temp file name per instance, so two instances (or a stale
     # one after a restart) can never move each other's temp file away
     exec $AWK -v MAP="$OUT_DIR/apps.map" -v TMPID="$$" '
-    # extract "key":"value" / "key":123 from a one-line JSON object
+    # extract "key":"value" / "key":123 from a one-line JSON object.
+    # The naive [^"]* pattern used before stopped at the first quote,
+    # including an ESCAPED one (\"), so a value like
+    #   "detected_application_name":"Foo \"Bar\""
+    # got truncated to "Foo \". This pattern instead allows any escaped pair
+    # (\\.) or any character that is not a bare quote/backslash, so it walks
+    # correctly through escaped content to the real closing quote, and
+    # unescape() below turns \" \\ \/ \n \t \r back into plain characters
+    # (the caller sanitizes non ASCII-ish characters afterwards anyway, so a
+    # simple unescape - not full \uXXXX decoding - is enough here).
+    function unescape(s,   out, i, n, c) {
+        n = length(s); out = ""
+        for (i = 1; i <= n; i++) {
+            c = substr(s, i, 1)
+            if (c == "\\" && i < n) {
+                i++
+                c = substr(s, i, 1)
+                if (c == "n" || c == "t" || c == "r") c = " "
+                # else: \" -> ", \\ -> \, \/ -> /, and anything else is kept
+                # as the literal character following the backslash
+            }
+            out = out c
+        }
+        return out
+    }
     function jstr(l, k) {
-        if (match(l, "\"" k "\":\"[^\"]*\""))
-            return substr(l, RSTART + length(k) + 4, RLENGTH - length(k) - 5)
+        if (match(l, "\"" k "\":\"(\\\\.|[^\"\\\\])*\""))
+            return unescape(substr(l, RSTART + length(k) + 4, RLENGTH - length(k) - 5))
         return ""
     }
     function jnum(l, k) {

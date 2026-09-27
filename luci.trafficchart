@@ -125,14 +125,33 @@ case "$1" in
         # fresh cache. Falls back to unsynchronized (but still cached)
         # behaviour if this busybox build lacks flock.
         HAVE_FLOCK=0
+        LOCKED=0
         if command -v flock >/dev/null 2>&1; then
             HAVE_FLOCK=1
             exec 9>"$CACHE_LOCK"
-            flock -w 2 9 2>/dev/null
+            if flock -w 2 9 2>/dev/null; then
+                LOCKED=1
+            fi
             if cache_is_fresh; then
                 cat "$CACHE_FILE"
-                flock -u 9 2>/dev/null
+                [ "$LOCKED" = "1" ] && flock -u 9 2>/dev/null
                 exit 0
+            fi
+            if [ "$LOCKED" != "1" ]; then
+                # The 2s wait timed out: someone else is already regenerating.
+                # Proceeding here unlocked would race them and redo the same
+                # work twice for nothing - wait longer (bounded) for them to
+                # finish instead, then just serve what they produced. Only
+                # fall through to regenerating ourselves if that also times
+                # out (e.g. the holder died mid-update).
+                if flock -w 5 9 2>/dev/null; then
+                    LOCKED=1
+                    if cache_is_fresh; then
+                        cat "$CACHE_FILE"
+                        flock -u 9 2>/dev/null
+                        exit 0
+                    fi
+                fi
             fi
         fi
 
@@ -145,19 +164,19 @@ case "$1" in
         if nft list table inet qos_custom >/dev/null 2>&1; then MARKING=true; else MARKING=false; fi
         if [ "$BACKEND" = "nss" ] && [ "$MARKING" = "false" ]; then
             echo '{"error": "table not found"}'
-            [ "$HAVE_FLOCK" = "1" ] && flock -u 9 2>/dev/null
+            [ "$LOCKED" = "1" ] && flock -u 9 2>/dev/null
             exit 0
         fi
 
         if [ ! -r "$AGG_FILE" ]; then
             echo '{"error": "aggregator not running - /etc/init.d/trafficchart start"}'
-            [ "$HAVE_FLOCK" = "1" ] && flock -u 9 2>/dev/null
+            [ "$LOCKED" = "1" ] && flock -u 9 2>/dev/null
             exit 0
         fi
         agg_epoch=$(date -r "$AGG_FILE" +%s 2>/dev/null)
         if [ -z "$agg_epoch" ] || [ $(( $(date +%s) - agg_epoch )) -gt "$AGG_MAX_AGE" ]; then
             echo '{"error": "aggregator data stale - /etc/init.d/trafficchart restart"}'
-            [ "$HAVE_FLOCK" = "1" ] && flock -u 9 2>/dev/null
+            [ "$LOCKED" = "1" ] && flock -u 9 2>/dev/null
             exit 0
         fi
         # one-line JSON object ending in "}" - strip that brace so iface/sqm
@@ -166,7 +185,7 @@ case "$1" in
         AGG_JSON="${AGG_JSON%\}}"
         if [ -z "$AGG_JSON" ]; then
             echo '{"error": "aggregator file empty"}'
-            [ "$HAVE_FLOCK" = "1" ] && flock -u 9 2>/dev/null
+            [ "$LOCKED" = "1" ] && flock -u 9 2>/dev/null
             exit 0
         fi
 
@@ -305,6 +324,13 @@ case "$1" in
         [ -n "$SHAPER_RX" ] || SHAPER_RX='{}'
         [ -n "$SHAPER_TX" ] || SHAPER_TX='{}'
 
+        # Per-WAN breakdown (empty array for the common single-queue case):
+        # the aggregate rx/tx/sqm fields above sum every enabled queue, which
+        # hides very asymmetric multi-WAN setups (e.g. "1100/120" hiding a
+        # 100/20 and a 1000/100 link) - see tc_wan_json() in trafficchart-common.
+        WAN_JSON=$(tc_wan_json)
+        [ -n "$WAN_JSON" ] || WAN_JSON='[]'
+
         {
         cat <<EOF
 ${AGG_JSON},
@@ -324,11 +350,12 @@ ${AGG_JSON},
   "sqm": {
     "upload_kbit": ${FOUND_UPLOAD:-0},
     "download_kbit": ${FOUND_DOWNLOAD:-0}
-  }
+  },
+  "wan": ${WAN_JSON}
 }
 EOF
         } > "${CACHE_FILE}.tmp" && mv -f "${CACHE_FILE}.tmp" "$CACHE_FILE"
         cat "$CACHE_FILE"
-        [ "$HAVE_FLOCK" = "1" ] && flock -u 9 2>/dev/null
+        [ "$LOCKED" = "1" ] && flock -u 9 2>/dev/null
         ;;
 esac
