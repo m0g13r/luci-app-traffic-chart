@@ -114,6 +114,18 @@ run_reader() {
             if (now - dead[k] > 30000) { delete dead[k]; delete map[k]; dirty = 1 }
             else nd++
         }
+        # Digest-less flows (see on_flow()) never get an authoritative purge
+        # event to key off of, so they cannot feed the dead[] table directly
+        # the normal way - without this they would sit in map[] forever once
+        # traffic on them stopped (a leak, and a permanently stale label).
+        # Once one has not been re-confirmed by a fresh "flow" line for 30s,
+        # hand it to the normal dead[]/grace-period path above instead.
+        for (k in nodig_last) {
+            if (now - nodig_last[k] > 30000) {
+                delete nodig_last[k]
+                if (!(k in dead)) { dead[k] = now; nd++ }
+            } else nd++
+        }
         deadflag = (nd > 0)
     }
     function on_flow(l,   app, host, val, ip, proto, lip, oip, lp, op, key, dg) {
@@ -133,14 +145,25 @@ run_reader() {
         if (lip == "" || oip == "" || lp < 0 || op < 0) return
         key = proto "|" v6full(lip) "|" v6full(oip) "|" lp "|" op
         dg = jstr(l, "digest")
-        if (!(dg in dg2key)) kref[key]++
-        dg2key[dg] = key
+        # An empty/missing digest cannot identify a flow uniquely - if
+        # netifyd ever emits several flows without one, they would all
+        # collide on dg2key[""] and silently corrupt the purge reference
+        # count and application mapping of each other (audit #2). Track
+        # those separately by last-sighting time instead (nodig_last[],
+        # swept in flush()) rather than through the digest-keyed
+        # dg2key/kref tables.
+        if (dg != "") {
+            if (!(dg in dg2key)) kref[key]++
+            dg2key[dg] = key
+        } else {
+            nodig_last[key] = now
+        }
         delete dead[key]
         if (map[key] != val) { map[key] = val; dirty = 1 }
     }
     function on_purge(l,   dg, k) {
         dg = jstr(l, "digest")
-        if (!(dg in dg2key)) return
+        if (dg == "" || !(dg in dg2key)) return
         k = dg2key[dg]; delete dg2key[dg]
         if (--kref[k] <= 0) { delete kref[k]; dead[k] = now; deadflag = 1 }
     }

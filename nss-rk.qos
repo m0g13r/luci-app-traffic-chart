@@ -67,32 +67,48 @@ esac
 # Waits (max ~2 min) until the WAN interface has an IPv4 or IPv6 address.
 # Never blocks forever: on timeout it warns and lets SQM start anyway.
 check_wan() {
-  local wan_json wan_ip wan_ip6 wan_up
+  local wan_json wan_ip wan_ip6 wan_up wan_logical
   local tries=0
   local max_tries=24   # 24 * 5s
 
+  # Resolve the actual ubus LOGICAL interface bound to the device this SQM
+  # instance shapes, instead of always asking about the fixed name "wan".
+  # This project explicitly supports multiple SQM queues/multi-WAN
+  # (trafficchart-common enumerates every enabled queue and even builds a
+  # per-WAN breakdown) - a queue configured for e.g. "wanb" or "wan6" was
+  # always waiting on (or trusting the readiness of) the unrelated "wan"
+  # interface here, which could both delay startup unnecessarily and
+  # falsely report ready. Same lookup technique as the PPPoE shadow-device
+  # search in nft_setup() below. Falls back to "wan" if nothing matches
+  # (e.g. ubus/jsonfilter unavailable, or interface not yet registered),
+  # which is exactly the previous behaviour.
+  wan_logical=$(ubus call network.interface dump 2>/dev/null | jsonfilter \
+      -e "@.interface[@.device='${IFACE_RAW}' || @.l3_device='${IFACE_RAW}' || @.device='${IFACE}' || @.l3_device='${IFACE}'].interface" 2>/dev/null | head -n1)
+  [ -n "${wan_logical}" ] || wan_logical="wan"
+  sqm_debug "check_wan: checking ubus logical interface '${wan_logical}' for device ${IFACE_RAW}"
+
   while [ ${tries} -lt ${max_tries} ]; do
-    wan_json="$(ubus call network.interface.wan status 2>/dev/null || true)"
+    wan_json="$(ubus call network.interface.${wan_logical} status 2>/dev/null || true)"
     wan_ip="$(echo "$wan_json" | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null || true)"
     wan_ip6="$(echo "$wan_json" | jsonfilter -e '@["ipv6-address"][0].address' 2>/dev/null || true)"
     wan_up="$(echo "$wan_json" | jsonfilter -e '@.up' 2>/dev/null || true)"
 
     if [ -n "$wan_ip" ] || [ -n "$wan_ip6" ]; then
-      sqm_debug "check_wan: WAN ready (ipv4=${wan_ip:-none} ipv6=${wan_ip6:-none})"
+      sqm_debug "check_wan: ${wan_logical} ready (ipv4=${wan_ip:-none} ipv6=${wan_ip6:-none})"
       return 0
     fi
 
     if [ "$wan_up" = "true" ]; then
-      sqm_debug "check_wan: WAN is up but has no address yet (attempt $((tries+1))/${max_tries}), sleeping 5 seconds..."
+      sqm_debug "check_wan: ${wan_logical} is up but has no address yet (attempt $((tries+1))/${max_tries}), sleeping 5 seconds..."
     else
-      sqm_debug "check_wan: WAN not ready yet (attempt $((tries+1))/${max_tries}), sleeping 5 seconds..."
+      sqm_debug "check_wan: ${wan_logical} not ready yet (attempt $((tries+1))/${max_tries}), sleeping 5 seconds..."
     fi
 
     tries=$((tries + 1))
     sleep 5
   done
 
-  sqm_warn "check_wan: timed out after $((max_tries * 5))s waiting for a WAN address (neither IPv4 nor IPv6). Continuing anyway - SQM may start before the WAN is fully ready."
+  sqm_warn "check_wan: timed out after $((max_tries * 5))s waiting for ${wan_logical} to get an address (neither IPv4 nor IPv6). Continuing anyway - SQM may start before the WAN is fully ready."
   return 0
 }
 
