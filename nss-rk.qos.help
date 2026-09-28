@@ -1,0 +1,21 @@
+nss-rk.qos is an SQM script for Qualcomm NSS hardware offload (nsstbl +
+nssfq_codel) with port based traffic classes (nftables marks + DSCP).
+
+Select the queue discipline "fq_codel" and this script. Only fq_codel is
+supported. Only ONE SQM instance is supported (shared nssifb / nft table).
+
+Only the low byte (0xff) of the packet/conntrack mark is used; other mark bits
+are preserved.
+
+Optional extras, OFF by default, in /etc/config/trafficchart (section global):
+  option dns_redirect '1'            redirect DNS from all non-WAN interfaces
+  option dns_redirect_exclude 'wg0'  interfaces left out of that redirect
+  option ttl_fix '1'                 rewrite TTL / hop limit 63,127 -> 64
+  option bulk_bytes '314572800'      flows above this size become BULK
+
+Restart SQM after changing any of them.
+
+Script options (SQM "Advanced" page):
+  ETARGET / ITARGET     codel target (default 5ms)
+  ELIMIT / ILIMIT       queue limit in packets (default: calculated, 100 ms)
+  EQDISC_OPTS / IQDISC_OPTS   extra nssfq_codel options (interval, quantum, flows)

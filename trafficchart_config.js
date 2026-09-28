@@ -88,11 +88,31 @@ return view.extend({
         o = s.option(form.Value, 'attr_ports', _('Router proxy port(s)'),
             _('Port(s) of a stream proxy running on the router itself, space separated. Traffic served to LAN devices ' +
               'through these ports is credited to the device instead of showing up as generic "Router" traffic. Leave empty to use every port except the infrastructure ports below.'));
-        o.placeholder = '9999';
+        o.placeholder = _('all except the infrastructure ports below');
 
         o = s.option(form.Value, 'attr_skip_ports', _('Router infrastructure ports'),
             _('Only used when the field above is empty: ports that never count as "router is serving this device" (SSH, DNS, DHCP, NTP, DoT, mDNS, LuCI ...).'));
         o.placeholder = '22 53 67 68 80 123 443 853 5353 5355';
+
+        s = m.section(form.NamedSection, 'global', 'trafficchart', _('SQM classifier (nss-rk.qos)'),
+            _('Optional extras of the nftables classifier. Both are OFF by default. Restart SQM after changing them.'));
+
+        o = s.option(form.Flag, 'dns_redirect', _('Redirect DNS to the router'),
+            _('Redirects DNS (port 53, UDP and TCP) coming from every non-WAN interface to the router\'s own resolver. ' +
+              'Also hits VPN interfaces and clients that use their own resolver - use the exclusion list below if that is not wanted. ' +
+              'DoH/DoT are not affected.'));
+        o.default = '0';
+        o.rmempty = false;
+
+        o = s.option(form.Value, 'dns_redirect_exclude', _('Interfaces excluded from the redirect'),
+            _('Space separated device names (e.g. wg0 tun0) whose DNS is left alone.'));
+        o.placeholder = 'wg0';
+        o.depends('dns_redirect', '1');
+
+        o = s.option(form.Flag, 'ttl_fix', _('Normalise TTL / hop limit'),
+            _('Rewrites packets with TTL/hop limit 63 or 127 to 64 (hides that traffic passed through a tethering device or an extra router hop).'));
+        o.default = '0';
+        o.rmempty = false;
 
         s = m.section(form.NamedSection, 'global', 'trafficchart', _('CPU / Performance'),
             _('These options actually turn off expensive features (not just tune them). Take effect on the next ' +

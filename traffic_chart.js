@@ -1863,7 +1863,7 @@ return view.extend({
             if (data && data.backend === 'nss')
                 hintText += ' ' + _('NSS hardware offload bypasses nftables for accelerated flows; conntrack byte counters keep advancing under offload, which is why they are used.');
             var hintEl = E('div', {
-                style: 'position: bottom: 14px; left: 32px; margin-top: 40px; margin-left: 40px; margin-right: 40px; font-size: 11px; color: var(--qos-text-muted); z-index: 10;'
+                style: 'margin-top: 40px; margin-left: 40px; margin-right: 40px; font-size: 11px; color: var(--qos-text-muted);'
             }, hintText);
 
             container.appendChild(staleEl);

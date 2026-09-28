@@ -286,7 +286,7 @@ if [ -r "$TC_COMMON" ]; then
     tc_cfg UN_WIN_LONG 300 int
     tc_cfg TOOLTIPS 1 int
     tc_cfg TC_STATS 1 int
-    tc_cfg ATTR_TOTALS 1 int;         tc_cfg ATTR_TOPAPPS 0 int;       tc_cfg ATTR_PORTS 9999 list
+    tc_cfg ATTR_TOTALS 1 int;         tc_cfg ATTR_TOPAPPS 0 int;       tc_cfg ATTR_PORTS "" list
     tc_cfg ATTR_SKIP_PORTS "22 53 67 68 80 123 443 853 5353 5355" list
     tc_cfg ATTR_WIN 60 int;           tc_cfg ATTR_TOL 0.6 num;         tc_cfg ATTR_MIN 262144 int
     tc_cfg ATTR_SHARE 0.25 num;       tc_cfg ATTR_MAX_APPS 64 int;     tc_cfg ATTR_MAX_DEVICES 64 int

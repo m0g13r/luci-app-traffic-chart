@@ -22,6 +22,7 @@ HIST_DIR="${TC_OUT_DIR:-/tmp/trafficchart}"
 # history.json = 5 min buckets, history_1h.json = hourly, history_1d.json = daily
 # (RAM mirrors written by the daemon, which also reloads them from the persistent
 # storage after a reboot - this script never touches the persistent path itself)
+HIST_MAX_BYTES=800000   # and never more than this many bytes (rpcd/ubus reply limit is 1 MB)
 HIST_MAX=600   # never return more buckets than this (ubus messages are limited to 1 MB)
 
 
@@ -78,10 +79,13 @@ case "$1" in
                 [ "$HN" -gt "$HIST_MAX" ] && HN=$HIST_MAX
                 if [ -r "$HIST_FILE" ]; then
                     # file = JSON array, one bucket per line; keep the newest HN
-                    awk -v N="$HN" -v TIER="$TIER" '
+                    awk -v N="$HN" -v TIER="$TIER" -v MAXB="$HIST_MAX_BYTES" '
                         /^\{/ { sub(/,$/, ""); b[++c] = $0 }
                         END {
                             s = c - N + 1; if (s < 1) s = 1
+                            tot = 0
+                            for (i = c; i >= s; i--) { tot += length(b[i]) + 1; if (tot > MAXB) { s = i + 1; break } }
+                            if (s > c && c > 0) s = c
                             printf "{\"tier\":\"%s\",\"buckets\":[", TIER
                             for (i = s; i <= c; i++) printf "%s%s", (i > s ? "," : ""), b[i]
                             print "]}"

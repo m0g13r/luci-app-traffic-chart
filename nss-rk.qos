@@ -1,7 +1,7 @@
 ###############################################################################
 # nss-rk.qos - SQM shaper for NSS hardware offload (nsstbl + nssfq_codel)
 # with port based traffic classes (nftables packet marks + DSCP).
-# version 20260921
+# version 0.9.0 (20260928)
 #
 # Based on simple.qos / nss.qos by ricsc, modified by rickk
 #   https://github.com/rickkdotnet/sqm-scripts-nss
@@ -15,6 +15,21 @@
 #   0x7 P2P     0x8 BE      0x9 VPN     0xa MAIL      0xb NTP     0xc FTP
 #   0xd REMOTE  0xe DB      0xf MGMT    0x10 CONTAINER  0x11 IOT
 #   0x40 = router originated traffic (never classified)
+#
+# Notes:
+#  * Only the low byte of the packet/conntrack mark is touched, all other bits
+#    (mwan3 etc.) are preserved.
+#  * NSS offload: flows that are already accelerated never walk the ruleset
+#    again, so their kernel mark stays as it was. The traffic chart applies the
+#    BULK demotion itself (trafficchart-agg), so it may show BULK for a flow
+#    whose kernel mark/DSCP is still WEB.
+#  * One SQM instance only: nssifb exists once and every instance recreates the
+#    nft table "inet qos_custom". Multi-WAN with NSS is not supported.
+#  * Optional extras, OFF by default, set in /etc/config/trafficchart (section
+#    global) or LuCI "Traffic Chart Settings" (restart SQM afterwards):
+#      dns_redirect '1'          redirect DNS (53) from all non-WAN interfaces
+#      dns_redirect_exclude '..' interfaces left out of the redirect (e.g. wg0)
+#      ttl_fix '1'               rewrite TTL/hop limit 63/127 to 64
 ###############################################################################
 
 . /lib/functions.sh
@@ -26,6 +41,18 @@ INSMOD=${INSMOD:-/sbin/insmod}
 
 # the low byte of the mark belongs to this script, other bits are left alone
 QOS_MASK=0xff
+QOS_KEEP=0xffffff00
+
+# nft statements that only change the low byte of the packet / conntrack mark
+qos_mset() { echo "meta mark set (meta mark & ${QOS_KEEP}) | $1"; }
+qos_cset() { echo "ct mark set (ct mark & ${QOS_KEEP}) | $1"; }
+
+# read a boolean option from /etc/config/trafficchart (default $2)
+qos_opt_flag() {
+    local v
+    v=$(uci -q get "trafficchart.global.$1" 2>/dev/null)
+    case "$v" in 1|on|yes|true|enabled) echo 1 ;; 0|off|no|false|disabled) echo 0 ;; *) echo "$2" ;; esac
+}
 
 # Never restart SQM from an interface hotplug event: bringing nssifb down/up
 # quickly tends to crash the router. NSS works on the hardware device, so an
@@ -155,6 +182,14 @@ qos_dscp() {
 }
 
 # Flows that already carry a class mark: only re-apply the DSCP.
+qos_ctrestore() {
+    local e m
+    for e in ${QOS_DSCP}; do
+        m="0x${e%%:*}"
+        echo "ct mark & ${QOS_MASK} == ${m} $(qos_mset ${m})"
+    done
+}
+
 qos_restore() {
     local e m d
     for e in ${QOS_DSCP}; do
@@ -170,15 +205,15 @@ qos_finish() {
     local d="$(qos_dscp "$1")"
     echo "meta mark & ${QOS_MASK} == $1 meta nfproto ipv4 ip dscp set ${d}"
     echo "meta mark & ${QOS_MASK} == $1 meta nfproto ipv6 ip6 dscp set ${d}"
-    echo "meta mark & ${QOS_MASK} == $1 ct mark set meta mark"
+    echo "meta mark & ${QOS_MASK} == $1 $(qos_cset $1)"
     echo "meta mark & ${QOS_MASK} == $1 return"
 }
 
 # Mark traffic of protocol $1 (tcp/udp) with class $3 if source OR destination
 # port is in the set $2.
 qos_ports() {
-    echo "$1 dport $2 meta mark set $3"
-    echo "$1 sport $2 meta mark set $3"
+    echo "$1 dport $2 $(qos_mset $3)"
+    echo "$1 sport $2 $(qos_mset $3)"
 }
 
 nft_setup() {
@@ -230,7 +265,7 @@ nft_setup() {
     #    a big DB dump should stay visible as DB, not vanish into BULK.
     # WEB, P2P and the BE catch-all stay subject to BULK on purpose.
     # NOTE: keep in sync with the class port lists in qos_classify below.
-    local BULK_EXEMPT_TCP_PORTS="{ 37, 42, 22, 23, 49, 88, 389, 464, 636, 853, 2000, 3389, 3478-3480, 5060, 5061, 5500, 5900, 6112-6119, 8801-8810, 9090, 10000, 20, 21, 111, 137, 139, 445, 989, 990, 873, 25, 465, 587, 110, 995, 143, 993, 691, 1433, 1521, 3306, 5432, 27017, 6379, 11211, 1194, 161, 162, 902, 2375, 2376, 6443, 9000, 1883, 8883, 8123 }"
+    local BULK_EXEMPT_TCP_PORTS="{ 37, 42, 53, 22, 23, 49, 88, 389, 464, 636, 853, 2000, 3389, 3478-3480, 5060, 5061, 5500, 5900, 6112-6119, 8801-8810, 9090, 10000, 20, 21, 111, 137, 139, 445, 989, 990, 873, 25, 465, 587, 110, 995, 143, 993, 691, 1433, 1521, 3306, 5432, 27017, 6379, 11211, 1194, 161, 162, 902, 2375, 2376, 6443, 9000, 1883, 8883, 8123 }"
     local BULK_EXEMPT_UDP_PORTS="{ 37, 42, 53, 67, 68, 123, 443, 546, 547, 3074, 3478-3480, 5060, 5061, 5353, 5355, 6112-6119, 8443, 8801-8810, 27000-27050, 69, 111, 137, 139, 1434, 11211, 51820, 1194, 500, 4500, 1701, 161, 162, 514, 623, 902, 1900, 5683 }"
 
     # --- Passive mode FTP via the nf_conntrack_ftp helper (optional) ---
@@ -249,7 +284,7 @@ nft_setup() {
 "
         FTP_HELPER_SET="tcp dport 21 ct helper set \"ftp_helper\"
         tcp sport 21 ct helper set \"ftp_helper\""
-        FTP_HELPER_MATCH="ct helper \"ftp_helper\" meta mark set 0xc"
+        FTP_HELPER_MATCH="ct helper \"ftp_helper\" $(qos_mset 0xc)"
     else
         sqm_debug "nft_setup: nf_conntrack_ftp helper not loaded, passive-mode FTP data will fall through to BE"
     fi
@@ -269,19 +304,42 @@ nft_setup() {
 "
     fi
 
+    # --- optional extras (both OFF by default) ---
+    local NAT_CHAIN="" TTL_RULES="" DNS_SET="${IFSET}" x
+    if [ "$(qos_opt_flag dns_redirect 0)" = "1" ]; then
+        for x in $(uci -q get trafficchart.global.dns_redirect_exclude 2>/dev/null); do
+            case "$x" in
+                ''|*[!A-Za-z0-9._-]*) sqm_warn "nft_setup: ignoring invalid dns_redirect_exclude entry '$x'" ;;
+                *) DNS_SET="${DNS_SET}, \"${x}\"" ;;
+            esac
+        done
+        sqm_debug "nft_setup: DNS redirect enabled, not applied to: { ${DNS_SET} }"
+        NAT_CHAIN="
+    # Redirect DNS from everything that is not a WAN (or excluded) device to
+    # the router's own resolver (no hardcoded LAN bridge name).
+    chain prerouting_nat {
+        type nat hook prerouting priority dstnat; policy accept;
+        iifname != { ${DNS_SET} } udp dport 53 redirect to 53
+        iifname != { ${DNS_SET} } tcp dport 53 redirect to 53
+    }
+"
+    fi
+    if [ "$(qos_opt_flag ttl_fix 0)" = "1" ]; then
+        sqm_debug "nft_setup: TTL/hop limit rewrite (63/127 -> 64) enabled"
+        TTL_RULES="
+        meta nfproto ipv4 ip ttl 63 ip ttl set 64
+        meta nfproto ipv4 ip ttl 127 ip ttl set 64
+        meta nfproto ipv6 ip6 hoplimit 63 ip6 hoplimit set 64
+        meta nfproto ipv6 ip6 hoplimit 127 ip6 hoplimit set 64
+"
+    fi
+
     nft delete table inet qos_custom 2>/dev/null
 
     nft -f - <<EOF
 table inet qos_custom {
 ${FTP_HELPER_DECL}
-    # Redirect DNS from everything that is not a WAN device to the router's
-    # own resolver (no hardcoded LAN bridge name).
-    chain prerouting_nat {
-        type nat hook prerouting priority dstnat; policy accept;
-        iifname != { ${IFSET} } udp dport 53 redirect to 53
-        iifname != { ${IFSET} } tcp dport 53 redirect to 53
-    }
-${MSS_CLAMP_CHAIN}
+${NAT_CHAIN}${MSS_CLAMP_CHAIN}
     chain prerouting_mangle {
         type filter hook prerouting priority mangle; policy accept;
         iifname { ${IFSET} } meta mark & ${QOS_MASK} == 0x00 jump qos_classify
@@ -290,12 +348,7 @@ ${MSS_CLAMP_CHAIN}
     chain postrouting_mangle {
         type filter hook postrouting priority mangle; policy accept;
         oifname { ${IFSET} } meta mark & ${QOS_MASK} == 0x00 jump qos_classify
-
-        meta nfproto ipv4 ip ttl 63 ip ttl set 64
-        meta nfproto ipv4 ip ttl 127 ip ttl set 64
-        meta nfproto ipv6 ip6 hoplimit 63 ip6 hoplimit set 64
-        meta nfproto ipv6 ip6 hoplimit 127 ip6 hoplimit set 64
-    }
+${TTL_RULES}    }
 
     # Router's own traffic: DNS/NTP as af42, the rest as be; both marked 0x40
     # so qos_classify skips it.
@@ -304,11 +357,11 @@ ${MSS_CLAMP_CHAIN}
 
         oifname { ${IFSET} } udp dport { 53, 123 } meta nfproto ipv4 ip dscp set af42
         oifname { ${IFSET} } udp dport { 53, 123 } meta nfproto ipv6 ip6 dscp set af42
-        oifname { ${IFSET} } udp dport { 53, 123 } meta mark set 0x40
+        oifname { ${IFSET} } udp dport { 53, 123 } $(qos_mset 0x40)
 
         oifname { ${IFSET} } meta mark & ${QOS_MASK} == 0x00 meta nfproto ipv4 ip dscp set be
         oifname { ${IFSET} } meta mark & ${QOS_MASK} == 0x00 meta nfproto ipv6 ip6 dscp set be
-        oifname { ${IFSET} } meta mark & ${QOS_MASK} == 0x00 meta mark set 0x40
+        oifname { ${IFSET} } meta mark & ${QOS_MASK} == 0x00 $(qos_mset 0x40)
     }
 
     # Shared by both directions. Every class is a block of "set the mark"
@@ -316,24 +369,24 @@ ${MSS_CLAMP_CHAIN}
     # matches wins - the order of the blocks IS the priority.
     chain qos_classify {
         # restore the class of an already classified flow; 0x40 = router traffic
-        meta mark set ct mark
+$(qos_ctrestore)
         meta mark & ${QOS_MASK} == 0x40 return
 
         # Flows above BULK_BYTES become BULK (0x6) - the restore rule for 0x6
         # below then sets the DSCP.
-        meta l4proto tcp tcp dport != ${BULK_EXEMPT_TCP_PORTS} tcp sport != ${BULK_EXEMPT_TCP_PORTS} ct bytes > ${BULK_BYTES} meta mark set 0x6 ct mark set meta mark
-        meta l4proto udp udp dport != ${BULK_EXEMPT_UDP_PORTS} udp sport != ${BULK_EXEMPT_UDP_PORTS} ct bytes > ${BULK_BYTES} meta mark set 0x6 ct mark set meta mark
+        meta l4proto tcp tcp dport != ${BULK_EXEMPT_TCP_PORTS} tcp sport != ${BULK_EXEMPT_TCP_PORTS} ct bytes > ${BULK_BYTES} $(qos_mset 0x6) $(qos_cset 0x6)
+        meta l4proto udp udp dport != ${BULK_EXEMPT_UDP_PORTS} udp sport != ${BULK_EXEMPT_UDP_PORTS} ct bytes > ${BULK_BYTES} $(qos_mset 0x6) $(qos_cset 0x6)
 
         # already classified: re-apply DSCP and stop
 $(qos_restore)
 
-        # 0x1 PRIO: ICMP, DNS (dport only), DoT, DHCP/DHCPv6, legacy nameserver, mDNS, LLMNR
+        # 0x1 PRIO: ICMP, DNS (udp: dport only, tcp: both), DoT, DHCP/DHCPv6, legacy nameserver, mDNS, LLMNR
         # (DoH is plain HTTPS on 443 and cannot be told apart without DPI)
-        ip protocol icmp meta mark set 0x1
-        ip6 nexthdr icmpv6 meta mark set 0x1
-        udp dport { 53, 67, 68, 546, 547, 42, 5353, 5355 } meta mark set 0x1
-        udp sport { 67, 68, 546, 547, 42, 5353, 5355 } meta mark set 0x1
-$(qos_ports tcp "{ 853, 42 }" 0x1)
+        ip protocol icmp $(qos_mset 0x1)
+        ip6 nexthdr icmpv6 $(qos_mset 0x1)
+        udp dport { 53, 67, 68, 546, 547, 42, 5353, 5355 } $(qos_mset 0x1)
+        udp sport { 67, 68, 546, 547, 42, 5353, 5355 } $(qos_mset 0x1)
+$(qos_ports tcp "{ 53, 853, 42 }" 0x1)
 $(qos_finish 0x1)
 
         # 0x2 VOIP: SIP, STUN/TURN, Zoom RTP, Cisco SCCP. The generic udp
@@ -410,13 +463,14 @@ $(qos_ports udp "{ 1900, 5683 }" 0x11)
 $(qos_finish 0x11)
 
         # 0x8 BE: everything else
-        meta mark & ${QOS_MASK} == 0x00 meta mark set 0x8
+        meta mark & ${QOS_MASK} == 0x00 $(qos_mset 0x8)
 $(qos_finish 0x8)
     }
 }
 EOF
 
     # reset old marks so every flow is classified again with the new ruleset
+    # (conntrack cannot clear just the low byte: this zeroes the whole ct mark)
     command -v conntrack >/dev/null 2>&1 && conntrack -U -m 0 >/dev/null 2>&1
 }
 
@@ -535,6 +589,10 @@ sqm_prepare_script() {
     if [ ! -d /sys/devices/virtual/net/nssifb ]; then
       sqm_log "sqm_prepare_script: nssifb interface does not exist, creating.. "
       $IP link add dev nssifb type nss_ifb || return 1
+    fi
+    # one SQM instance only with NSS (see header)
+    if [ "$(uci -q show sqm 2>/dev/null | grep -c "\.enabled='1'")" -gt 1 ]; then
+        sqm_warn "sqm_prepare_script: more than one SQM queue is enabled - nss-rk.qos supports a single instance (shared nssifb / nft table)"
     fi
     nft_setup
     return 0
