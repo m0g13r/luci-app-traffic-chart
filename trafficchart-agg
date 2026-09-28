@@ -262,17 +262,17 @@ if [ -r "$TC_COMMON" ]; then
             PROFILE_MX_MAX=2000;           PROFILE_PAIR_MAX=1000
             ;;
     esac
-    tc_cfg INTERVAL "$PROFILE_INTERVAL" int
+    tc_cfg INTERVAL "$PROFILE_INTERVAL" pint
     tc_cfg ADAPT_INTERVAL "$PROFILE_ADAPT_INTERVAL" int
-    tc_cfg INTERVAL_MAX "$PROFILE_INTERVAL_MAX" int
-    tc_cfg ADAPT_BUDGET "$PROFILE_ADAPT_BUDGET" num
+    tc_cfg INTERVAL_MAX "$PROFILE_INTERVAL_MAX" pint
+    tc_cfg ADAPT_BUDGET "$PROFILE_ADAPT_BUDGET" ratio
     tc_cfg TOOLTIP_EVERY "$PROFILE_TOOLTIP_EVERY" int
     tc_cfg HOSTS_REFRESH_SEC "$PROFILE_HOSTS_REFRESH_SEC" int
     tc_cfg GUA_REFRESH_SEC "$PROFILE_GUA_REFRESH_SEC" int
-    tc_cfg RATE_WIN "$PROFILE_RATE_WIN" int
+    tc_cfg RATE_WIN "$PROFILE_RATE_WIN" pint
     tc_cfg BULK_BYTES "$PROFILE_BULK_BYTES" int
-    tc_cfg HIST_SEC 300 int;          tc_cfg HIST_KEEP 288 int
-    tc_cfg HIST_HOUR_KEEP 192 int;    tc_cfg HIST_DAY_KEEP 400 int
+    tc_cfg HIST_SEC 300 pint;         tc_cfg HIST_KEEP 288 pint
+    tc_cfg HIST_HOUR_KEEP 192 pint;   tc_cfg HIST_DAY_KEEP 400 pint
     tc_cfg PERSIST_DIR "";            tc_cfg PERSIST_MOUNT "";         tc_cfg PERSIST_SEC 3600 int
     tc_cfg PERSIST_TIMEOUT 10 int
     tc_cfg HOST_MAX 200 int
@@ -280,16 +280,16 @@ if [ -r "$TC_COMMON" ]; then
     tc_cfg PAIR_MAX "$PROFILE_PAIR_MAX" int;   tc_cfg TBL_IDLE_LONG 3600 int;   tc_cfg TBL_IDLE_SHORT 600 int
     tc_cfg BIRTH_MAX 1073741824 int;  tc_cfg GONE_GRACE 5 int
     tc_cfg L2_OVERHEAD auto l2;       tc_cfg L2_INIT 18 int;           tc_cfg L2_CANDIDATES "0 14 18 22 26" list
-    tc_cfg CAL_WIN 30 int;            tc_cfg CAL_KEEP 60 int;          tc_cfg CAL_MIN 8 int
-    tc_cfg CAL_PCTL 25 int;           tc_cfg CAL_MAX_PKT 400 int;      tc_cfg CAL_MIN_PKTS 500 int
-    tc_cfg CAL_TOL 1 int;             tc_cfg UN_WIN 30 int;            tc_cfg UN_WIN_RX 60 int
-    tc_cfg UN_WIN_LONG 300 int
+    tc_cfg CAL_WIN 30 pint;           tc_cfg CAL_KEEP 60 pint;         tc_cfg CAL_MIN 8 pint
+    tc_cfg CAL_PCTL 25 int;           tc_cfg CAL_MAX_PKT 400 int;      tc_cfg CAL_MIN_PKTS 500 pint
+    tc_cfg CAL_TOL 1 int;             tc_cfg UN_WIN 30 pint;           tc_cfg UN_WIN_RX 60 pint
+    tc_cfg UN_WIN_LONG 300 int      # 0 = off (allowed)
     tc_cfg TOOLTIPS 1 int
     tc_cfg TC_STATS 1 int
     tc_cfg ATTR_TOTALS 1 int;         tc_cfg ATTR_TOPAPPS 0 int;       tc_cfg ATTR_PORTS "" list
     tc_cfg ATTR_SKIP_PORTS "22 53 67 68 80 123 443 853 5353 5355" list
     tc_cfg ATTR_WIN 60 int;           tc_cfg ATTR_TOL 0.6 num;         tc_cfg ATTR_MIN 262144 int
-    tc_cfg ATTR_SHARE 0.25 num;       tc_cfg ATTR_MAX_APPS 64 int;     tc_cfg ATTR_MAX_DEVICES 64 int
+    tc_cfg ATTR_SHARE 0.25 ratio;       tc_cfg ATTR_MAX_APPS 64 int;     tc_cfg ATTR_MAX_DEVICES 64 int
 fi
 
 CT_FILE="${CT_FILE:-/proc/net/nf_conntrack}"
@@ -392,6 +392,13 @@ case "$PERSIST_SEC" in ''|*[!0-9]*) PERSIST_SEC=3600 ;; esac
 [ "$PERSIST_SEC" -ge 60 ] || PERSIST_SEC=60
 case "$HIST_HOUR_KEEP" in ''|*[!0-9]*|0) HIST_HOUR_KEEP=192 ;; esac
 case "$HIST_DAY_KEEP" in ''|*[!0-9]*|0) HIST_DAY_KEEP=400 ;; esac
+# Same guards for values that came from the environment (tc_cfg keeps those
+# untouched) or when trafficchart-common is missing: 0 would close and write the
+# 5 min bucket at every poll (HIST_SEC) or drop every bucket at once (HIST_KEEP).
+case "$HIST_SEC"  in ''|*[!0-9]*) HIST_SEC=300 ;; esac
+[ "$HIST_SEC" -ge 1 ] 2>/dev/null || HIST_SEC=300
+case "$HIST_KEEP" in ''|*[!0-9]*) HIST_KEEP=288 ;; esac
+[ "$HIST_KEEP" -ge 1 ] 2>/dev/null || HIST_KEEP=288
 
 mkdir -p "$OUT_DIR" || exit 1
 
@@ -438,7 +445,26 @@ $AWK -v CT_FILE="$CT_FILE" -v OUT="$OUT_DIR" -v INTERVAL="$INTERVAL" \
 # "LAN-side" / non-WAN address? (RFC1918, loopback, link-local, multicast,
 # ULA, plus the dynamically discovered LAN GUA prefixes in "gua").
 # IPv6 addresses in /proc/net/nf_conntrack are fully expanded (%pI6).
-function islocal(a) {
+#
+# islocal() is called several times for every conntrack line of every poll (source,
+# destination, sometimes the reply source, plus dev_key() and the live flow list), and
+# the answer only depends on two things: the "gua" prefix regex and the neighbour table
+# "hmac". So the result is cached per address (lcache) and the cache is emptied whenever
+# either of them is refreshed (refresh_gua(), refresh_hosts()). It is bounded: the address
+# set includes every remote host, so it is emptied as well once LCACHE_MAX entries are held.
+function islocal(a,   r) {
+    if (a in lcache) return lcache[a]
+    if (nlcache >= LCACHE_MAX) lcache_clear()
+    r = islocal_raw(a)
+    lcache[a] = r; nlcache++
+    return r
+}
+
+function lcache_clear() {
+    split("", lcache); nlcache = 0
+}
+
+function islocal_raw(a) {
     if (a ~ /^(192\.168\.|10\.|127\.|169\.254\.|255\.)/) return 1
     if (a ~ /^172\.(1[6-9]|2[0-9]|3[01])\./) return 1
     if (a ~ /^(22[4-9]|23[0-9])\./) return 1
@@ -465,6 +491,7 @@ function refresh_gua(   rx) {
     rx = ""
     if ((V6HELPER | getline rx) > 0) gua = rx; else gua = ""
     close(V6HELPER)
+    lcache_clear()      # islocal() results depend on gua
 }
 
 # Addresses recorded by dev_key() as "IPv6, no MAC known" that are still
@@ -496,6 +523,7 @@ function refresh_hosts(   l, f, nm) {
         else if (f[1] == "R") rtr[f[2]] = 1
     }
     close(HOSTS_HELPER)
+    lcache_clear()      # islocal() results depend on hmac
 }
 
 function dev_key(lan, src, rsrc,   addr, mac, key, nm) {
@@ -1392,7 +1420,9 @@ function l2_mode() { return l2_auto ? (cal_n >= CAL_MIN ? 2 : 1) : 0 }
 
 # one calibration window of one direction: (tc bytes - conntrack bytes) per conntrack packet
 function cal_eval(dtc, dct, dpk,   e) {
-    if (dpk < CAL_MIN_PKTS || dct / dpk > CAL_MAX_PKT) return
+    # dpk <= 0 first: with CAL_MIN_PKTS = 0 an idle window (dpk = 0) would otherwise
+    # reach the divisions below (awk aborts on division by zero)
+    if (dpk <= 0 || dpk < CAL_MIN_PKTS || dct / dpk > CAL_MAX_PKT) return
     e = (dtc - dct) / dpk
     if (e < 0 || e > 64) return          # counter restart, or clearly not a header
     cal_ptr = cal_ptr % CAL_KEEP + 1
@@ -1948,6 +1978,7 @@ BEGIN {
     "date +%s" | getline since
     close("date +%s")
     n = 0; warm = 1; nflows = 0
+    LCACHE_MAX = 4096; nlcache = 0
     INTERVAL += 0; if (INTERVAL < 1) INTERVAL = 1
     ADAPT_INTERVAL += 0; INTERVAL_MAX += 0; ADAPT_BUDGET += 0
     TOOLTIP_EVERY += 0; HOSTS_REFRESH_SEC += 0; GUA_REFRESH_SEC += 0
@@ -1977,6 +2008,9 @@ BEGIN {
     if (ncand < 1) { ncand = 1; cand[1] = L2_INIT + 0 }
     CAL_TOL += 0
     CAL_WIN += 0; CAL_KEEP += 0; CAL_MIN += 0; CAL_PCTL += 0; CAL_MAX_PKT += 0; CAL_MIN_PKTS += 0
+    if (CAL_PCTL > 100) CAL_PCTL = 100       # index into the sorted window must stay inside it
+    HOUR_SEC += 0; DAY_SEC += 0
+    if (HOUR_SEC < 1) HOUR_SEC = 3600; if (DAY_SEC < 1) DAY_SEC = 86400   # divisors in hist_tick()
     if (CAL_KEEP < 4) CAL_KEEP = 4
     if (CAL_MIN > CAL_KEEP) CAL_MIN = CAL_KEEP
     CAL_K = int(CAL_WIN / INTERVAL + 0.5); if (CAL_K < 2) CAL_K = 2

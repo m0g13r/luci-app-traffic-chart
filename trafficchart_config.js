@@ -46,7 +46,7 @@ return view.extend({
         o.default = PROFILE_DEFAULT;
 
         o = s.option(form.Value, 'interval', _('Poll interval'), _('Seconds between conntrack passes (starting point; auto-stretches under load, see below).'));
-        o.datatype = 'uinteger';
+        o.datatype = 'min(1)';
         o.placeholder = String(PROFILES[PROFILE_DEFAULT].interval);
 
         o = s.option(form.Flag, 'adapt_interval', _('Adaptive interval'),
@@ -54,12 +54,17 @@ return view.extend({
         o.default = '1';
 
         o = s.option(form.Value, 'interval_max', _('Max interval'), _('Seconds: ceiling for the auto-stretched interval.'));
-        o.datatype = 'uinteger';
+        o.datatype = 'min(1)';
         o.placeholder = String(PROFILES[PROFILE_DEFAULT].interval_max);
         o.depends('adapt_interval', '1');
 
         o = s.option(form.Value, 'adapt_budget', _('Adapt budget'), _('Fraction of the polling cycle the daemon may spend before stretching the interval.'));
         o.datatype = 'ufloat';
+        o.validate = function(section_id, value) {
+            if (value === null || value === '') return true;
+            var v = parseFloat(value);
+            return (v > 0 && v < 1) ? true : _('A fraction greater than 0 and less than 1 (e.g. 0.30).');
+        };
         o.placeholder = String(PROFILES[PROFILE_DEFAULT].adapt_budget);
 
         o = s.option(form.Value, 'hosts_refresh_sec', _('Host refresh'), _('Seconds between neighbour/DHCP/host table refreshes.'));
@@ -203,19 +208,19 @@ return view.extend({
         o.placeholder = '10';
 
         o = s.option(form.Value, 'hist_sec', _('5 minute bucket length'), _('Seconds per bucket of the finest resolution (24 hours view).'));
-        o.datatype = 'uinteger';
+        o.datatype = 'min(1)';
         o.placeholder = '300';
 
         o = s.option(form.Value, 'hist_keep', _('5 minute buckets kept'), _('Default 288 x 300 s = 24 h.'));
-        o.datatype = 'uinteger';
+        o.datatype = 'min(1)';
         o.placeholder = '288';
 
         o = s.option(form.Value, 'hist_hour_keep', _('Hourly buckets kept'), _('Week view. Default 192 = 8 days.'));
-        o.datatype = 'uinteger';
+        o.datatype = 'min(1)';
         o.placeholder = '192';
 
         o = s.option(form.Value, 'hist_day_keep', _('Daily buckets kept'), _('Month and year view. Default 400 days.'));
-        o.datatype = 'uinteger';
+        o.datatype = 'min(1)';
         o.placeholder = '400';
 
         s = m.section(form.NamedSection, 'global', 'trafficchart', _('Advanced'));
