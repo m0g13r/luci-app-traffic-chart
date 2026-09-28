@@ -8,7 +8,7 @@ live traffic chart that uses netifyd/nf_conntrack to work with hw offloading
 <img width="1723" height="1117" alt="Bildschirmfoto vom 2026-09-21 11-56-21" src="https://github.com/user-attachments/assets/96d4bd4b-f188-4b43-9512-146ccb0cddbf" />
 
 
-The basic idea
+how it works ...
 
 With hardware flow offloading, packets in an established connection can bypass most of the normal Linux forwarding path. So something like:
 
