@@ -704,8 +704,14 @@ return view.extend({
                  */
                 var target = ev.currentTarget || ev.target;
 
-                if (historyPinned &&
-                    (historyPinned.target === target || historyPinned.key === key)) {
+                /*
+                 * History bars normally have one DOM target per item. The
+                 * accessibility/large-hit overlay is intentionally shared
+                 * by the whole panel, so DOM-target equality would make a
+                 * click on any other bucket toggle the existing pin off.
+                 * The stable logical key is the actual identity here.
+                 */
+                if (historyPinned && historyPinned.key === key) {
                     historyPinned = null;
                     tipHide();
                     return;
@@ -803,6 +809,17 @@ return view.extend({
                 if (mbit >= 1) return (Math.round(mbit * 10) / 10) + ' Mbit/s';
                 if (mbit > 0) return Math.round(mbit * 1000) + ' kbit/s';
                 return '0';
+            }
+            /*
+             * Visual history scaling: emphasize low rates without changing
+             * the actual values used by tooltips/export/data processing.
+             * sqrt() means 25% of max occupies 50% of the chart height.
+             */
+            var Y_SCALE_POWER = 0.5;
+            function scaleY(rate, dmax) {
+                if (!(dmax > 0) || !(rate > 0)) return 0;
+                var f = rate / dmax;
+                return Math.pow(Math.max(0, Math.min(1, f)), Y_SCALE_POWER);
             }
             function niceMax(x) {
                 if (x <= 0) return 1;
@@ -1205,10 +1222,12 @@ return view.extend({
                     var panelTop = yCursor;
                     var dmax = maxvByDir[d];
                     for (var g = 0; g <= 4; g++) {
-                        var y = panelTop + pt + ph - (ph * g / 4);
+                        var yf = g / 4;
+                        var y = panelTop + pt + ph - (ph * yf);
+                        var axisRateValue = dmax * Math.pow(yf, 1 / Y_SCALE_POWER);
                         svg.appendChild(svgEl('line', { x1: pl, x2: W - pr, y1: y, y2: y, stroke: 'rgba(0,0,0,0.12)', 'stroke-width': 1 }));
                         var lbl = svgEl('text', { x: pl - 8, y: y + 4, 'text-anchor': 'end', style: AXIS_TEXT_STYLE });
-                        lbl.textContent = axisRate(dmax * g / 4);
+                        lbl.textContent = axisRate(axisRateValue);
                         svg.appendChild(lbl);
                     }
                     if (dirs.length > 1) {
@@ -1218,20 +1237,7 @@ return view.extend({
                     }
 
                     gapRuns.forEach(function(gr) {
-                        var gx = svgEl('rect', { x: pl + gr[0] * bw, y: panelTop + pt, width: (gr[1] - gr[0]) * bw, height: ph, fill: 'url(#qos_gap_pat)', style: 'cursor:pointer;' });
-                        var gapInfo = {
-                            label: stampLabel(t0 + gr[0] * colw, R.span) + ' - ' + stampLabel(t0 + gr[1] * colw, R.span),
-                            sub: _('no data (aggregator was not running)'),
-                            color: '#94a3b8',
-                            detailTitle: '',
-                            details: []
-                        };
-                        (function(gapInfo_ref, gapKey) {
-                            gx.addEventListener('mouseenter', function(ev) { historyTipHover(gapInfo_ref, ev); });
-                            gx.addEventListener('mousemove', historyTipMove);
-                            gx.addEventListener('mouseleave', historyTipLeave);
-                            gx.addEventListener('click', function(ev) { historyTipClick(gapInfo_ref, ev, gapKey); });
-                        })(gapInfo, historyTipKey('gap', gr[0], gr[1], d));
+                        var gx = svgEl('rect', { x: pl + gr[0] * bw, y: panelTop + pt, width: (gr[1] - gr[0]) * bw, height: ph, fill: 'url(#qos_gap_pat)', style: 'pointer-events:none;' });
                         svg.appendChild(gx);
                     });
 
@@ -1240,39 +1246,234 @@ return view.extend({
                         series.forEach(function(k) {
                             var vv = bd.v[k] || 0;
                             if (vv <= 0) return;
-                            var h = ph * vv / dmax, y = panelTop + pt + ph - ph * (acc + vv) / dmax;
+                            var yTopFrac = scaleY(acc + vv, dmax);
+                            var yBaseFrac = scaleY(acc, dmax);
+                            var y = panelTop + pt + ph - ph * yTopFrac;
+                            var h = ph * Math.max(0, yTopFrac - yBaseFrac);
                             var r = svgEl('rect', {
                                 x: pl + ci * bw + gap,
                                 y: y,
                                 width: Math.max(bw - 2 * gap, 1),
                                 height: Math.max(h, 0.5),
                                 fill: k === '__rest' ? 'hsl(210,8%,62%)' : colorOf(k),
-                                style: 'cursor:pointer;'
+                                style: 'pointer-events:none;'
                             });
-
-                            (function(c_ref, ci_ref, k_ref, vv_ref, d_ref) {
-                                var barKey = historyTipKey('bar', ci_ref, k_ref, d_ref);
-                                r.addEventListener('mouseenter', function(ev) {
-                                    historyTipHover(historyTip(c_ref, ci_ref, k_ref, vv_ref, d_ref), ev);
-                                });
-                                r.addEventListener('mousemove', historyTipMove);
-                                r.addEventListener('mouseleave', historyTipLeave);
-                                r.addEventListener('click', function(ev) {
-                                    historyTipClick(historyTip(c_ref, ci_ref, k_ref, vv_ref, d_ref), ev, barKey);
-                                });
-                            })(c, ci, k, vv, d);
 
                             svg.appendChild(r);
                             acc += vv;
                         });
                     });
 
+                    /*
+                     * Independent interaction layer.
+                     *
+                     * The visible bars keep their real dimensions.  The
+                     * overlay below handles selection from the DATA geometry,
+                     * so a bucket remains selectable even when it is only a
+                     * few pixels wide and a series is <1px high.
+                     */
+                    (function() {
+                        var HIT_MIN_H = 10;
+
+                        function svgPoint(ev) {
+                            var rr = svg.getBoundingClientRect();
+                            var vb = svg.viewBox && svg.viewBox.baseVal;
+                            var sx = vb && vb.width ? vb.width / rr.width : 1;
+                            var sy = vb && vb.height ? vb.height / rr.height : 1;
+                            return {
+                                x: (ev.clientX - rr.left) * sx + (vb ? vb.x : 0),
+                                y: (ev.clientY - rr.top) * sy + (vb ? vb.y : 0)
+                            };
+                        }
+
+                        function clamp(v, lo, hi) {
+                            return Math.max(lo, Math.min(hi, v));
+                        }
+
+                        function gapAt(ci) {
+                            for (var gi = 0; gi < gapRuns.length; gi++) {
+                                if (ci >= gapRuns[gi][0] && ci < gapRuns[gi][1])
+                                    return gapRuns[gi];
+                            }
+                            return null;
+                        }
+
+                        function pickSegment(c, ci, py) {
+                            var bd = c.byDir[d];
+                            if (!bd || !bd.v) return null;
+
+                            var items = [];
+                            var acc = 0;
+
+                            /*
+                             * IMPORTANT: hit testing follows the exact same
+                             * transformed geometry as the visible bars.
+                             * This makes the mouse position deterministic:
+                             * when the pointer is physically over a segment,
+                             * that segment always wins.
+                             */
+                            series.forEach(function(k) {
+                                var v = Number(bd.v[k]) || 0;
+                                if (v <= 0) return;
+
+                                var y0 = scaleY(acc, dmax);
+                                var y1 = scaleY(acc + v, dmax);
+                                var top = panelTop + pt + ph - ph * y1;
+                                var bottom = panelTop + pt + ph - ph * y0;
+
+                                items.push({
+                                    k: k,
+                                    v: v,
+                                    top: Math.min(top, bottom),
+                                    bottom: Math.max(top, bottom),
+                                    center: (top + bottom) / 2,
+                                    realH: Math.abs(bottom - top)
+                                });
+                                acc += v;
+                            });
+
+                            if (!items.length) return null;
+
+                            /* Pass 1: exact visual hit.  Never let a virtual
+                             * target steal a mouse position that is actually
+                             * inside another visible segment. */
+                            for (var i = 0; i < items.length; i++) {
+                                var exact = items[i];
+                                if (py >= exact.top && py <= exact.bottom)
+                                    return exact;
+                            }
+
+                            /*
+                             * Pass 2: the pointer is in empty space because
+                             * the segment is sub-pixel or above the stack.
+                             * Use a small virtual target around the real
+                             * segment, but do NOT move its center.  The target
+                             * is clipped halfway toward neighbouring segment
+                             * centers, so adjacent series cannot unexpectedly
+                             * swap ownership.
+                             */
+                            var best = null;
+                            var bestDist = Infinity;
+                            var maxVirtual = 8;
+
+                            for (var j = 0; j < items.length; j++) {
+                                var item = items[j];
+                                var half = Math.max(item.realH / 2, HIT_MIN_H / 2);
+
+                                /* Limit expansion to the nearest neighbouring
+                                 * real segment center. */
+                                if (j > 0) {
+                                    var dPrev = Math.abs(item.center - items[j - 1].center);
+                                    half = Math.min(half, dPrev / 2);
+                                }
+                                if (j + 1 < items.length) {
+                                    var dNext = Math.abs(items[j + 1].center - item.center);
+                                    half = Math.min(half, dNext / 2);
+                                }
+
+                                half = Math.min(half, maxVirtual);
+
+                                var dist = Math.abs(py - item.center);
+                                if (dist <= half && dist < bestDist) {
+                                    bestDist = dist;
+                                    best = item;
+                                }
+                            }
+
+                            /* Above/below the actual stack: make selection easy
+                             * without making a distant tiny series steal the
+                             * whole panel. */
+                            if (!best) {
+                                var nearest = null;
+                                var nearestDist = Infinity;
+                                items.forEach(function(item) {
+                                    var dist = py < item.top ? item.top - py :
+                                        (py > item.bottom ? py - item.bottom : 0);
+                                    if (dist < nearestDist) {
+                                        nearestDist = dist;
+                                        nearest = item;
+                                    }
+                                });
+                                if (nearestDist <= maxVirtual)
+                                    best = nearest;
+                            }
+
+                            return best;
+                        }
+
+                        function hitInfo(ev) {
+                            var p = svgPoint(ev);
+                            var ci = Math.floor((p.x - pl) / bw);
+                            ci = clamp(ci, 0, cols.length - 1);
+
+                            var gr = gapAt(ci);
+                            if (gr) {
+                                return {
+                                    info: {
+                                        label: stampLabel(t0 + gr[0] * colw, R.span) +
+                                            ' - ' + stampLabel(t0 + gr[1] * colw, R.span),
+                                        sub: _('no data (aggregator was not running)'),
+                                        color: '#94a3b8',
+                                        detailTitle: '',
+                                        details: []
+                                    },
+                                    key: historyTipKey('gap', gr[0], gr[1], d)
+                                };
+                            }
+
+                            var c = cols[ci];
+                            if (!c || !c.dt || c.dt <= 0) return null;
+
+                            var picked = pickSegment(c, ci, p.y);
+                            if (!picked) return null;
+
+                            return {
+                                info: historyTip(c, ci, picked.k, picked.v, d),
+                                key: historyTipKey('hit', ci, picked.k, d)
+                            };
+                        }
+
+                        var overlay = svgEl('rect', {
+                            x: pl,
+                            y: panelTop + pt,
+                            width: Math.max(pw, 1),
+                            height: Math.max(ph, 1),
+                            fill: 'rgba(0,0,0,0)'
+                        });
+
+                        function update(ev) {
+                            /* A pinned tooltip must stay where it was pinned.
+                             * Do not retarget or move it while the mouse moves. */
+                            if (historyPinned) return;
+
+                            var hit = hitInfo(ev);
+                            if (!hit) {
+                                historyTipLeave();
+                                return;
+                            }
+
+                            historyTipHover(hit.info, ev);
+                        }
+
+                        overlay.addEventListener('mouseenter', update);
+                        overlay.addEventListener('mousemove', update);
+                        overlay.addEventListener('mouseleave', historyTipLeave);
+
+                        overlay.addEventListener('click', function(ev) {
+                            var hit = hitInfo(ev);
+                            if (!hit) return;
+                            historyTipClick(hit.info, ev, hit.key);
+                        });
+
+                        svg.appendChild(overlay);
+                    })();
+
                     if (drawPrev) {
                         var pd = '', pen = false;
                         pcols.forEach(function(pc, ci) {
                             if (pc.dt <= 0) { pen = false; return; }
                             var pv = pc.b[d === 'in' ? 0 : 1] * 8 / pc.dt / 1e6;
-                            pd += (pen ? 'L' : 'M') + (pl + ci * bw + bw / 2).toFixed(1) + ' ' + (panelTop + pt + ph - Math.min(ph, ph * pv / dmax)).toFixed(1) + ' ';
+                            pd += (pen ? 'L' : 'M') + (pl + ci * bw + bw / 2).toFixed(1) + ' ' + (panelTop + pt + ph - ph * scaleY(Math.min(pv, dmax), dmax)).toFixed(1) + ' ';
                             pen = true;
                         });
                         var pline = svgEl('path', { d: pd, style: 'fill:none; stroke:var(--secondary-dark-color); stroke-width:1.4; stroke-dasharray:4 3; opacity:0.8; pointer-events:none;' });
@@ -1438,7 +1639,7 @@ return view.extend({
                 var bwv = Math.max(bw - 0.5, 0.5);
                 var dh = h * (dv || 0) / maxv, eh = h * ev / maxv;
                 if (dv > 0) {
-                    var rd = svgEl('rect', { x: x, y: h - dh, width: bwv, height: Math.max(dh, 0.8), fill: 'rgba(239,68,68,0.85)', style: 'cursor:pointer;' });
+                    var rd = svgEl('rect', { x: x, y: h - dh, width: bwv, height: Math.max(dh, 0.8), fill: 'rgba(239,68,68,0.85)' });
                     (function(val) {
                         rd.addEventListener('mouseenter', function(ev) {
                             tipTrack(ev);
@@ -1450,7 +1651,7 @@ return view.extend({
                     svg.appendChild(rd);
                 }
                 if (ev > 0) {
-                    var re = svgEl('rect', { x: x, y: h - dh - eh, width: bwv, height: Math.max(eh, 0.8), fill: 'rgba(245,158,11,0.85)', style: 'cursor:pointer;' });
+                    var re = svgEl('rect', { x: x, y: h - dh - eh, width: bwv, height: Math.max(eh, 0.8), fill: 'rgba(245,158,11,0.85)' });
                     (function(val) {
                         re.addEventListener('mouseenter', function(ev) {
                             tipTrack(ev);
