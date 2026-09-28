@@ -1028,7 +1028,7 @@ function pend_release(key,   fb) {
 
 function pend_clear(key) {
     delete pdb1[key]; delete pdb2[key]; delete pdp1[key]; delete pdp2[key]
-    delete pdage[key]; delete plan[key]; delete pcls[key]; delete pdev[key]; delete prem[key]; delete ppk[key]
+    delete pdage[key]; delete pdfirst[key]; delete plan[key]; delete pcls[key]; delete pdev[key]; delete prem[key]; delete ppk[key]
 }
 
 # Account one flow delta to an application. Only called for flows that
@@ -1063,8 +1063,11 @@ function app_account(key, dk, lan, ecls, proto, src, dst, pp, d1, d2, q1, q2,   
     } else {
         pdb1[key] += d1; pdb2[key] += d2; pdp1[key] += q1; pdp2[key] += q2
         plan[key] = lan; pcls[key] = ecls; pdev[key] = dk; prem[key] = rem; ppk[key] = sv
+        # Held for a wall-clock time, not a poll count: with the adaptive
+        # interval a poll count stretches to minutes under load (audit).
+        if (!(key in pdfirst)) pdfirst[key] = t0
         pdage[key]++
-        if (pdage[key] >= APP_HOLD) { pend_release(key); giveup[key] = 1 }
+        if (t0 - pdfirst[key] >= APP_HOLD_SEC) { pend_release(key); giveup[key] = 1 }
     }
 }
 
@@ -1174,6 +1177,9 @@ function parse_pass(   line, r, h, proto, mark, pp, t, sp, b1, b2, p1, p2,
                 if (forced_reset || b1 + b2 <= BIRTH_MAX) {
                     # same tuple reused by a new connection: counters restarted
                     d1 = b1; d2 = b2; q1 = p1; q2 = p2; bulk[key] = 0
+                    # a new connection must not inherit the application label
+                    # of the old one that used the same tuple
+                    delete lab[key]; delete lhost[key]; delete giveup[key]
                 } else {
                     # long flow, one counter went backwards: not a new connection.
                     # Count only what grew, never the whole history.
@@ -1206,7 +1212,7 @@ function parse_pass(   line, r, h, proto, mark, pp, t, sp, b1, b2, p1, p2,
                 # (which can lag up to ATTR_WIN seconds and land in one lump - see rate_one() below).
                 if (attr_port_ok(proto, pp)) { vdl[dk] += d2; vul[dk] += d1; dib_rt[dk] += d2; dob_rt[dk] += d1 }
             }
-            pb1[key] = b1; pb2[key] = b2; pp1[key] = p1; pp2[key] = p2; gen[key] = n
+            pb1[key] = b1; pb2[key] = b2; pp1[key] = p1; pp2[key] = p2; gen[key] = n; gent[key] = t0
             if (tcpstate != "") laststate[key] = tcpstate; else delete laststate[key]
             continue
         }
@@ -1231,18 +1237,22 @@ function parse_pass(   line, r, h, proto, mark, pp, t, sp, b1, b2, p1, p2,
         }
         if (key in fei) ftot[key] = b1 + b2
 
-        pb1[key] = b1; pb2[key] = b2; pp1[key] = p1; pp2[key] = p2; gen[key] = n
+        pb1[key] = b1; pb2[key] = b2; pp1[key] = p1; pp2[key] = p2; gen[key] = n; gent[key] = t0
         if (tcpstate != "") laststate[key] = tcpstate; else delete laststate[key]
     }
     close(CT_FILE)
     if (r < 0) return      # unreadable: keep state, do not sweep
     router_attribute()
 
-    # forget flows that are gone (their bytes stay in the class totals)
+    # forget flows that are gone (their bytes stay in the class totals) -
+    # but not after a pass that saw less than half of the previous flows:
+    # that is most likely a partial read, and forgetting baselines now would
+    # book the full counters of the returning flows a second time.
     for (k in gen) {
-        if (n - gen[k] > GONE_GRACE) {
+        if (nflows > 50 && flows < nflows / 2) break
+        if (n - gen[k] > 3 && t0 - gent[k] > GONE_SEC) {
             if (k in pdage) pend_release(k)
-            delete gen[k]; delete pb1[k]; delete pb2[k]
+            delete gen[k]; delete gent[k]; delete pb1[k]; delete pb2[k]
             delete pp1[k]; delete pp2[k]; delete bulk[k]
             delete lab[k]; delete lhost[k]; delete giveup[k]
             delete fei[k]; delete feo[k]; delete fact[k]; delete fdev[k]; delete fcls[k]; delete ftot[k]
@@ -1939,7 +1949,9 @@ BEGIN {
     if (ADAPT_BUDGET <= 0 || ADAPT_BUDGET >= 1) ADAPT_BUDGET = 0.30
     poll_interval = INTERVAL
     last_hosts_refresh = -1e9; last_gua_refresh = -1e9; tooltip_last = 0
-    BIRTH_MAX += 0; GONE_GRACE += 0
+    BIRTH_MAX += 0; GONE_GRACE += 0; APP_HOLD += 0
+    APP_HOLD_SEC = (APP_HOLD - 1) * INTERVAL; if (APP_HOLD_SEC < 0) APP_HOLD_SEC = 0
+    GONE_SEC = GONE_GRACE * INTERVAL
     RATE_WIN += 0; UN_WIN += 0
     if (RATE_WIN < 2 * INTERVAL) RATE_WIN = 2 * INTERVAL
     if (UN_WIN < RATE_WIN) UN_WIN = RATE_WIN

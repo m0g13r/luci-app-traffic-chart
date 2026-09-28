@@ -376,6 +376,13 @@ tc_add_qosmate_iface() {
     [ "$enabled" = "1" ] || return
     config_get iface settings WAN
     [ -n "$iface" ] || return
+    if [ ! -e "$SYSNET/$iface" ]; then
+        # Typical after a swconfig -> DSA migration: interface names change
+        # (eth0.2 -> wan, ...) and this option points at a device that no
+        # longer exists, so there will be no tc counters at all.
+        logger -t trafficchart "qosmate WAN device '$iface' does not exist in $SYSNET - check option WAN in /etc/config/qosmate (ip link show)" 2>/dev/null
+        return
+    fi
     config_get download settings DOWNRATE 0
     config_get upload settings UPRATE 0
     tc_register_wan "$iface" "$(tc_num "$upload")" "$(tc_num "$download")"
