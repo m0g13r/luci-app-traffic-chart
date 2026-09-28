@@ -30,6 +30,8 @@
 #                  all enabled queues
 #   TX_DEVS        devices carrying the upload shaper (NSS: VLAN suffix removed)
 #   RX_DEVS        devices carrying the download shaper (ifb / nssifb)
+#   TC_DIAG        human readable reason when detection had to fall back / failed
+#   TC_FALLBACK    1 = no SQM queue, raw counters of the detected WAN device
 #   RX_RAW         interfaces whose ifb does not exist (ingress shaping inactive):
 #                  their raw rx counter is used as the best available signal
 #   RX_DEV / TX_IFACE   first entry of RX_DEVS / TX_DEVS (used for the shaper
@@ -220,7 +222,11 @@ tc_find_ifb() {
 tc_qdisc_bytes() {
     local dev="$1" bytes
     [ -n "$dev" ] && [ -e "$SYSNET/${dev}" ] || return 1
-    bytes=$(tc -s qdisc show dev "$dev" 2>/dev/null | awk '/^ *Sent /{print $2; exit}')
+    # noqueue (pppoe-wan, vlan, ...) always reports "Sent 0": useless - return
+    # failure so the caller falls back to the sysfs counters
+    bytes=$(tc -s qdisc show dev "$dev" 2>/dev/null | awk '
+        /^qdisc / { if ($2 == "noqueue") exit; next }
+        /^ *Sent / { print $2; exit }')
     case "$bytes" in
         ''|*[!0-9]*) return 1 ;;
     esac
@@ -299,11 +305,49 @@ tc_num() {
     case "$1" in ''|*[!0-9]*) echo 0 ;; *) echo "$1" ;; esac
 }
 
+# logical interface name (wan) or device name -> existing device; fails if unknown
+tc_dev_of() {
+    local n="$1" d
+    case "$n" in ''|*[!A-Za-z0-9._@-]*) return 1 ;; esac
+    if [ -e "$SYSNET/$n" ]; then echo "$n"; return 0; fi
+    command -v ubus >/dev/null 2>&1 && command -v jsonfilter >/dev/null 2>&1 || return 1
+    d=$(ubus call "network.interface.$n" status 2>/dev/null | jsonfilter -e '@.l3_device' -e '@.device' 2>/dev/null | head -n1)
+    [ -n "$d" ] && [ -e "$SYSNET/$d" ] && { echo "$d"; return 0; }
+    return 1
+}
+
+# Fallback when no usable SQM queue exists: find the WAN device ourselves.
+#   1. option wan_dev (device or logical interface name)
+#   2. ubus: l3_device of "wan" / "wan6"
+#   3. device of the default route (IPv4, then IPv6)
+tc_detect_wan_dev() {
+    local d n cfg
+    cfg=$(uci -q get trafficchart.global.wan_dev 2>/dev/null)
+    if [ -n "$cfg" ]; then
+        d=$(tc_dev_of "$cfg") && [ -n "$d" ] && { echo "$d"; return 0; }
+        logger -t trafficchart "option wan_dev '$cfg' is not a usable device - auto-detecting" 2>/dev/null
+    fi
+    if command -v ubus >/dev/null 2>&1 && command -v jsonfilter >/dev/null 2>&1; then
+        for n in wan wan6; do
+            d=$(ubus call "network.interface.$n" status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null | head -n1)
+            [ -n "$d" ] && [ -e "$SYSNET/$d" ] && { echo "$d"; return 0; }
+        done
+    fi
+    for n in -4 -6; do
+        d=$(ip $n route show default 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
+        [ -n "$d" ] && [ -e "$SYSNET/$d" ] && { echo "$d"; return 0; }
+    done
+    return 1
+}
+
 # Shared by tc_add_queue() (sqm-scripts) and tc_add_qosmate_iface() (qosmate):
 # registers one WAN device with its configured rates, picks the tx device and
 # ifb (rx) device the same way for both, and records the WAN_INFO row.
 tc_register_wan() {
-    local iface="$1" upload="$2" download="$3" tx ifb rxdev
+    local iface="$1" upload="$2" download="$3" tx ifb rxdev real
+
+    # sqm "interface" may be a logical name (wan) instead of a device
+    real=$(tc_dev_of "$iface") && [ -n "$real" ] && iface="$real"
 
     tc_push IFACE_LIST "$iface"
     [ -n "$FOUND_IFACE" ] || FOUND_IFACE="$iface"
@@ -419,10 +463,11 @@ tc_wan_json() {
 }
 
 tc_resolve() {
+    local w d ok
     . "${TC_FUNCTIONS:-/lib/functions.sh}"
     BACKEND=$(tc_detect_backend)
     IFACE_LIST=""; FOUND_IFACE=""; FOUND_UPLOAD=0; FOUND_DOWNLOAD=0
-    TX_DEVS=""; RX_DEVS=""; RX_RAW=""; WAN_INFO=""
+    TX_DEVS=""; RX_DEVS=""; RX_RAW=""; WAN_INFO=""; TC_DIAG=""; TC_FALLBACK=0
     config_load sqm
     config_foreach tc_add_queue queue
     if [ -z "$IFACE_LIST" ]; then
@@ -431,6 +476,33 @@ tc_resolve() {
         config_load qosmate
         tc_add_qosmate_iface
     fi
+
+    # queue configured, but none of its devices exists -> treat as "no queue"
+    if [ -n "$IFACE_LIST" ]; then
+        ok=0
+        for d in $TX_DEVS $RX_DEVS $RX_RAW; do [ -e "$SYSNET/$d" ] && ok=1; done
+        if [ "$ok" = 0 ]; then
+            TC_DIAG="configured SQM interface ($IFACE_LIST) does not exist"
+            IFACE_LIST=""; FOUND_IFACE=""; FOUND_UPLOAD=0; FOUND_DOWNLOAD=0
+            TX_DEVS=""; RX_DEVS=""; RX_RAW=""; WAN_INFO=""
+        fi
+    fi
+
+    # No shaper found at all: plain interface counters of the WAN device
+    if [ -z "$IFACE_LIST" ]; then
+        w=$(tc_detect_wan_dev)
+        if [ -n "$w" ]; then
+            TC_FALLBACK=1
+            tc_push IFACE_LIST "$w"; FOUND_IFACE="$w"
+            tc_push TX_DEVS "$w"; tc_push RX_RAW "$w"
+            WAN_INFO="$(printf '%s\t%s\t%s\t%s\t%s\n' "$w" "$w" "$w" 0 0)"
+            TC_DIAG="${TC_DIAG:+$TC_DIAG; }no SQM queue - using raw counters of $w (no shaper, no configured rate)"
+        else
+            TC_DIAG="${TC_DIAG:+$TC_DIAG; }no SQM queue and no WAN device found - set option wan_dev in Traffic Chart Settings"
+        fi
+    fi
+    command -v tc >/dev/null 2>&1 || TC_DIAG="${TC_DIAG:+$TC_DIAG; }tc is not installed (tc-tiny / tc-full), using sysfs counters"
+
     RX_DEV="${RX_DEVS%% *}"
     TX_IFACE="${TX_DEVS%% *}"
     if [ "$BACKEND" = "nss" ]; then
@@ -464,7 +536,8 @@ tc_read_counters() {
     for d in $RX_RAW; do
         b=$(cat "$SYSNET/${d}/statistics/rx_bytes" 2>/dev/null)
         case "$b" in ''|*[!0-9]*) continue ;; esac
-        src="${src:+$src, }${d} (raw, ingress shaping inactive)"
+        if [ "$TC_FALLBACK" = 1 ]; then src="${src:+$src, }${d} (raw, no shaper)"
+        else src="${src:+$src, }${d} (raw, ingress shaping inactive)"; fi
         sum=$((sum + b)); n=$((n + 1))
     done
     if [ "$n" -gt 0 ]; then RX_BYTES="$sum"; else RX_BYTES=""; fi

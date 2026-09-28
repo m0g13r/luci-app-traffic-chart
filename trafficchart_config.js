@@ -213,6 +213,10 @@ return view.extend({
         o.placeholder = '/var/run/netifyd/netifyd.sock';
         o.depends('apps', '1');
 
+        o = s.option(form.Value, 'wan_dev', _('WAN device (fallback)'),
+            _('Only used when no enabled SQM queue is found: device (e.g. eth1, pppoe-wan) or logical interface (wan) whose counters are used for the link rate. Empty = auto-detect.'));
+        o.placeholder = 'pppoe-wan';
+
         o = s.option(form.Value, 'agg_max_age', _('Stale threshold'), _('Seconds: aggregator data older than this is reported as stale on the chart page.'));
         o.datatype = 'uinteger';
         o.placeholder = '10';

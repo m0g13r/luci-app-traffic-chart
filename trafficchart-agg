@@ -313,7 +313,13 @@ ATTR_WIN="${ATTR_WIN:-60}"   # seconds: window in which router WAN volume and cl
 # Port of the stream proxy on the router; empty = every port except ATTR_SKIP_PORTS.
  # ATTR_PORTS, ATTR_TOTALS, ATTR_TOPAPPS, RATE_WIN and UN_WIN were loaded above.
 TC_HELPER="${TC_HELPER:-/usr/libexec/trafficchart-tc}"   # prints "<rx_bytes> <tx_bytes> <rx_drop> <rx_ecn> <tx_drop> <tx_ecn>" of the shapers; without it the page falls back to browser side rates and no shaper history
-[ -x "$TC_HELPER" ] || TC_HELPER=""   # not installed: no link rate, the page falls back to browser side rates
+# run via sh so a missing execute bit no longer disables it silently
+if [ -r "$TC_HELPER" ]; then
+    TC_HELPER="sh $TC_HELPER"
+else
+    TC_HELPER=""   # not installed: no link rate, the page falls back to browser side rates
+    logger -t trafficchart "trafficchart-tc not found - no link rate" 2>/dev/null
+fi
 # TC_STATS (option tc_stats, default 1): trafficchart-tc itself forks "tc -s qdisc show"
 # once per RX device and once per TX device (twice that with multi-WAN), PLUS
 # tc_resolve()'s own config_load/config_foreach over uci sqm - all of that on every

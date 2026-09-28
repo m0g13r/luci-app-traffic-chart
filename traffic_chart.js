@@ -78,10 +78,17 @@ return view.extend({
             var styleTag = document.createElement('style');
             styleTag.id = 'qos_chart_style';
             styleTag.textContent =
+                ':root {' +
+                '  --qos-text-strong: var(--primary-color, var(--main-color, var(--text-color, currentColor)));' +
+                '  --qos-text: var(--text-color, var(--main-color, var(--primary-color, currentColor)));' +
+                '  --qos-text-muted: var(--secondary-color, var(--gray-color, color-mix(in srgb, var(--qos-text-strong) 58%, transparent)));' +
+                '  --qos-surface: var(--card-background, var(--background-color, Canvas));' +
+                '  --qos-danger: var(--error-color, #dc2626);' +
+                '}' +
                 '.qos-panels { position: relative; z-index: 1; display:flex; justify-content:center; align-items:flex-start;' +
                 '  gap:16px; flex-wrap:wrap; }' +
                 '.qos-panel { display:flex; flex-direction:column; align-items:center; width:100%; max-width:1280px; box-sizing:border-box; }' +
-                '.qos-panel-title { font-size:15px; font-weight:800; color:var(--secondary-dark-color); margin-bottom:6px; letter-spacing:0.3px; }' +
+                '.qos-panel-title { font-size:15px; font-weight:800; color:var(--qos-text-strong); margin-bottom:6px; letter-spacing:0.3px; }' +
                 '.qos-card { display:flex; justify-content:center; align-items:flex-start; gap:12px; flex-wrap:wrap; width:100%; min-width:0; }' +
                 '.qos-card > * { min-width:0; }' +
                 '.qos-seg { transition: stroke-dasharray 1.2s cubic-bezier(.22,1,.36,1), stroke-dashoffset 1.2s cubic-bezier(.22,1,.36,1), stroke-width .25s ease, opacity .25s ease; cursor: pointer; }' +
@@ -176,6 +183,8 @@ return view.extend({
             tipPlace();
         }
 
+        var tcDiagText = '';
+
         function buildDirectionPanel(dir, order, metaOf, dynamicMeta, noun) {
             var refs = { classes: {}, segEls: {} };
             var lastValues = { total: '100.0%', classes: {}, counters: {} };
@@ -224,15 +233,15 @@ return view.extend({
 
             var centerPctEl = E('div', {
                 class: 'qos-center-value',
-                style: 'font-size:19px; font-weight:800; color:var(--secondary-dark-color); font-variant-numeric: tabular-nums; min-width:95px; text-align:center;'
+                style: 'font-size:19px; font-weight:800; color:var(--qos-text-strong); font-variant-numeric: tabular-nums; min-width:95px; text-align:center;'
             }, '100.0%');
             var centerLabelEl = E('div', {
                 class: 'qos-center-value',
-                style: 'font-size:9.5px; color:var(--main-bright-color); letter-spacing:0.4px; text-align:center; max-width:125px;'
+                style: 'font-size:9.5px; color:var(--qos-text-muted); letter-spacing:0.4px; text-align:center; max-width:125px;'
             }, dir.centerLabel);
 
             var activeCountEl = E('div', {
-                style: 'font-size:11px; color:var(--main-bright-color); text-transform:uppercase; letter-spacing:0.7px; margin-bottom:2px;'
+                style: 'font-size:11px; color:var(--qos-text-muted); text-transform:uppercase; letter-spacing:0.7px; margin-bottom:2px;'
             }, noun || '');
 
             var legendChildren = [];
@@ -243,19 +252,19 @@ return view.extend({
                     style: 'position:absolute; left:0; top:0; bottom:0; width:0%; border-radius:6px; opacity:0.25; background:' + metaOf(cls).color + '; transition:width 0.4s ease;'
                 });
                 var liveTextEl = E('span', {
-                    style: 'position:relative; z-index:1; font-size:11px; font-weight:700; color:var(--secondary-dark-color); font-variant-numeric: tabular-nums;'
+                    style: 'position:relative; z-index:1; font-size:11px; font-weight:700; color:var(--qos-text-strong); font-variant-numeric: tabular-nums;'
                 }, '0 bit/s');
                 var livePctEl = E('div', {
                     style: 'position:relative; display:inline-flex; align-items:center; justify-content:flex-end; padding:2px 8px; border-radius:6px; background:rgba(0,0,0,0.04); min-width:85px; overflow:hidden;'
                 }, [ liveBarEl, liveTextEl ]);
 
-                var sigmaBytesEl = E('span', { style: 'color:var(--main-dark-color);' }, '0 B');
-                var sigmaPacketsEl = E('span', { style: 'color:var(--main-dark-color);' }, '0');
-                var sigmaSuffixWordEl = E('span', { style: 'color:var(--main-dark-color);' }, ' packets');
+                var sigmaBytesEl = E('span', { style: 'color:var(--qos-text);' }, '0 B');
+                var sigmaPacketsEl = E('span', { style: 'color:var(--qos-text);' }, '0');
+                var sigmaSuffixWordEl = E('span', { style: 'color:var(--qos-text);' }, ' packets');
                 var sigmaSuffixTimeEl = E('span', {}, ' (since start)');
                 var sigmaEl = E('span', {
                     style: 'white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; flex:1 1 auto;'
-                }, [ E('span', { style: 'color:var(--main-dark-color);' }, 'Total '), sigmaBytesEl, ' - ', sigmaPacketsEl, sigmaSuffixWordEl, sigmaSuffixTimeEl ]);
+                }, [ E('span', { style: 'color:var(--qos-text);' }, 'Total '), sigmaBytesEl, ' - ', sigmaPacketsEl, sigmaSuffixWordEl, sigmaSuffixTimeEl ]);
                 var totalPctEl = E('span', {
                     style: 'min-width:58px; text-align:right; display:inline-block; flex-shrink:0;'
                 }, 'total: 0.0%');
@@ -267,7 +276,7 @@ return view.extend({
                 refs.classes[cls].sigmaSuffixTime = sigmaSuffixTimeEl;
                 refs.classes[cls].totalPct = totalPctEl;
 
-                var labelEl = E('span', { style: 'font-size:11.5px; color:var(--secondary-dark-color); font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;' }, metaOf(cls).label);
+                var labelEl = E('span', { style: 'font-size:11.5px; color:var(--qos-text-strong); font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;' }, metaOf(cls).label);
                 var swatch = E('span', { class: 'qos-swatch', style: 'width:11px; height:11px; background:' + metaOf(cls).color + '; border-radius:3px; display:inline-block; flex-shrink:0; box-shadow:0 2px 5px rgba(0,0,0,0.15);' });
 
                 var headerRow = E('div', {
@@ -297,7 +306,7 @@ return view.extend({
                 }, [
                     headerRow,
                     E('div', {
-                        style: 'display:flex; flex-wrap:nowrap; justify-content:space-between; align-items:center; gap:4px; margin:0 1px; min-width:0; font-size:9.5px; color:var(--main-bright-color); font-variant-numeric: tabular-nums;'
+                        style: 'display:flex; flex-wrap:nowrap; justify-content:space-between; align-items:center; gap:4px; margin:0 1px; min-width:0; font-size:9.5px; color:var(--qos-text-muted); font-variant-numeric: tabular-nums;'
                     }, [ sigmaEl, totalPctEl ])
                 ]);
                 refs.classes[cls].rowEl = rowEl;
@@ -335,20 +344,20 @@ return view.extend({
                 E('div', { style: 'position:relative; width:100%; max-width:360px; aspect-ratio:1/1; flex:0 1 360px;' }, [
                     svg,
                     E('div', {
-                        style: 'position:absolute; inset:30.8%; border-radius:50%; background:var(--table-background-color); display:flex; flex-direction:column; align-items:center; justify-content:center; box-shadow: inset 0 0 0 1px var(--main-bright-color);'
+                        style: 'position:absolute; inset:30.8%; border-radius:50%; background:var(--qos-surface); display:flex; flex-direction:column; align-items:center; justify-content:center; box-shadow: inset 0 0 0 1px var(--qos-text-muted);'
                     }, [ centerPctEl, centerLabelEl ])
                 ]),
                 E('div', { style: 'width:100%; max-width:760px; min-width:280px; flex:1 1 520px; box-sizing:border-box;' }, [ activeCountEl, legendGrid ])
             ]);
 
-            var linkStatsBar = E('div', { style: 'position:absolute; left:0; top:0; bottom:0; width:0%; background:var(--main-bright-color); opacity:0.15; transition:width 0.4s ease; border-radius:6px; pointer-events:none;' });
+            var linkStatsBar = E('div', { style: 'position:absolute; left:0; top:0; bottom:0; width:0%; background:var(--qos-text-muted); opacity:0.15; transition:width 0.4s ease; border-radius:6px; pointer-events:none;' });
             var linkStatsText = E('span', { style: 'position:relative; z-index:1; font-weight:600;' }, _('Measuring real interface throughput...'));
             var linkStatsEl = E('div', {
-                style: 'position:relative; display:inline-block; font-size:11.5px; color:var(--secondary-dark-color); margin-bottom:8px; font-variant-numeric: tabular-nums; text-align:center; padding:4px 12px; border-radius:6px; background:rgba(0,0,0,0.03); overflow:hidden; min-width:60%;'
+                style: 'position:relative; display:inline-block; font-size:11.5px; color:var(--qos-text-strong); margin-bottom:8px; font-variant-numeric: tabular-nums; text-align:center; padding:4px 12px; border-radius:6px; background:rgba(0,0,0,0.03); overflow:hidden; min-width:60%;'
             }, [ linkStatsBar, linkStatsText ]);
 
             var diagEl = E('div', {
-                style: 'font-size:9.5px; color:var(--main-bright-color); margin-bottom:6px; font-variant-numeric: tabular-nums; text-align:center;'
+                style: 'font-size:9.5px; color:var(--qos-text-muted); margin-bottom:6px; font-variant-numeric: tabular-nums; text-align:center;'
             }, '');
 
             var panelEl = E('div', { class: 'qos-panel' }, [
@@ -408,17 +417,20 @@ return view.extend({
                 var configuredBps = (configuredKbit || 0) * 1000;
                 var totalPct = 0;
                 
+                var diagTxt = tcDiagText ? ' - ' + tcDiagText : '';
                 if (ifaceRateBps === null || ifaceRateBps === undefined) {
-                    linkStatsText.textContent = _('Link rate not available (no tc counters)') + sourceTxt;
+                    linkStatsText.textContent = _('Link rate not available (no tc counters)') + diagTxt + sourceTxt;
                 } else {
                     var ifaceMbit = ifaceRateBps * 8 / 1e6;
                     if (configuredMbit > 0) {
                         totalPct = Math.min(100, (ifaceMbit / configuredMbit) * 100);
                         linkStatsText.textContent = ifaceMbit.toFixed(1) + ' Mbit/s of ' + configuredMbit.toFixed(0) + ' Mbit/s configured (' + totalPct.toFixed(1) + '%)' + sourceTxt;
                     } else {
-                        linkStatsText.textContent = ifaceMbit.toFixed(1) + ' Mbit/s (configured SQM bandwidth not found)' + sourceTxt;
+                        linkStatsText.textContent = ifaceMbit.toFixed(1) + ' Mbit/s' +
+                            (tcDiagText ? ' (' + tcDiagText + ')' : ' (configured SQM bandwidth not found)') + sourceTxt;
                     }
                 }
+                linkStatsText.title = tcDiagText || '';
                 linkStatsBar.style.width = totalPct.toFixed(1) + '%';
 
                 order.forEach(function(cls) {
@@ -745,7 +757,7 @@ return view.extend({
             }
 
             var chartHost = E('div', { style: 'width:100%;' });
-            var persistEl = E('div', { style: 'text-align:center; font-size:10.5px; color:var(--main-bright-color); margin-top:4px;' });
+            var persistEl = E('div', { style: 'text-align:center; font-size:10.5px; color:var(--qos-text-muted); margin-top:4px;' });
             var btnStyle = 'margin-right:6px;';
             var rangeDefs = RANGES.map(function(r) { return [ r.id, r.label ]; });
             var dimDefs = [ ['a', _('Applications')], ['d', _('Devices')], ['h', _('Destinations')] ];
@@ -780,7 +792,7 @@ return view.extend({
                 dirBtns.push(b);
             });
 
-            var resetBtn = E('button', { type: 'button', style: btnStyle + 'margin-left:18px; color:var(--danger-color);' }, _('Clear history'));
+            var resetBtn = E('button', { type: 'button', style: btnStyle + 'margin-left:18px; color:var(--qos-danger);' }, _('Clear history'));
             resetBtn.title = _('Resets the cumulative application/device/destination totals and the stored history, without restarting the service. Buckets already written to a storage path (if configured) are kept.');
             resetBtn.addEventListener('click', function(e) {
                 e.stopPropagation();
@@ -803,7 +815,7 @@ return view.extend({
                 if (k === '(other)') return 'hsl(210,8%,62%)';
                 return 'hsl(' + slotHue(k) + ',58%,46%)';
             }
-            var AXIS_TEXT_STYLE = 'font-size:12px; fill:var(--main-bright-color);';
+            var AXIS_TEXT_STYLE = 'font-size:12px; fill:var(--qos-text-muted);';
             function axisRate(mbit) {
                 if (mbit >= 100) return Math.round(mbit) + ' Mbit/s';
                 if (mbit >= 1) return (Math.round(mbit * 10) / 10) + ' Mbit/s';
@@ -869,7 +881,7 @@ return view.extend({
                 while (persistEl.firstChild) persistEl.removeChild(persistEl.firstChild);
                 lines.forEach(function(l, i) {
                     var bad = (p && p.state !== 'off' && targets[i] && targets[i].state !== 'ok');
-                    persistEl.appendChild(E('div', { style: bad ? 'color:var(--danger-color);' : '' }, l));
+                    persistEl.appendChild(E('div', { style: bad ? 'color:var(--qos-danger);' : '' }, l));
                 });
             };
 
@@ -949,9 +961,9 @@ return view.extend({
                         E('td', { 'class': 'td', style: num }, x.bl > 0 ? backlogTxt(x.bl, link / 1000) : '-') ]));
                 });
                 return E('div', { style: 'width:fit-content; max-width:100%; margin:10px auto 0; overflow-x:auto;' }, [
-                    E('div', { style: 'font-size:11px; font-weight:700; color:var(--secondary-dark-color); margin-bottom:2px;' }, _('Statistics for the shown period')),
+                    E('div', { style: 'font-size:11px; font-weight:700; color:var(--qos-text-strong); margin-bottom:2px;' }, _('Statistics for the shown period')),
                     E('table', { 'class': 'table', style: 'width:auto; margin:0;' }, rows),
-                    E('div', { style: 'font-size:9.5px; color:var(--main-bright-color); margin-top:2px; max-width:640px;' },
+                    E('div', { style: 'font-size:9.5px; color:var(--qos-text-muted); margin-top:2px; max-width:640px;' },
                         _('Computed from the stored buckets (%s each), so short bursts inside a bucket are averaged out.').format(durTxt(bl)) +
                         (v.sqm.down > 0 || v.sqm.up > 0 ? ' ' + _('Percentages refer to the configured SQM rate.') : '')) ]);
             }
@@ -1022,19 +1034,19 @@ return view.extend({
                 var errored = st.err && st.err[R.tier];
                 if (!B) {
                     if (errored) {
-                        chartHost.appendChild(E('div', { style: 'text-align:center; color:var(--danger-color); padding:30px 0;' },
+                        chartHost.appendChild(E('div', { style: 'text-align:center; color:var(--qos-danger); padding:30px 0;' },
                             _('History could not be loaded (request to the aggregator failed). Retrying automatically.')));
                     } else {
-                        chartHost.appendChild(E('div', { style: 'text-align:center; color:var(--main-bright-color); padding:30px 0;' }, _('Loading...')));
+                        chartHost.appendChild(E('div', { style: 'text-align:center; color:var(--qos-text-muted); padding:30px 0;' }, _('Loading...')));
                     }
                     return;
                 }
                 if (errored) {
-                    chartHost.appendChild(E('div', { style: 'text-align:center; color:var(--danger-color); font-size:11px; padding:4px 0;' },
+                    chartHost.appendChild(E('div', { style: 'text-align:center; color:var(--qos-danger); font-size:11px; padding:4px 0;' },
                         _('The last refresh of this history failed - showing the most recently loaded data, which may be outdated. Retrying automatically.')));
                 }
                 if (!B.length) {
-                    chartHost.appendChild(E('div', { style: 'text-align:center; color:var(--main-bright-color); padding:30px 0;' },
+                    chartHost.appendChild(E('div', { style: 'text-align:center; color:var(--qos-text-muted); padding:30px 0;' },
                         R.tier === '5m' ? _('No history yet - the first bucket is written 5 minutes after the aggregator started.')
                                         : _('No data for this range yet - hourly buckets are closed at the full hour, daily buckets at midnight (and when the service is stopped).')));
                     return;
@@ -1476,7 +1488,7 @@ return view.extend({
                             pd += (pen ? 'L' : 'M') + (pl + ci * bw + bw / 2).toFixed(1) + ' ' + (panelTop + pt + ph - ph * scaleY(Math.min(pv, dmax), dmax)).toFixed(1) + ' ';
                             pen = true;
                         });
-                        var pline = svgEl('path', { d: pd, style: 'fill:none; stroke:var(--secondary-dark-color); stroke-width:1.4; stroke-dasharray:4 3; opacity:0.8; pointer-events:none;' });
+                        var pline = svgEl('path', { d: pd, style: 'fill:none; stroke:var(--qos-text-strong); stroke-width:1.4; stroke-dasharray:4 3; opacity:0.8; pointer-events:none;' });
                         svg.appendChild(pline);
                     }
 
@@ -1506,7 +1518,7 @@ return view.extend({
                             })(c, ci, d, rate, ecnRate);
                             svg.appendChild(hit);
                         });
-                        var dl = svgEl('text', { x: pl - 8, y: dropTop + DROP_H - 1, 'text-anchor': 'end', style: 'font-size:8.5px; fill:var(--main-bright-color);' });
+                        var dl = svgEl('text', { x: pl - 8, y: dropTop + DROP_H - 1, 'text-anchor': 'end', style: 'font-size:8.5px; fill:var(--qos-text-muted);' });
                         dl.textContent = _('drops');
                         svg.appendChild(dl);
                         yCursor += DROP_H;
@@ -1538,13 +1550,13 @@ return view.extend({
                 if (rest.length) legend.appendChild(legendItem('__rest', 'hsl(210,8%,62%)', _('Other (%d)').format(rest.length)));
                 if (st.cmp && !prevAny) legend.appendChild(E('span', { style: 'opacity:0.7;' }, _('Previous period: no data stored yet')));
                 if (drawPrev) legend.appendChild(E('span', {}, [
-                    E('span', { style: 'display:inline-block; width:16px; margin-right:5px; vertical-align:middle; border-top:2px dashed var(--secondary-dark-color);' }), _('Previous period') ]));
+                    E('span', { style: 'display:inline-block; width:16px; margin-right:5px; vertical-align:middle; border-top:2px dashed var(--qos-text-strong);' }), _('Previous period') ]));
                 if (showDrops) legend.appendChild(E('span', {}, [
                     E('span', { style: 'display:inline-block; width:11px; height:11px; border-radius:3px; margin-right:5px; background:rgba(220,38,38,0.4);' }), _('Shaper drops (strip opacity = intensity relative to the worst column shown)') ]));
                 chartHost.appendChild(legend);
 
                 var colTxt = colw >= 86400 ? _('%.1f days').format(colw / 86400) : colw >= 3600 ? _('%.1f h').format(colw / 3600) : _('%d min').format(Math.round(colw / 60));
-                chartHost.appendChild(E('div', { style: 'text-align:center; font-size:10.5px; color:var(--main-bright-color); margin-top:6px;' },
+                chartHost.appendChild(E('div', { style: 'text-align:center; font-size:10.5px; color:var(--qos-text-muted); margin-top:6px;' },
                     _('Average rate per column (%s), %s - %s.').format(colTxt, new Date(t0 * 1000).toLocaleString(), new Date(end * 1000).toLocaleString())));
                 chartHost.appendChild(statsTable(sel, R, bl));
             }
@@ -1596,7 +1608,7 @@ return view.extend({
         var flowsView = makeFlowsView();
         var histView = makeHistoryView();
 
-        var shaperEl = E('div', { style: 'font-size:11.5px; color:var(--secondary-dark-color); margin:0 0 12px; line-height:1.55; font-variant-numeric: tabular-nums;' });
+        var shaperEl = E('div', { style: 'font-size:11.5px; color:var(--qos-text-strong); margin:0 0 12px; line-height:18px; font-variant-numeric: tabular-nums; height:40px; min-height:40px; max-height:40px; box-sizing:border-box; overflow:hidden;' });
 
         // Per-WAN breakdown (audit #12): the main link line above sums every
         // enabled SQM queue into one rate and one configured-rate figure,
@@ -1605,7 +1617,7 @@ return view.extend({
         // tc_wan_json() in trafficchart-common) has one entry per queue when
         // there is more than one; this stays empty and hidden for the common
         // single-WAN case.
-        var wanEl = E('div', { style: 'display:none; font-size:11px; color:var(--main-bright-color); margin:0 0 10px; line-height:1.5; font-variant-numeric: tabular-nums; text-align:center;' });
+        var wanEl = E('div', { style: 'display:none; font-size:11px; color:var(--qos-text-muted); margin:0 0 10px; line-height:1.5; font-variant-numeric: tabular-nums; text-align:center;' });
         var prevWan = {};
         function wanUpdate(wan, dt) {
             while (wanEl.firstChild) wanEl.removeChild(wanEl.firstChild);
@@ -1666,7 +1678,7 @@ return view.extend({
             return svg;
         }
 
-        var l2El = E('div', { id: 'qos_l2diag', style: 'font-size:11.5px; color:var(--secondary-dark-color); margin:-6px 0 12px; line-height:1.55; font-variant-numeric: tabular-nums;' });
+        var l2El = E('div', { id: 'qos_l2diag', style: 'font-size:11.5px; color:var(--qos-text-strong); margin:-6px 0 12px; line-height:1.55; font-variant-numeric: tabular-nums;' });
         function l2Update(r) {
             while (l2El.firstChild) l2El.removeChild(l2El.firstChild);
             if (!r || r.l2 === undefined || !r.tc) return;
@@ -1677,7 +1689,7 @@ return view.extend({
                 _('Link header: %d B/packet (%s)').format(r.l2, how)));
             var extra = (r.l2_mode === 2) ? (r.l2_raw || 0) - r.l2 : 0;
             if (extra >= 3)
-                l2El.appendChild(E('span', { style: 'color:var(--danger-color); margin-left:10px;' },
+                l2El.appendChild(E('span', { style: 'color:var(--qos-danger); margin-left:10px;' },
                     _('⚠ measured %.1f B/packet: about %.0f B/packet more than a link header - traffic that conntrack does not see is probably present (shown as "Not attributed")').format(r.l2_raw, extra)));
         }
         function shaperUpdate(sh, dt) {
@@ -1703,14 +1715,14 @@ return view.extend({
                     _('backlog') + ' ' + formatBytes(cur.backlog_b || 0) + ' / ' + (cur.backlog_p || 0) + ' pkt · ' +
                     _('limit hits') + ' ' + (cur.drop_overlimit || 0) + ' · ' + _('active flows') + ' ' + ((cur.flows_new || 0) + (cur.flows_old || 0));
 
-                var spark = liveSparkline(hist.d, hist.e, drawMax);
+                var spark = liveSparkline(hist.d, hist.e, drawMax); spark.style.flex = '0 0 auto'; spark.style.display = 'inline-block';
                 spark.setAttribute('title', _('Recent drop rate (red) / ECN rate (amber), roughly the last %d polls.').format(LIVE_DROP_LEN));
 
                 var lineEl = E('div', {
-                    style: 'display:flex; align-items:center; flex-wrap:wrap; gap:5px; margin-bottom:2px;',
+                    style: 'display:flex; align-items:center; flex-wrap:nowrap; gap:5px; margin-bottom:2px; height:18px; min-height:18px; max-height:18px; overflow:hidden; white-space:nowrap;',
                     title: _('Drops are normal codel behaviour under load. "Limit hits" > 0 mean the queue limit was exceeded (limit too small for the link speed).')
                 }, [ prefix, spark, suffix ]);
-                if ((cur.drop_overlimit || 0) > 0 && prev && cur.drop_overlimit > (prev.drop_overlimit || 0)) lineEl.style.color = 'var(--danger-color)';
+                if ((cur.drop_overlimit || 0) > 0 && prev && cur.drop_overlimit > (prev.drop_overlimit || 0)) lineEl.style.color = 'var(--qos-danger)';
 
                 shaperEl.appendChild(lineEl);
             });
@@ -1757,7 +1769,7 @@ return view.extend({
             saveFile('trafficchart-' + stamp() + '.json', 'application/json', JSON.stringify(lastData, null, 2));
         }
 
-        var statusEl = E('span', { style: 'color:var(--main-bright-color);' }, _('Querying conntrack via ubus...'));
+        var statusEl = E('span', { style: 'color:var(--qos-text-muted);' }, _('Querying conntrack via ubus...'));
 
         var restartBusy = false;
         var restartBtn = E('button', {
@@ -1784,12 +1796,12 @@ return view.extend({
         });
 
         var staleEl = E('div', {
-            style: 'display:none; color:var(--danger-color); font-size:11.5px; text-align:center; margin-bottom:8px;'
+            style: 'display:none; color:var(--qos-danger); font-size:11.5px; text-align:center; margin-bottom:8px;'
         }, [ E('span', { id: 'qos_stale_text' }, '') ]);
 
         var container = E('div', {
             id: 'qos_container',
-            style: 'background: var(--table-background-color); border: 1px solid var(--main-bright-color); border-radius: .50em; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3); padding:28px 32px; max-width:1700px; margin:0 auto;'
+            style: 'background: var(--qos-surface); border: 1px solid var(--qos-text-muted); border-radius: .50em; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3); padding:28px 32px; max-width:1700px; margin:0 auto;'
         }, [ statusEl, restartBtn, staleEl ]);
 
         container.addEventListener('click', function(e) {
@@ -1851,7 +1863,7 @@ return view.extend({
             if (data && data.backend === 'nss')
                 hintText += ' ' + _('NSS hardware offload bypasses nftables for accelerated flows; conntrack byte counters keep advancing under offload, which is why they are used.');
             var hintEl = E('div', {
-                style: 'position: bottom: 14px; left: 32px; margin-top: 40px; margin-left: 40px; margin-right: 40px; font-size: 11px; color: var(--main-bright-color); z-index: 10;'
+                style: 'position: bottom: 14px; left: 32px; margin-top: 40px; margin-left: 40px; margin-right: 40px; font-size: 11px; color: var(--qos-text-muted); z-index: 10;'
             }, hintText);
 
             container.appendChild(staleEl);
@@ -1973,6 +1985,7 @@ return view.extend({
                 wanUpdate(data.wan, dt);
                 l2Update(rateInfo);
                 lastData = data;
+                tcDiagText = data.tc_diag || '';
                 histView.setPersist(data.persist || null);
                 histView.setSqm(sqmDownloadKbit, sqmUploadKbit);
 

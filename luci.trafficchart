@@ -334,6 +334,7 @@ case "$1" in
         {
         cat <<EOF
 ${AGG_JSON},
+  "tc_diag": "${TC_DIAG}",
   "backend": "${BACKEND}",
   "marking": ${MARKING},
   "iface": {
