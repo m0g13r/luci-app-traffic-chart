@@ -14,23 +14,6 @@ support for Qualcomm NSS hardware offload.
 Optional: `socat` + `netifyd` (application names), `conntrack`.
 NSS shaper additionally needs an NSS build with `nss-ifb` / `nsstbl` / `nssfq_codel`.
 
-## Install
-
-Build as luci package (`Makefile` included) or copy the files:
-
-| file | destination |
-|---|---|
-| trafficchart | /etc/init.d/trafficchart (chmod +x) |
-| trafficchart.config | /etc/config/trafficchart |
-| trafficchart-agg, -apps, -common, -hosts, -tc, -v6prefixes | /usr/libexec/ (chmod +x) |
-| luci.trafficchart | /usr/libexec/rpcd/luci.trafficchart (chmod +x) |
-| luci-app-traffic-chart.json | /usr/share/rpcd/acl.d/ |
-| luci-app-traffic-chart_menu.json | /usr/share/luci/menu.d/luci-app-traffic-chart.json |
-| traffic_chart.js, trafficchart_config.js | /www/luci-static/resources/view/network/ |
-| nss-rk.qos, nss-rk.qos.help | /usr/lib/sqm/ |
-
-Then `/etc/init.d/trafficchart enable; /etc/init.d/rpcd restart; /etc/init.d/trafficchart start`.
-
 ## Behaviour worth knowing
 
 * **NSS offload:** accelerated flows are not classified again, so their kernel
