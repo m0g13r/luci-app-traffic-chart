@@ -27,11 +27,13 @@ NSS shaper additionally needs an NSS build with `nss-ifb` / `nsstbl` / `nssfq_co
   (`dns_redirect`, `dns_redirect_exclude`, `ttl_fix`), see `nss-rk.qos.help`.
 * `attr_ports` empty = every port except `attr_skip_ports`.
 
-<img width="1723" height="1117" alt="Bildschirmfoto vom 2026-09-21 11-59-59" src="https://github.com/user-attachments/assets/4feb4138-16df-443a-8d9d-8da589c54948" />
-<img width="1723" height="1117" alt="Bildschirmfoto vom 2026-09-21 11-59-32" src="https://github.com/user-attachments/assets/ef72e11c-fc79-465f-91e3-19dac0053477" />
-<img width="1723" height="1117" alt="Bildschirmfoto vom 2026-09-21 11-58-59" src="https://github.com/user-attachments/assets/6b54718c-c101-488a-bb67-428436d76dd5" />
-<img width="1723" height="1117" alt="Bildschirmfoto vom 2026-09-21 11-58-16" src="https://github.com/user-attachments/assets/6c471137-fbe7-401e-ac30-a4047429df9b" />
-<img width="1723" height="1117" alt="Bildschirmfoto vom 2026-09-21 11-56-21" src="https://github.com/user-attachments/assets/96d4bd4b-f188-4b43-9512-146ccb0cddbf" />
+<img width="1950" height="1363" alt="Bildschirmfoto vom 2026-09-29 01-05-22" src="https://github.com/user-attachments/assets/2a2589db-1969-4608-b04e-83a4ab8bb47d" />
+<img width="1950" height="1363" alt="Bildschirmfoto vom 2026-09-29 01-06-35" src="https://github.com/user-attachments/assets/2505da5a-d370-4fa7-a157-50a6899278dc" />
+<img width="1950" height="1363" alt="Bildschirmfoto vom 2026-09-29 01-06-03" src="https://github.com/user-attachments/assets/a627bee4-34f6-4996-8b9e-989d6fcefe71" />
+<img width="1950" height="1363" alt="Bildschirmfoto vom 2026-09-29 01-01-44" src="https://github.com/user-attachments/assets/e66ec458-9168-45d3-b8fd-a8d767f3850d" />
+<img width="1950" height="1363" alt="Bildschirmfoto vom 2026-09-29 01-02-24" src="https://github.com/user-attachments/assets/bdfe1d4f-0fb9-4828-94a8-0b42950c4def" />
+
+
 
 
 how it works ...
