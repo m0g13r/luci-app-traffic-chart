@@ -1,5 +1,48 @@
 # luci-app-traffic-chart
-live traffic chart that uses netifyd/nf_conntrack to work with hw offloading
+Live and historic traffic view for OpenWrt routers running SQM, with special
+support for Qualcomm NSS hardware offload.
+
+* Per application, device and destination, live and as history
+  (5 min / hourly / daily buckets, optionally persisted to USB/NAS)
+* Byte counts come from conntrack, application names from netifyd (optional)
+* Shaper health: drops, ECN marks, backlog (nsstbl/nssifb, cake, htb+fq_codel)
+* `nss-rk.qos`: SQM script for NSS with 17 port based traffic classes
+
+## Requirements
+
+`luci-base`, `rpcd`, `sqm-scripts`, `nftables`, `jsonfilter`, `tc` (tc-tiny/full).
+Optional: `socat` + `netifyd` (application names), `conntrack`.
+NSS shaper additionally needs an NSS build with `nss-ifb` / `nsstbl` / `nssfq_codel`.
+
+## Install
+
+Build as luci package (`Makefile` included) or copy the files:
+
+| file | destination |
+|---|---|
+| trafficchart | /etc/init.d/trafficchart (chmod +x) |
+| trafficchart.config | /etc/config/trafficchart |
+| trafficchart-agg, -apps, -common, -hosts, -tc, -v6prefixes | /usr/libexec/ (chmod +x) |
+| luci.trafficchart | /usr/libexec/rpcd/luci.trafficchart (chmod +x) |
+| luci-app-traffic-chart.json | /usr/share/rpcd/acl.d/ |
+| luci-app-traffic-chart_menu.json | /usr/share/luci/menu.d/luci-app-traffic-chart.json |
+| traffic_chart.js, trafficchart_config.js | /www/luci-static/resources/view/network/ |
+| nss-rk.qos, nss-rk.qos.help | /usr/lib/sqm/ |
+
+Then `/etc/init.d/trafficchart enable; /etc/init.d/rpcd restart; /etc/init.d/trafficchart start`.
+
+## Behaviour worth knowing
+
+* **NSS offload:** accelerated flows are not classified again, so their kernel
+  mark/DSCP stays as it was. The chart demotes big WEB/P2P/BE flows to BULK
+  itself, so it can show BULK while the kernel mark is still WEB.
+* **One SQM instance** with NSS (single `nssifb`, single nft table).
+  The generic backend supports several queues.
+* **Marks:** only the low byte is used, other bits are preserved.
+  Restarting the classifier zeroes the whole conntrack mark (`conntrack -U -m 0`).
+* **DNS redirect and TTL rewrite** are OFF by default
+  (`dns_redirect`, `dns_redirect_exclude`, `ttl_fix`), see `nss-rk.qos.help`.
+* `attr_ports` empty = every port except `attr_skip_ports`.
 
 <img width="1723" height="1117" alt="Bildschirmfoto vom 2026-09-21 11-59-59" src="https://github.com/user-attachments/assets/4feb4138-16df-443a-8d9d-8da589c54948" />
 <img width="1723" height="1117" alt="Bildschirmfoto vom 2026-09-21 11-59-32" src="https://github.com/user-attachments/assets/ef72e11c-fc79-465f-91e3-19dac0053477" />
