@@ -225,7 +225,7 @@ if [ -r "$TC_COMMON" ]; then
     PROFILE_TOOLTIP_EVERY=0
     PROFILE_HOSTS_REFRESH_SEC=60
     PROFILE_GUA_REFRESH_SEC=120
-    PROFILE_RATE_WIN=10
+    PROFILE_RATE_WIN=30
     PROFILE_BULK_BYTES=314572800
     PROFILE_MX_MAX=2000
     PROFILE_PAIR_MAX=1000
@@ -233,32 +233,32 @@ if [ -r "$TC_COMMON" ]; then
         realtime)
             PROFILE_INTERVAL=1;            PROFILE_ADAPT_INTERVAL=1;     PROFILE_INTERVAL_MAX=5
             PROFILE_ADAPT_BUDGET=0.15;     PROFILE_TOOLTIP_EVERY=1;      PROFILE_HOSTS_REFRESH_SEC=30
-            PROFILE_GUA_REFRESH_SEC=60;    PROFILE_RATE_WIN=5;           PROFILE_BULK_BYTES=314572800
+            PROFILE_GUA_REFRESH_SEC=60;    PROFILE_RATE_WIN=10;           PROFILE_BULK_BYTES=314572800
             PROFILE_MX_MAX=4000;           PROFILE_PAIR_MAX=2000
             ;;
         balanced)
             PROFILE_INTERVAL=2;            PROFILE_ADAPT_INTERVAL=1;     PROFILE_INTERVAL_MAX=10
             PROFILE_ADAPT_BUDGET=0.30;     PROFILE_TOOLTIP_EVERY=0;      PROFILE_HOSTS_REFRESH_SEC=60
-            PROFILE_GUA_REFRESH_SEC=120;   PROFILE_RATE_WIN=10;          PROFILE_BULK_BYTES=314572800
+            PROFILE_GUA_REFRESH_SEC=120;   PROFILE_RATE_WIN=20;          PROFILE_BULK_BYTES=314572800
             PROFILE_MX_MAX=2000;           PROFILE_PAIR_MAX=1000
             ;;
         low-cpu)
             PROFILE_INTERVAL=4;            PROFILE_ADAPT_INTERVAL=1;     PROFILE_INTERVAL_MAX=20
             PROFILE_ADAPT_BUDGET=0.45;     PROFILE_TOOLTIP_EVERY=2;      PROFILE_HOSTS_REFRESH_SEC=180
-            PROFILE_GUA_REFRESH_SEC=300;   PROFILE_RATE_WIN=10;          PROFILE_BULK_BYTES=314572800
+            PROFILE_GUA_REFRESH_SEC=300;   PROFILE_RATE_WIN=20;          PROFILE_BULK_BYTES=314572800
             PROFILE_MX_MAX=1000;           PROFILE_PAIR_MAX=500
             ;;
         very-low-cpu)
             PROFILE_INTERVAL=6;            PROFILE_ADAPT_INTERVAL=1;     PROFILE_INTERVAL_MAX=30
             PROFILE_ADAPT_BUDGET=0.55;     PROFILE_TOOLTIP_EVERY=3;      PROFILE_HOSTS_REFRESH_SEC=300
-            PROFILE_GUA_REFRESH_SEC=600;   PROFILE_RATE_WIN=10;          PROFILE_BULK_BYTES=314572800
+            PROFILE_GUA_REFRESH_SEC=600;   PROFILE_RATE_WIN=30;          PROFILE_BULK_BYTES=314572800
             PROFILE_MX_MAX=500;            PROFILE_PAIR_MAX=250
             ;;
         *)
             PROFILE=balanced
             PROFILE_INTERVAL=2;            PROFILE_ADAPT_INTERVAL=1;     PROFILE_INTERVAL_MAX=10
             PROFILE_ADAPT_BUDGET=0.30;     PROFILE_TOOLTIP_EVERY=0;      PROFILE_HOSTS_REFRESH_SEC=60
-            PROFILE_GUA_REFRESH_SEC=120;   PROFILE_RATE_WIN=10;          PROFILE_BULK_BYTES=314572800
+            PROFILE_GUA_REFRESH_SEC=120;   PROFILE_RATE_WIN=20;          PROFILE_BULK_BYTES=314572800
             PROFILE_MX_MAX=2000;           PROFILE_PAIR_MAX=1000
             ;;
     esac
@@ -267,8 +267,8 @@ if [ -r "$TC_COMMON" ]; then
     tc_cfg INTERVAL_MAX "$PROFILE_INTERVAL_MAX" pint
     tc_cfg ADAPT_BUDGET "$PROFILE_ADAPT_BUDGET" ratio
     tc_cfg TOOLTIP_EVERY "$PROFILE_TOOLTIP_EVERY" int
-    tc_cfg HOSTS_REFRESH_SEC "$PROFILE_HOSTS_REFRESH_SEC" int
-    tc_cfg GUA_REFRESH_SEC "$PROFILE_GUA_REFRESH_SEC" int
+    tc_cfg HOSTS_REFRESH_SEC "$PROFILE_HOSTS_REFRESH_SEC" pint
+    tc_cfg GUA_REFRESH_SEC "$PROFILE_GUA_REFRESH_SEC" pint
     tc_cfg RATE_WIN "$PROFILE_RATE_WIN" pint
     tc_cfg BULK_BYTES "$PROFILE_BULK_BYTES" int
     tc_cfg HIST_SEC 300 pint;         tc_cfg HIST_KEEP 288 pint
@@ -927,11 +927,11 @@ function attr_match(dir,   k, p, a, d, ra, rap, sel, vd, rem, used, cr, cv, pick
         if (dir == 0) {
             pair_xfer(bd, ba, x, 0, (ATTR_TOPAPPS ? ba : "Proxy-Stream (via Router)"))
             dib[bd] += x; dib["router"] -= x; dipk[bd] += pk; dipk["router"] -= pk
-            dib_rt["router"] -= x
+            dib_rt[bd] += x; dib_rt["router"] -= x
         } else {
             pair_xfer(bd, ba, 0, x, (ATTR_TOPAPPS ? ba : "Proxy-Stream (via Router)"))
             dob[bd] += x; dob["router"] -= x; dopk[bd] += pk; dopk["router"] -= pk
-            dob_rt["router"] -= x
+            dob_rt[bd] += x; dob_rt["router"] -= x
         }
         used[bd] = 1; rem[ba] -= x; cr[ba] += x; cv[bd] += x
     }
@@ -1242,10 +1242,10 @@ function parse_pass(   line, r, h, proto, mark, pp, t, sp, b1, b2, p1, p2,
             if (d1 > 0 || d2 > 0) {
                 dk = dev_key(1, src, "")
                 dvi[dk] += d2; dvo[dk] += d1
-                # dib_rt/dob_rt mirror dib/dob but credit router-attributable traffic THE MOMENT it is
-                # delivered, not when attr_match() later moves it from the Router bucket to the device
-                # (which can lag up to ATTR_WIN seconds and land in one lump - see rate_one() below).
-                if (attr_port_ok(proto, pp)) { vdl[dk] += d2; vul[dk] += d1; dib_rt[dk] += d2; dob_rt[dk] += d1 }
+                # Keep eligible LAN->router bytes in the attribution pool only.  They
+                # enter the device rate total when attr_match() actually pairs them
+                # with router WAN bytes in the same direction.
+                if (attr_port_ok(proto, pp)) { vdl[dk] += d2; vul[dk] += d1 }
             }
             pb1[key] = b1; pb2[key] = b2; pp1[key] = p1; pp2[key] = p2; gen[key] = n; gent[key] = t0
             if (tcpstate != "") laststate[key] = tcpstate; else delete laststate[key]
@@ -1423,12 +1423,27 @@ function l2_now() { return l2_auto ? l2_est : L2_OVERHEAD }
 function l2_mode() { return l2_auto ? (cal_n >= CAL_MIN ? 2 : 1) : 0 }
 
 # one calibration window of one direction: (tc bytes - conntrack bytes) per conntrack packet
-function cal_eval(dtc, dct, dpk,   e) {
-    # dpk <= 0 first: with CAL_MIN_PKTS = 0 an idle window (dpk = 0) would otherwise
-    # reach the divisions below (awk aborts on division by zero)
-    if (dpk <= 0 || dpk < CAL_MIN_PKTS || dct / dpk > CAL_MAX_PKT) return
+function cal_sample(dtc, dct, dpk,   e) {
+    # Return one direction measured bytes/packet overhead.  Missing traffic
+    # can only increase this value, so the caller can combine RX/TX into one
+    # common link-header sample without letting one dirty direction define it.
+    if (dpk <= 0 || dpk < CAL_MIN_PKTS || dct / dpk > CAL_MAX_PKT) return -1
     e = (dtc - dct) / dpk
-    if (e < 0 || e > 64) return          # counter restart, or clearly not a header
+    if (e < 0 || e > 64) return -1          # counter restart / unusable window
+    return e
+}
+
+function cal_eval_pair(dtc_rx, dct_rx, dpk_rx, dtc_tx, dct_tx, dpk_tx,   er, et, e) {
+    # RX and TX traverse the same link and therefore have the same L2 header.
+    # Extra traffic invisible to conntrack can only raise the measured value.
+    # For a paired window, use the lower valid direction as the conservative
+    # header observation.  If only one direction is usable, keep that sample.
+    er = cal_sample(dtc_rx, dct_rx, dpk_rx)
+    et = cal_sample(dtc_tx, dct_tx, dpk_tx)
+    if (er < 0 && et < 0) return
+    if (er < 0) e = et
+    else if (et < 0) e = er
+    else e = (er < et) ? er : et
     cal_ptr = cal_ptr % CAL_KEEP + 1
     cal_v[cal_ptr] = e
     if (cal_n < CAL_KEEP) cal_n++
@@ -1458,8 +1473,8 @@ function cal_update() {
     }
     if (++cal_polls < CAL_K) return
     cal_polls = 0
-    cal_eval(tcc_rx - cs_tc_rx, ct_tot_in - cs_ct_rx, ct_pk_in - cs_pk_rx)
-    cal_eval(tcc_tx - cs_tc_tx, ct_tot_out - cs_ct_tx, ct_pk_out - cs_pk_tx)
+    cal_eval_pair(tcc_rx - cs_tc_rx, ct_tot_in - cs_ct_rx, ct_pk_in - cs_pk_rx,
+                  tcc_tx - cs_tc_tx, ct_tot_out - cs_ct_tx, ct_pk_out - cs_pk_tx)
     cs_tc_rx = tcc_rx; cs_tc_tx = tcc_tx; cs_ct_rx = ct_tot_in; cs_ct_tx = ct_tot_out; cs_pk_rx = ct_pk_in; cs_pk_tx = ct_pk_out
     cal_estimate()
 }
