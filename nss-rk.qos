@@ -1,7 +1,7 @@
 ###############################################################################
 # nss-rk.qos - SQM shaper for NSS hardware offload (nsstbl + nssfq_codel)
 # with port based traffic classes (nftables packet marks + DSCP).
-# version 0.9.0 (20260928)
+# version 0.9.1 (20260929)
 #
 # Based on simple.qos / nss.qos by ricsc, modified by rickk
 #   https://github.com/rickkdotnet/sqm-scripts-nss
@@ -258,15 +258,11 @@ nft_setup() {
     BULK_BYTES=$(uci -q get trafficchart.global.bulk_bytes 2>/dev/null)
     case "${BULK_BYTES}" in ''|*[!0-9]*) BULK_BYTES=314572800 ;; esac
 
-    # Ports that are never demoted to BULK, because they are either
-    #  - latency critical and may legitimately run for hours (PRIO, VOIP,
-    #    GAME, STREAM, REMOTE), or
-    #  - identified by port (FTP/SMB/NFS, MAIL, NTP, DB, VPN, MGMT, CONTAINER, IOT):
-    #    a big DB dump should stay visible as DB, not vanish into BULK.
-    # WEB, P2P and the BE catch-all stay subject to BULK on purpose.
-    # NOTE: keep in sync with the class port lists in qos_classify below.
-    local BULK_EXEMPT_TCP_PORTS="{ 37, 42, 53, 22, 23, 49, 88, 389, 464, 636, 853, 2000, 3389, 3478-3480, 5060, 5061, 5500, 5900, 6112-6119, 8801-8810, 9090, 10000, 20, 21, 111, 137, 139, 445, 989, 990, 873, 25, 465, 587, 110, 995, 143, 993, 691, 1433, 1521, 3306, 5432, 27017, 6379, 11211, 1194, 161, 162, 902, 2375, 2376, 6443, 9000, 1883, 8883, 8123 }"
-    local BULK_EXEMPT_UDP_PORTS="{ 37, 42, 53, 67, 68, 123, 443, 546, 547, 3074, 3478-3480, 5060, 5061, 5353, 5355, 6112-6119, 8443, 8801-8810, 27000-27050, 69, 111, 137, 139, 1434, 11211, 51820, 1194, 500, 4500, 1701, 161, 162, 514, 623, 902, 1900, 5683 }"
+    # BULK is class based: only flows already classified WEB (0x4), P2P (0x7)
+    # or BE (0x8) can be demoted (same rule as trafficchart-agg). Every class
+    # that is identified by port/protocol stays what it is, so no port
+    # exemption lists (and no second copy to keep in sync) are needed. It also
+    # covers dynamic ports, e.g. FTP passive data (class 0xc via the helper).
 
     # --- Passive mode FTP via the nf_conntrack_ftp helper (optional) ---
     # The helper announces the negotiated data port as a RELATED conntrack
@@ -334,9 +330,16 @@ nft_setup() {
 "
     fi
 
-    nft delete table inet qos_custom 2>/dev/null
+    # ct bytes (BULK rule) needs conntrack accounting; do not rely on
+    # trafficchart-agg (START=99) having switched it on already
+    [ -w /proc/sys/net/netfilter/nf_conntrack_acct ] && echo 1 > /proc/sys/net/netfilter/nf_conntrack_acct
 
+    # One atomic transaction: add + delete + define. Classification never
+    # disappears between removing the old and loading the new ruleset, and if
+    # loading fails the old table stays in place.
     nft -f - <<EOF
+add table inet qos_custom
+delete table inet qos_custom
 table inet qos_custom {
 ${FTP_HELPER_DECL}
 ${NAT_CHAIN}${MSS_CLAMP_CHAIN}
@@ -372,10 +375,9 @@ ${TTL_RULES}    }
 $(qos_ctrestore)
         meta mark & ${QOS_MASK} == 0x40 return
 
-        # Flows above BULK_BYTES become BULK (0x6) - the restore rule for 0x6
-        # below then sets the DSCP.
-        meta l4proto tcp tcp dport != ${BULK_EXEMPT_TCP_PORTS} tcp sport != ${BULK_EXEMPT_TCP_PORTS} ct bytes > ${BULK_BYTES} $(qos_mset 0x6) $(qos_cset 0x6)
-        meta l4proto udp udp dport != ${BULK_EXEMPT_UDP_PORTS} udp sport != ${BULK_EXEMPT_UDP_PORTS} ct bytes > ${BULK_BYTES} $(qos_mset 0x6) $(qos_cset 0x6)
+        # Flows above BULK_BYTES become BULK (0x6) - only WEB / P2P / BE, the
+        # restore rule for 0x6 below then sets the DSCP.
+        meta l4proto { tcp, udp } meta mark & ${QOS_MASK} == { 0x4, 0x7, 0x8 } ct bytes > ${BULK_BYTES} $(qos_mset 0x6) $(qos_cset 0x6)
 
         # already classified: re-apply DSCP and stop
 $(qos_restore)
@@ -468,6 +470,10 @@ $(qos_finish 0x8)
     }
 }
 EOF
+    if [ $? -ne 0 ]; then
+        sqm_error "nft_setup: loading the nftables ruleset failed - table inet qos_custom unchanged"
+        return 1
+    fi
 
     # reset old marks so every flow is classified again with the new ruleset
     # (conntrack cannot clear just the low byte: this zeroes the whole ct mark)
@@ -543,7 +549,7 @@ egress() {
   # (header added by NSS), so err on the large side: MTU + 18. Set the
   # overhead to 0 or 14 in the SQM config if you do not like that.
   local MTU=$( get_mtu ${IFACE} )
-  [ "${OVERHEAD}" -eq 0 ] && OVERHEAD=18
+  [ "${OVERHEAD:-0}" -eq 0 ] && OVERHEAD=18
   let MTU+=OVERHEAD
 
   [ -z "$ELIMIT" ] && ELIMIT=$(calc_limit ${UPLINK} ${MTU} ${MAXQLIMIT_MS})
@@ -557,7 +563,7 @@ ingress() {
   [ -z "$ITARGET" ] && ITARGET="5ms"
 
   local MTU=$( get_mtu $DEV )
-  [ "${OVERHEAD}" -eq 0 ] && OVERHEAD=18
+  [ "${OVERHEAD:-0}" -eq 0 ] && OVERHEAD=18
   let MTU+=OVERHEAD
 
   [ -z "$ILIMIT" ] && ILIMIT=$(calc_limit ${DOWNLINK} ${MTU} ${MAXQLIMIT_MS})

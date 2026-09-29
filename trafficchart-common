@@ -11,6 +11,8 @@
 #   tc_resolve          # who is shaped, and where
 #   tc_read_counters    # post-shaping byte counters (needs tc_resolve first)
 #   tc_shaper_drops DEV BACKEND   # "<dropped> <ecn> <backlog bytes>" of DEV's qdisc (drops/ECN cumulative, backlog momentary)
+#   tc_dev_stats DEV BACKEND      # "<bytes> <dropped> <ecn> <backlog>" with ONE tc + ONE awk
+#   tc_resolve_cached             # tc_resolve with a cache (cheap enough for every poll)
 #
 # tc_resolve sets:
 #   BACKEND        nss | generic
@@ -70,18 +72,41 @@
 
 SYSNET="${TC_SYSNET:-/sys/class/net}"
 
-# Quote one shell value for the single assignment performed by tc_cfg().
-# The value itself is never interpreted as shell syntax by eval.
-tc_shell_quote() {
-    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
-}
-
-# Read one UCI option when requested by tc_cfg().
-# No UCI output is evaluated as shell code.
+# Index of the options that exist in /etc/config/trafficchart (section global),
+# read ONCE per process with a single "uci show". tc_cfg() then only forks
+# "uci get" for options that are really set (before: 2-3 uci forks plus tr/sed
+# for EVERY call, also for the many options that are not set at all).
 tc_load_config() {
     [ -n "$TC_CFG_LOADED" ] && return 0
     TC_CFG_LOADED=1
+    TC_UCI_KEYS=" "
     command -v uci >/dev/null 2>&1 || return 0
+    local dump line k
+    dump=$(uci -q show trafficchart.global 2>/dev/null)
+    while IFS= read -r line; do
+        case "$line" in
+            trafficchart.global.*=*)
+                k="${line#trafficchart.global.}"; k="${k%%=*}"
+                TC_UCI_KEYS="${TC_UCI_KEYS}${k} " ;;
+        esac
+    done <<TC_EOF
+$dump
+TC_EOF
+}
+
+# lower case of $1 without forking (result in TC_LC)
+tc_lc() {
+    local s="$1" out="" c
+    while [ -n "$s" ]; do
+        c="${s%"${s#?}"}"; s="${s#?}"
+        case "$c" in
+            A) c=a;; B) c=b;; C) c=c;; D) c=d;; E) c=e;; F) c=f;; G) c=g;; H) c=h;; I) c=i;;
+            J) c=j;; K) c=k;; L) c=l;; M) c=m;; N) c=n;; O) c=o;; P) c=p;; Q) c=q;; R) c=r;;
+            S) c=s;; T) c=t;; U) c=u;; V) c=v;; W) c=w;; X) c=x;; Y) c=y;; Z) c=z;;
+        esac
+        out="${out}${c}"
+    done
+    TC_LC="$out"
 }
 
 tc_cfg_valid() {
@@ -100,7 +125,7 @@ tc_cfg_valid() {
 }
 
 tc_cfg() {
-    local var="$1" def="$2" type="$3" key isset val qval
+    local var="$1" def="$2" type="$3" key val
 
     case "$var" in
         ''|*[!A-Za-z0-9_]*)
@@ -108,79 +133,23 @@ tc_cfg() {
             ;;
     esac
 
-    # Keep explicitly supplied environment variables unchanged.
-    case "$var" in
-        PROFILE)            [ -n "${PROFILE+x}" ] && return 0 ;;
-        INTERVAL)           [ -n "${INTERVAL+x}" ] && return 0 ;;
-        ADAPT_INTERVAL)     [ -n "${ADAPT_INTERVAL+x}" ] && return 0 ;;
-        INTERVAL_MAX)       [ -n "${INTERVAL_MAX+x}" ] && return 0 ;;
-        ADAPT_BUDGET)       [ -n "${ADAPT_BUDGET+x}" ] && return 0 ;;
-        TOOLTIP_EVERY)      [ -n "${TOOLTIP_EVERY+x}" ] && return 0 ;;
-        HOSTS_REFRESH_SEC)  [ -n "${HOSTS_REFRESH_SEC+x}" ] && return 0 ;;
-        GUA_REFRESH_SEC)    [ -n "${GUA_REFRESH_SEC+x}" ] && return 0 ;;
-        RATE_WIN)           [ -n "${RATE_WIN+x}" ] && return 0 ;;
-        BULK_BYTES)         [ -n "${BULK_BYTES+x}" ] && return 0 ;;
-        HIST_SEC)           [ -n "${HIST_SEC+x}" ] && return 0 ;;
-        HIST_KEEP)          [ -n "${HIST_KEEP+x}" ] && return 0 ;;
-        HIST_HOUR_KEEP)     [ -n "${HIST_HOUR_KEEP+x}" ] && return 0 ;;
-        HIST_DAY_KEEP)      [ -n "${HIST_DAY_KEEP+x}" ] && return 0 ;;
-        PERSIST_DIR)        [ -n "${PERSIST_DIR+x}" ] && return 0 ;;
-        PERSIST_MOUNT)      [ -n "${PERSIST_MOUNT+x}" ] && return 0 ;;
-        PERSIST_SEC)        [ -n "${PERSIST_SEC+x}" ] && return 0 ;;
-        PERSIST_TIMEOUT)    [ -n "${PERSIST_TIMEOUT+x}" ] && return 0 ;;
-        HOST_MAX)           [ -n "${HOST_MAX+x}" ] && return 0 ;;
-        APP_HOLD)           [ -n "${APP_HOLD+x}" ] && return 0 ;;
-        APP_MAX)            [ -n "${APP_MAX+x}" ] && return 0 ;;
-        MX_MAX)             [ -n "${MX_MAX+x}" ] && return 0 ;;
-        PAIR_MAX)           [ -n "${PAIR_MAX+x}" ] && return 0 ;;
-        TBL_IDLE_LONG)      [ -n "${TBL_IDLE_LONG+x}" ] && return 0 ;;
-        TBL_IDLE_SHORT)     [ -n "${TBL_IDLE_SHORT+x}" ] && return 0 ;;
-        BIRTH_MAX)          [ -n "${BIRTH_MAX+x}" ] && return 0 ;;
-        GONE_GRACE)         [ -n "${GONE_GRACE+x}" ] && return 0 ;;
-        L2_OVERHEAD)        [ -n "${L2_OVERHEAD+x}" ] && return 0 ;;
-        L2_INIT)            [ -n "${L2_INIT+x}" ] && return 0 ;;
-        L2_CANDIDATES)      [ -n "${L2_CANDIDATES+x}" ] && return 0 ;;
-        CAL_WIN)            [ -n "${CAL_WIN+x}" ] && return 0 ;;
-        CAL_KEEP)           [ -n "${CAL_KEEP+x}" ] && return 0 ;;
-        CAL_MIN)            [ -n "${CAL_MIN+x}" ] && return 0 ;;
-        CAL_PCTL)           [ -n "${CAL_PCTL+x}" ] && return 0 ;;
-        CAL_MAX_PKT)        [ -n "${CAL_MAX_PKT+x}" ] && return 0 ;;
-        CAL_MIN_PKTS)       [ -n "${CAL_MIN_PKTS+x}" ] && return 0 ;;
-        CAL_TOL)            [ -n "${CAL_TOL+x}" ] && return 0 ;;
-        UN_WIN)             [ -n "${UN_WIN+x}" ] && return 0 ;;
-        UN_WIN_RX)          [ -n "${UN_WIN_RX+x}" ] && return 0 ;;
-        UN_WIN_LONG)        [ -n "${UN_WIN_LONG+x}" ] && return 0 ;;
-        TOOLTIPS)           [ -n "${TOOLTIPS+x}" ] && return 0 ;;
-        TC_STATS)           [ -n "${TC_STATS+x}" ] && return 0 ;;
-        ATTR_TOTALS)        [ -n "${ATTR_TOTALS+x}" ] && return 0 ;;
-        ATTR_TOPAPPS)       [ -n "${ATTR_TOPAPPS+x}" ] && return 0 ;;
-        ATTR_PORTS)         [ -n "${ATTR_PORTS+x}" ] && return 0 ;;
-        ATTR_SKIP_PORTS)    [ -n "${ATTR_SKIP_PORTS+x}" ] && return 0 ;;
-        ATTR_WIN)           [ -n "${ATTR_WIN+x}" ] && return 0 ;;
-        ATTR_TOL)           [ -n "${ATTR_TOL+x}" ] && return 0 ;;
-        ATTR_MIN)           [ -n "${ATTR_MIN+x}" ] && return 0 ;;
-        ATTR_SHARE)         [ -n "${ATTR_SHARE+x}" ] && return 0 ;;
-        ATTR_MAX_APPS)      [ -n "${ATTR_MAX_APPS+x}" ] && return 0 ;;
-        ATTR_MAX_DEVICES)   [ -n "${ATTR_MAX_DEVICES+x}" ] && return 0 ;;
-        AGG_MAX_AGE)        [ -n "${AGG_MAX_AGE+x}" ] && return 0 ;;
-        CACHE_TTL_SEC)      [ -n "${CACHE_TTL_SEC+x}" ] && return 0 ;;
-    esac
+    # Keep explicitly supplied environment variables unchanged (any variable,
+    # the name was validated above, so the eval only sees [A-Za-z0-9_]).
+    eval "[ -n \"\${$var+x}\" ]" && return 0
 
     tc_load_config
-    key=$(echo "$var" | tr 'A-Z' 'a-z')
-    val=$(uci -q get "trafficchart.global.$key" 2>/dev/null)
-
-    if [ -n "$val" ] || uci -q get "trafficchart.global.$key" >/dev/null 2>&1; then
-        if tc_cfg_valid "$key" "$type" "$val"; then
-            qval=$(tc_shell_quote "$val")
-            eval "$var=$qval"
-            return 0
-        fi
-        logger -t trafficchart "config: invalid value '$val' for option $key - using default '$def'" 2>/dev/null
-    fi
-
-    qval=$(tc_shell_quote "$def")
-    eval "$var=$qval"
+    tc_lc "$var"; key="$TC_LC"
+    case "$TC_UCI_KEYS" in
+        *" $key "*)
+            val=$(uci -q get "trafficchart.global.$key" 2>/dev/null)
+            if tc_cfg_valid "$key" "$type" "$val"; then
+                eval "$var=\$val"      # value is data, never parsed as shell
+                return 0
+            fi
+            logger -t trafficchart "config: invalid value '$val' for option $key - using default '$def'" 2>/dev/null
+            ;;
+    esac
+    eval "$var=\$def"
 }
 
 tc_detect_backend() {
@@ -247,13 +216,14 @@ tc_qdisc_bytes() {
 #   generic  first qdisc is the root (cake, or htb); if there are fq_codel
 #            leaves (htb+fq_codel), their dropped/ecn are summed - cake reports
 #            drops on its own root line instead, so that is used as a fallback
-# Prints "<dropped> <ecn>", both 0 if the device/qdisc could not be read.
+# Prints "<dropped> <ecn> <backlog bytes>"; prints nothing if the device does not exist.
 # Shared by luci.trafficchart (live shaper panel) and trafficchart-tc (feeds
 # trafficchart-agg, which turns the cumulative numbers into per-bucket deltas
 # for the History tab - see hist_close() there).
 tc_shaper_drops() {
     local dev="$1" backend="$2"
-    [ -n "$dev" ] && [ -e "$SYSNET/${dev}" ] || { echo "0 0 0"; return; }
+    # device missing: print nothing (callers treat that as "not readable")
+    [ -n "$dev" ] && [ -e "$SYSNET/${dev}" ] || return 1
     tc -s qdisc show dev "$dev" 2>/dev/null | awk -v BACKEND="$backend" '
         function num(v,   n, u) {
             n = v + 0; u = v; sub(/^[0-9.]+/, "", u)
@@ -290,6 +260,53 @@ tc_shaper_drops() {
                 B = bl[1] + 0
             }
             printf "%d %d %.0f\n", D + 0, E + 0, B + 0
+        }'
+}
+
+# Everything the aggregator needs from ONE device with ONE "tc -s qdisc show"
+# and ONE awk (before: tc_qdisc_bytes and tc_shaper_drops each ran their own):
+#   "<bytes> <dropped> <ecn> <backlog bytes>"
+# <bytes> = Sent bytes of the root qdisc, or "-" if it cannot be used (noqueue
+# always reports 0: the caller falls back to the sysfs counters). Drops / ECN /
+# backlog follow the same rules as tc_shaper_drops. Prints nothing if the
+# device does not exist.
+tc_dev_stats() {
+    local dev="$1" backend="$2"
+    [ -n "$dev" ] && [ -e "$SYSNET/${dev}" ] || return 1
+    tc -s qdisc show dev "$dev" 2>/dev/null | awk -v BACKEND="$backend" '
+        function num(v,   n, u) {
+            n = v + 0; u = v; sub(/^[0-9.]+/, "", u)
+            if (u ~ /^K/) n *= 1024; else if (u ~ /^M/) n *= 1048576; else if (u ~ /^G/) n *= 1073741824
+            return n
+        }
+        /^qdisc / { q++; nm[q] = $2; next }
+        /^ *backlog / { bl[q] = num($2); next }
+        /^[ \t]*marks[ \t]+[0-9]+/ { ecn[q] += $2 + 0; next }
+        /^ *Sent / {
+            if (!(q in sent)) sent[q] = $2
+            l = $0; gsub(/[(),]/, " ", l); n = split(l, f, " ")
+            for (i = 1; i <= n; i++) if (f[i] == "dropped") dr[q] = f[i + 1] + 0
+            next
+        }
+        /maxpacket/ {
+            for (i = 1; i < NF; i++) if ($i == "ecn_mark") ecn[q] = $(i + 1) + 0
+            next
+        }
+        END {
+            bytes = "-"
+            if (q >= 1 && nm[1] != "noqueue" && (1 in sent) && sent[1] ~ /^[0-9]+$/) bytes = sent[1]
+            D = 0; E = 0; B = 0
+            if (BACKEND == "nss") {
+                for (i = 1; i <= q; i++) if (nm[i] == "nssfq_codel") { D = dr[i]; E = ecn[i] }
+                if (!D) for (i = 1; i <= q; i++) if (nm[i] == "nsstbl") D = dr[i]
+                for (i = 1; i <= q; i++) if (nm[i] == "nssfq_codel" || nm[i] == "nsstbl") B += bl[i]
+            } else {
+                for (i = 1; i <= q; i++) if (nm[i] ~ /fq_codel$/) { D += dr[i]; E += ecn[i] }
+                if (!D && q >= 1) D = dr[1] + 0
+                if (!E && q >= 1) E = ecn[1] + 0
+                B = bl[1] + 0
+            }
+            printf "%s %.0f %.0f %.0f\n", bytes, D + 0, E + 0, B + 0
         }'
 }
 
@@ -384,7 +401,11 @@ tc_register_wan() {
     # very different links in a multi-WAN setup (e.g. "1100/120" hides a
     # 100/20 and a 1000/100 WAN). tc_wan_json() below turns this back into a
     # per-WAN breakdown for the page to optionally show.
-    WAN_INFO="${WAN_INFO}$(printf '%s\t%s\t%s\t%s\t%s\n' "$iface" "$tx" "$rxdev" "$upload" "$download")"
+    # NOTE: $(...) strips a trailing newline, so the separator is added by hand
+    # (before: with 2+ queues all rows were glued into one line and
+    # tc_wan_json() always printed "[]").
+    WAN_INFO="${WAN_INFO:+$WAN_INFO
+}$(printf '%s\t%s\t%s\t%s\t%s' "$iface" "$tx" "$rxdev" "$upload" "$download")"
 }
 
 # config_foreach callback: every enabled sqm-scripts queue counts (multi-WAN)
@@ -517,6 +538,63 @@ tc_resolve() {
         QTXT="tc qdisc"
         SYSNOTE=""
     fi
+}
+
+# tc_resolve() with a cache, for callers that run every few seconds
+# (trafficchart-tc, once per aggregator poll). tc_resolve costs 10-15 forks
+# (config_load, uci, sed, ubus, jsonfilter ...) for a result that practically
+# never changes. The result (BACKEND RX_DEVS TX_DEVS RX_RAW TC_FALLBACK) is kept
+# in $TC_CACHE and reused while
+#   - it is younger than TC_CACHE_TTL seconds (60; 10 while a configured ingress
+#     device does not exist yet, 5 while nothing was found at all),
+#   - none of the config files in TC_CFG_FILES is newer than it,
+#   - every device in it still exists.
+# Everything is checked with shell builtins (no fork on a hit). Sets the same
+# variables as tc_resolve, except WAN_INFO / FOUND_* / QTXT / SYSNOTE / TC_DIAG
+# (not needed there - use tc_resolve when you need those).
+tc_resolve_cached() {
+    local now up ttl f d ok=1 tmp
+    TC_CACHE="${TC_CACHE:-${OUT_DIR:-${TC_OUT_DIR:-/tmp/trafficchart}}/tcdevs}"
+    up=""; read up _ 2>/dev/null < /proc/uptime
+    now="${up%.*}"
+    case "$now" in ''|*[!0-9]*) now=0 ;; esac
+
+    if [ "$now" -gt 0 ] && [ -r "$TC_CACHE" ]; then
+        C_UP=""; C_BACKEND=""; C_RX_DEVS=""; C_TX_DEVS=""; C_RX_RAW=""; C_FALLBACK=""
+        . "$TC_CACHE" 2>/dev/null
+        ttl="${TC_CACHE_TTL:-60}"
+        [ -n "$C_RX_RAW" ] && [ "$C_FALLBACK" != "1" ] && ttl=10
+        [ -z "$C_RX_DEVS$C_TX_DEVS" ] && ttl=5
+        case "$C_UP" in
+            ''|*[!0-9]*) ok=0 ;;
+            *) { [ "$now" -ge "$C_UP" ] && [ $((now - C_UP)) -lt "$ttl" ]; } || ok=0 ;;
+        esac
+        [ -n "$C_BACKEND" ] || ok=0
+        if [ "$ok" = 1 ]; then
+            for f in ${TC_CFG_FILES:-/etc/config/sqm /etc/config/qosmate /etc/config/trafficchart}; do
+                if [ "$f" -nt "$TC_CACHE" ]; then ok=0; break; fi
+            done
+        fi
+        if [ "$ok" = 1 ]; then
+            for d in $C_RX_DEVS $C_TX_DEVS $C_RX_RAW; do
+                [ -e "$SYSNET/$d" ] || { ok=0; break; }
+            done
+        fi
+        if [ "$ok" = 1 ]; then
+            BACKEND="$C_BACKEND"; RX_DEVS="$C_RX_DEVS"; TX_DEVS="$C_TX_DEVS"
+            RX_RAW="$C_RX_RAW"; TC_FALLBACK="$C_FALLBACK"
+            return 0
+        fi
+    fi
+
+    tc_resolve
+    [ "$now" -gt 0 ] || return 0
+    case "$BACKEND$RX_DEVS$TX_DEVS$RX_RAW" in *\'*) return 0 ;; esac
+    tmp="$TC_CACHE.$$"
+    { printf "C_UP='%s'\nC_BACKEND='%s'\nC_RX_DEVS='%s'\nC_TX_DEVS='%s'\nC_RX_RAW='%s'\nC_FALLBACK='%s'\n" \
+        "$now" "$BACKEND" "$RX_DEVS" "$TX_DEVS" "$RX_RAW" "$TC_FALLBACK" > "$tmp"; } 2>/dev/null \
+        && mv -f "$tmp" "$TC_CACHE" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    return 0
 }
 
 # sums over all devices of each direction -> RX_BYTES/RX_SOURCE, TX_BYTES/TX_SOURCE

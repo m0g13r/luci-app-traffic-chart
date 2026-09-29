@@ -177,6 +177,13 @@ case "$1" in
             [ "$LOCKED" = "1" ] && flock -u 9 2>/dev/null
             exit 0
         fi
+        # The daemon stretches its poll interval under load (up to interval_max,
+        # 20-30 s in the low-cpu profiles), so a fixed 10 s limit reported a
+        # healthy daemon as stale. Allow at least two current intervals + 5 s.
+        AGG_IV=$(sed -n 's/.*"load":{[^}]*"interval":\([0-9][0-9]*\),.*/\1/p' "$AGG_FILE" 2>/dev/null | head -n1)
+        case "$AGG_IV" in ''|*[!0-9]*) AGG_IV=0 ;; esac
+        AGG_MIN_AGE=$((2 * AGG_IV + 5))
+        [ "$AGG_MAX_AGE" -ge "$AGG_MIN_AGE" ] || AGG_MAX_AGE=$AGG_MIN_AGE
         agg_epoch=$(date -r "$AGG_FILE" +%s 2>/dev/null)
         if [ -z "$agg_epoch" ] || [ $(( $(date +%s) - agg_epoch )) -gt "$AGG_MAX_AGE" ]; then
             echo '{"error": "aggregator data stale - /etc/init.d/trafficchart restart"}'

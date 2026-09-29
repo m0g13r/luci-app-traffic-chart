@@ -47,11 +47,15 @@ if [ "$V6_RERESOLVE" = "1" ] && [ -s "$UNRESOLVED_FILE" ]; then
         PING6="ping -6 -c1 -W1 -q"
     fi
     if [ -n "$PING6" ]; then
-        awk -v max="$UNRESOLVED_MAX" '!seen[$0]++ { print; if (++n >= max) exit }' "$UNRESOLVED_FILE" | while IFS= read -r addr; do
-            [ -n "$addr" ] || continue
-            $PING6 "$addr" >/dev/null 2>&1 &
-        done
-        wait
+        # the jobs live in the subshell of the pipeline, so the wait has to be
+        # in that same subshell (a wait after the pipeline waits for nothing)
+        awk -v max="$UNRESOLVED_MAX" '!seen[$0]++ { print; if (++n >= max) exit }' "$UNRESOLVED_FILE" | {
+            while IFS= read -r addr; do
+                [ -n "$addr" ] || continue
+                $PING6 "$addr" >/dev/null 2>&1 &
+            done
+            wait
+        }
     fi
 fi
 
