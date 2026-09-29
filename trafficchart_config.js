@@ -234,6 +234,11 @@ return view.extend({
         o.datatype = 'uinteger';
         o.placeholder = '200';
 
+        o = s.option(form.Value, 'row_keep', _('Rows listed individually'),
+            _('Devices and destinations listed individually in the live data (the most active and the biggest this many each); the rest is summed as "(other)". Smaller = less data per page poll. 0 = list everything.'));
+        o.datatype = 'uinteger';
+        o.placeholder = '40';
+
         o = s.option(form.Value, 'sock', _('netifyd socket'), _('Path of the netifyd JSON socket.'));
         o.placeholder = '/var/run/netifyd/netifyd.sock';
         o.depends('apps', '1');

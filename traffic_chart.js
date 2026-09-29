@@ -577,6 +577,7 @@ return view.extend({
             function(e) { return (e.top && e.top.length) ? e.top : null; }, _('Top destinations'));
         var devicesView = makeSlotView(MAX_ROWS - 1, _('Devices'),
             function(key, e) {
+                if (key === '(other)' && e.count) return _('Other (%d devices)').format(e.count);
                 var nm = e.name || key;
                 if (e.ip && e.ip !== nm) nm += ' (' + e.ip + ')';
                 return nm;
@@ -589,7 +590,7 @@ return view.extend({
                 return t.length ? t : null;
             }, _('Top applications'));
         var hostsView = makeSlotView(MAX_ROWS - 1, _('Destinations'),
-            function(name) { return name; },
+            function(name, e) { return (name === '(other)' && e && e.count) ? _('Other (%d destinations)').format(e.count) : name; },
             function(n) { return _('Other (%d destinations)').format(n); },
             function(e) { return (e.top && e.top.length) ? e.top : null; }, _('Top devices'));
         var slotViews = [ appsView, devicesView, hostsView ];
@@ -1730,6 +1731,18 @@ return view.extend({
         }
 
         var lastData = null;
+        // Only the visible one of the three live views (applications / devices /
+        // destinations) is rendered; the others catch up when their tab is opened.
+        var activeTab = 0;
+        function renderTab(idx) {
+            var d = lastData;
+            if (!d || idx > 2 || !d.rate) return;
+            var ri = d.rate;
+            var ifr = ri.tc ? { rx: ri.rx_bps || 0, tx: ri.tx_bps || 0 } : null;
+            var dn = d.sqm ? (d.sqm.download_kbit || 0) : 0, up = d.sqm ? (d.sqm.upload_kbit || 0) : 0;
+            var v = [ appsView, devicesView, hostsView ][idx], items = [ d.apps, d.devices, d.hosts ][idx];
+            if (items) v.render(items, ifr, dn, up, d.iface, baselineLabelText(), ri);
+        }
         function stamp() {
             var d = new Date(), p = function(n) { return (n < 10 ? '0' : '') + n; };
             return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes());
@@ -1835,6 +1848,8 @@ return view.extend({
                 slotViews.forEach(function(sv) { sv.panelIn.clearPinned(); sv.panelOut.clearPinned(); });
                 groups.forEach(function(g, i) { g.style.display = (i === idx) ? '' : 'none'; });
                 tabBtns.forEach(function(li, i) { li.className = (i === idx) ? 'cbi-tab' : 'cbi-tab-disabled'; });
+                activeTab = idx;
+                renderTab(idx);
                 histView.active = (idx === 4);
                 if (idx === 4) histView.load();
                 if (btnJson) exportTitles();
@@ -1921,7 +1936,19 @@ return view.extend({
         var tabHidden = (typeof document.hidden === 'boolean') ? document.hidden : false;
         document.addEventListener('visibilitychange', function() { tabHidden = document.hidden; });
 
-        poll.add(function() {
+        // The daemon only produces new data every load.interval seconds (4-20 s in the
+        // low-cpu profiles): poll at half of that instead of a fixed 2 s.
+        var pollSec = 2;
+        function adaptPoll(data) {
+            var iv = (data && data.load && data.load.interval) || 0;
+            var want = Math.max(2, Math.min(10, Math.ceil(iv / 2)));
+            if (want === pollSec) return;
+            pollSec = want;
+            // not inside the running poll iteration
+            setTimeout(function() { poll.remove(pollFn); poll.add(pollFn, pollSec); }, 0);
+        }
+
+        var pollFn = function() {
             if (tabHidden) return Promise.resolve();
             if (pollInFlight) return Promise.resolve();
             pollInFlight = true;
@@ -1993,11 +2020,10 @@ return view.extend({
 
                 var baselineLabel = baselineLabelText();
 
-                if (data.apps) appsView.render(data.apps, ifaceRate, sqmDownloadKbit, sqmUploadKbit, data.iface, baselineLabel, rateInfo);
-                if (data.devices) devicesView.render(data.devices, ifaceRate, sqmDownloadKbit, sqmUploadKbit, data.iface, baselineLabel, rateInfo);
-                if (data.hosts) hostsView.render(data.hosts, ifaceRate, sqmDownloadKbit, sqmUploadKbit, data.iface, baselineLabel, rateInfo);
+                renderTab(activeTab);
 
                 haveRenderedOnce = true;
+                adaptPoll(data);
             }).catch(function(err) {
                 clearTimeout(hardTimer);
                 var stale = (pollRequestId !== myPollId);
@@ -2008,7 +2034,8 @@ return view.extend({
                 }
                 throw err;
             });
-        }, 2);
+        };
+        poll.add(pollFn, pollSec);
 
         return m;
     },

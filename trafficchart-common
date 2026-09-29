@@ -11,7 +11,9 @@
 #   tc_resolve          # who is shaped, and where
 #   tc_read_counters    # post-shaping byte counters (needs tc_resolve first)
 #   tc_shaper_drops DEV BACKEND   # "<dropped> <ecn> <backlog bytes>" of DEV's qdisc (drops/ECN cumulative, backlog momentary)
-#   tc_dev_stats DEV BACKEND      # "<bytes> <dropped> <ecn> <backlog>" with ONE tc + ONE awk
+#   tc_dev_stats DEV BACKEND [KBIT]  # "<bytes> <dropped> <ecn> <backlog> <shaper json>" with ONE tc + ONE awk
+#   tc_marking_cached             # MARKING=true|false (nft table qos_custom loaded), 15 s cache
+#   tc_build_frag                 # FRAG = the JSON members luci.trafficchart used to build per request
 #   tc_resolve_cached             # tc_resolve with a cache (cheap enough for every poll)
 #
 # tc_resolve sets:
@@ -264,50 +266,143 @@ tc_shaper_drops() {
 }
 
 # Everything the aggregator needs from ONE device with ONE "tc -s qdisc show"
-# and ONE awk (before: tc_qdisc_bytes and tc_shaper_drops each ran their own):
-#   "<bytes> <dropped> <ecn> <backlog bytes>"
+# and ONE awk:
+#   "<bytes> <dropped> <ecn> <backlog bytes> <shaper json>"
 # <bytes> = Sent bytes of the root qdisc, or "-" if it cannot be used (noqueue
 # always reports 0: the caller falls back to the sysfs counters). Drops / ECN /
-# backlog follow the same rules as tc_shaper_drops. Prints nothing if the
-# device does not exist.
+# backlog follow the same rules as tc_shaper_drops. <shaper json> is the object
+# the page shows in its shaper line (nsstbl + nssfq_codel for BACKEND nss, the
+# stock shaper otherwise; "{}" if the device has no such qdisc); it never
+# contains a blank, so the line splits into exactly 5 words. $3 = configured SQM
+# rate in kbit, shown when a stock qdisc does not report one (htb keeps its
+# rate in a class). Prints nothing if the device does not exist.
 tc_dev_stats() {
-    local dev="$1" backend="$2"
+    local dev="$1" backend="$2" cfg="${3:-0}"
     [ -n "$dev" ] && [ -e "$SYSNET/${dev}" ] || return 1
-    tc -s qdisc show dev "$dev" 2>/dev/null | awk -v BACKEND="$backend" '
+    tc -s qdisc show dev "$dev" 2>/dev/null | awk -v BACKEND="$backend" -v CFG="$cfg" '
         function num(v,   n, u) {
             n = v + 0; u = v; sub(/^[0-9.]+/, "", u)
             if (u ~ /^K/) n *= 1024; else if (u ~ /^M/) n *= 1048576; else if (u ~ /^G/) n *= 1073741824
             return n
         }
-        /^qdisc / { q++; nm[q] = $2; next }
-        /^ *backlog / { bl[q] = num($2); next }
-        /^[ \t]*marks[ \t]+[0-9]+/ { ecn[q] += $2 + 0; next }
+        /^qdisc / {
+            q++; nm[q] = $2
+            for (i = 1; i <= NF; i++) {
+                if ($i == "bandwidth" && bw == "") bw = $(i + 1)
+                if ($i == "rate" && nm[q] == "nsstbl") rtok[q] = $(i + 1)
+                if ($i == "target") tg[q] = $(i + 1)
+                if ($i == "limit") lm[q] = $(i + 1)
+                if ($i == "flows") fl[q] = $(i + 1)
+            }
+            next
+        }
+        /^ *backlog / { blb[q] = num($2); blp[q] = num($3); next }
+        # cake has no single top-level ECN counter like fq_codels "ecn_mark"
+        # field - it only reports marks per traffic class (tin), as a bare
+        # "marks N" line, so without this a cake root always showed 0 ECN marks.
+        /^[ \t]*marks[ \t]+[0-9]+/ { se[q] += $2 + 0; next }
         /^ *Sent / {
-            if (!(q in sent)) sent[q] = $2
             l = $0; gsub(/[(),]/, " ", l); n = split(l, f, " ")
-            for (i = 1; i <= n; i++) if (f[i] == "dropped") dr[q] = f[i + 1] + 0
+            for (i = 1; i <= n; i++) {
+                if (f[i] == "Sent" && !(q in sent)) { sent[q] = f[i + 1]; pk[q] = f[i + 3] }
+                if (f[i] == "dropped") { dr[q] = f[i + 1] + 0; hasdr[q] = 1 }
+                if (f[i] == "overlimits") ov[q] = f[i + 1]
+            }
             next
         }
         /maxpacket/ {
-            for (i = 1; i < NF; i++) if ($i == "ecn_mark") ecn[q] = $(i + 1) + 0
+            for (i = 1; i < NF; i++) {
+                if ($i == "maxpacket") { mp[q] = $(i + 1); gmp = $(i + 1) }
+                if ($i == "drop_overlimit") { dol[q] = $(i + 1); gdol = $(i + 1) }
+                if ($i == "new_flow_count") { nfc[q] = $(i + 1); gnfc = $(i + 1) }
+                if ($i == "ecn_mark") { se[q] = $(i + 1) + 0; ecnt[q] = $(i + 1); gecn = $(i + 1) }
+            }
             next
         }
+        /new_flows_len/ { nfl[q] = $2; ofl[q] = $4; gnfl = $2; gofl = $4 }
         END {
             bytes = "-"
             if (q >= 1 && nm[1] != "noqueue" && (1 in sent) && sent[1] ~ /^[0-9]+$/) bytes = sent[1]
+
+            # ---- drops / ecn / backlog (same rules as tc_shaper_drops)
             D = 0; E = 0; B = 0
             if (BACKEND == "nss") {
-                for (i = 1; i <= q; i++) if (nm[i] == "nssfq_codel") { D = dr[i]; E = ecn[i] }
+                for (i = 1; i <= q; i++) if (nm[i] == "nssfq_codel") { D = dr[i]; E = se[i] }
                 if (!D) for (i = 1; i <= q; i++) if (nm[i] == "nsstbl") D = dr[i]
-                for (i = 1; i <= q; i++) if (nm[i] == "nssfq_codel" || nm[i] == "nsstbl") B += bl[i]
+                for (i = 1; i <= q; i++) if (nm[i] == "nssfq_codel" || nm[i] == "nsstbl") B += blb[i]
             } else {
-                for (i = 1; i <= q; i++) if (nm[i] ~ /fq_codel$/) { D += dr[i]; E += ecn[i] }
+                for (i = 1; i <= q; i++) if (nm[i] ~ /fq_codel$/) { D += dr[i]; E += se[i] }
                 if (!D && q >= 1) D = dr[1] + 0
-                if (!E && q >= 1) E = ecn[1] + 0
-                B = bl[1] + 0
+                if (!E && q >= 1) E = se[1] + 0
+                B = blb[1] + 0
             }
-            printf "%s %.0f %.0f %.0f\n", bytes, D + 0, E + 0, B + 0
+
+            # ---- shaper json (the live shaper line of the page)
+            json = "{}"
+            if (BACKEND == "nss") {
+                qt = 0; qf = 0
+                for (i = 1; i <= q; i++) { if (nm[i] == "nsstbl") qt = i; if (nm[i] == "nssfq_codel") qf = i }
+                if (qt > 0 && (qt in sent)) {
+                    json = sprintf("{\"rate\":\"%s\",\"target\":\"%s\",\"limit\":\"%s\",\"flows\":%d,", rtok[qt], tg[qf], lm[qf], fl[qf] + 0)
+                    json = json sprintf("\"sent\":%.0f,\"pkts\":%.0f,\"dropped\":%.0f,\"overlimits\":%.0f,", sent[qt], pk[qt], (qf > 0 && (qf in hasdr)) ? dr[qf] : dr[qt], ov[qt])
+                    json = json sprintf("\"backlog_b\":%.0f,\"backlog_p\":%.0f,\"ecn\":%.0f,\"drop_overlimit\":%.0f,", blb[qf] + blb[qt], blp[qf] + blp[qt], gecn + 0, gdol + 0)
+                    json = json sprintf("\"new_flow_count\":%.0f,\"flows_new\":%d,\"flows_old\":%d,\"maxpacket\":%d}", gnfc + 0, gnfl + 0, gofl + 0, gmp + 0)
+                }
+            } else if (q >= 1 && (1 in sent)) {
+                lf = 0; Dj = 0; Ej = 0; Oj = 0; Nj = 0; FN = 0; FO = 0; M = 0
+                for (i = 1; i <= q; i++) if (nm[i] ~ /fq_codel$/) {
+                    if (!lf) lf = i
+                    Dj += dr[i]; Ej += ecnt[i]; Oj += dol[i]; Nj += nfc[i]; FN += nfl[i]; FO += ofl[i]
+                    if (mp[i] + 0 > M) M = mp[i] + 0
+                }
+                if (!lf) { lf = 1; Dj = dr[1] }
+                rate = bw
+                if (rate == "" && CFG + 0 > 0) rate = (CFG >= 1000) ? sprintf("%gMbit", CFG / 1000) : sprintf("%dkbit", CFG)
+                json = sprintf("{\"rate\":\"%s\",\"target\":\"%s\",\"limit\":\"%s\",\"flows\":%d,", rate, tg[lf], lm[lf], fl[lf] + 0)
+                json = json sprintf("\"sent\":%.0f,\"pkts\":%.0f,\"dropped\":%.0f,\"overlimits\":%.0f,", sent[1], pk[1], Dj, ov[1])
+                json = json sprintf("\"backlog_b\":%.0f,\"backlog_p\":%.0f,\"ecn\":%.0f,\"drop_overlimit\":%.0f,", blb[1], blp[1], Ej, Oj)
+                json = json sprintf("\"new_flow_count\":%.0f,\"flows_new\":%d,\"flows_old\":%d,\"maxpacket\":%d}", Nj, FN, FO, M)
+            }
+            gsub(/[ \t]/, "", json)
+            printf "%s %.0f %.0f %.0f %s\n", bytes, D + 0, E + 0, B + 0, json
         }'
+}
+
+# "marking": is the nftables classifier table (nss-rk.qos) loaded? Cached for
+# 15 s in $OUT_DIR/tcmark (one "nft list" fork per refresh instead of per
+# request). Sets MARKING to true / false.
+tc_marking_cached() {
+    local up now f M_UP M_VAL
+    f="${TC_MARK_CACHE:-${OUT_DIR:-${TC_OUT_DIR:-/tmp/trafficchart}}/tcmark}"
+    up=""; read up _ 2>/dev/null < /proc/uptime
+    now="${up%.*}"
+    case "$now" in ''|*[!0-9]*) now=0 ;; esac
+    if [ "$now" -gt 0 ] && [ -r "$f" ]; then
+        M_UP=""; M_VAL=""
+        . "$f" 2>/dev/null
+        case "$M_UP" in
+            ''|*[!0-9]*) ;;
+            *) if [ "$now" -ge "$M_UP" ] && [ $((now - M_UP)) -lt 15 ]; then
+                   case "$M_VAL" in true|false) MARKING="$M_VAL"; return 0 ;; esac
+               fi ;;
+        esac
+    fi
+    if nft list table inet qos_custom >/dev/null 2>&1; then MARKING=true; else MARKING=false; fi
+    [ "$now" -gt 0 ] && printf "M_UP='%s'\nM_VAL='%s'\n" "$now" "$MARKING" > "$f" 2>/dev/null
+    return 0
+}
+
+# Everything the page needs besides the traffic numbers, as ONE JSON fragment
+# (no enclosing braces) in FRAG. Written by trafficchart-tc (second output line,
+# picked up by trafficchart-agg and stored in classes.json), so
+# luci.trafficchart does not have to run any tc/nft/uci at all.
+# Input: TC_DIAG BACKEND MARKING IFACE_NAME RX_BYTES TX_BYTES RX_SOURCE TX_SOURCE
+#        SHAPER_RX SHAPER_TX FOUND_UPLOAD FOUND_DOWNLOAD WAN_JSON
+tc_build_frag() {
+    [ -n "$SHAPER_RX" ] || SHAPER_RX='{}'
+    [ -n "$SHAPER_TX" ] || SHAPER_TX='{}'
+    [ -n "$WAN_JSON" ] || WAN_JSON='[]'
+    FRAG="\"tc_diag\":\"${TC_DIAG}\",\"backend\":\"${BACKEND}\",\"marking\":${MARKING:-false},\"iface\":{\"name\":\"${IFACE_NAME}\",\"rx_bytes\":${RX_BYTES:-0},\"tx_bytes\":${TX_BYTES:-0},\"rx_source\":\"${RX_SOURCE}\",\"tx_source\":\"${TX_SOURCE}\"},\"shaper\":{\"rx\":${SHAPER_RX},\"tx\":${SHAPER_TX}},\"sqm\":{\"upload_kbit\":${FOUND_UPLOAD:-0},\"download_kbit\":${FOUND_DOWNLOAD:-0}},\"wan\":${WAN_JSON}"
 }
 
 # list helpers: tc_in_list "<list>" item / tc_push LISTVAR item (no duplicates)
@@ -543,25 +638,27 @@ tc_resolve() {
 # tc_resolve() with a cache, for callers that run every few seconds
 # (trafficchart-tc, once per aggregator poll). tc_resolve costs 10-15 forks
 # (config_load, uci, sed, ubus, jsonfilter ...) for a result that practically
-# never changes. The result (BACKEND RX_DEVS TX_DEVS RX_RAW TC_FALLBACK) is kept
-# in $TC_CACHE and reused while
+# never changes. The result is kept in $TC_CACHE and reused while
 #   - it is younger than TC_CACHE_TTL seconds (60; 10 while a configured ingress
 #     device does not exist yet, 5 while nothing was found at all),
 #   - none of the config files in TC_CFG_FILES is newer than it,
 #   - every device in it still exists.
 # Everything is checked with shell builtins (no fork on a hit). Sets the same
-# variables as tc_resolve, except WAN_INFO / FOUND_* / QTXT / SYSNOTE / TC_DIAG
-# (not needed there - use tc_resolve when you need those).
+# variables as tc_resolve (BACKEND IFACE_LIST FOUND_IFACE FOUND_UPLOAD
+# FOUND_DOWNLOAD TX_DEVS RX_DEVS RX_RAW TC_DIAG TC_FALLBACK RX_DEV TX_IFACE
+# WAN_INFO QTXT SYSNOTE) plus NWAN, the number of configured queues.
 tc_resolve_cached() {
-    local now up ttl f d ok=1 tmp
+    local now up ttl f d ok=1 tmp t
     TC_CACHE="${TC_CACHE:-${OUT_DIR:-${TC_OUT_DIR:-/tmp/trafficchart}}/tcdevs}"
     up=""; read up _ 2>/dev/null < /proc/uptime
     now="${up%.*}"
     case "$now" in ''|*[!0-9]*) now=0 ;; esac
 
     if [ "$now" -gt 0 ] && [ -r "$TC_CACHE" ]; then
-        C_UP=""; C_BACKEND=""; C_RX_DEVS=""; C_TX_DEVS=""; C_RX_RAW=""; C_FALLBACK=""
+        C_V=""; C_UP=""; C_BACKEND=""; C_RX_DEVS=""; C_TX_DEVS=""; C_RX_RAW=""; C_FALLBACK=""
+        C_IFACE_LIST=""; C_FOUND_UPLOAD=""; C_FOUND_DOWNLOAD=""; C_TC_DIAG=""; C_NWAN=""; C_WAN_INFO=""
         . "$TC_CACHE" 2>/dev/null
+        [ "$C_V" = "2" ] || ok=0
         ttl="${TC_CACHE_TTL:-60}"
         [ -n "$C_RX_RAW" ] && [ "$C_FALLBACK" != "1" ] && ttl=10
         [ -z "$C_RX_DEVS$C_TX_DEVS" ] && ttl=5
@@ -583,18 +680,48 @@ tc_resolve_cached() {
         if [ "$ok" = 1 ]; then
             BACKEND="$C_BACKEND"; RX_DEVS="$C_RX_DEVS"; TX_DEVS="$C_TX_DEVS"
             RX_RAW="$C_RX_RAW"; TC_FALLBACK="$C_FALLBACK"
+            IFACE_LIST="$C_IFACE_LIST"; FOUND_IFACE="${C_IFACE_LIST%% *}"
+            FOUND_UPLOAD="$C_FOUND_UPLOAD"; FOUND_DOWNLOAD="$C_FOUND_DOWNLOAD"
+            TC_DIAG="$C_TC_DIAG"; NWAN="$C_NWAN"; WAN_INFO="$C_WAN_INFO"
+            RX_DEV="${RX_DEVS%% *}"; TX_IFACE="${TX_DEVS%% *}"
+            tc_set_qtxt
             return 0
         fi
     fi
 
     tc_resolve
+    NWAN=0
+    if [ -n "$WAN_INFO" ]; then
+        NWAN=1; t="$WAN_INFO"
+        while :; do
+            case "$t" in
+                *"
+"*) NWAN=$((NWAN + 1)); t="${t#*
+}" ;;
+                *) break ;;
+            esac
+        done
+    fi
     [ "$now" -gt 0 ] || return 0
-    case "$BACKEND$RX_DEVS$TX_DEVS$RX_RAW" in *\'*) return 0 ;; esac
+    case "$BACKEND$RX_DEVS$TX_DEVS$RX_RAW$IFACE_LIST$TC_DIAG$WAN_INFO" in *\'*) return 0 ;; esac
     tmp="$TC_CACHE.$$"
-    { printf "C_UP='%s'\nC_BACKEND='%s'\nC_RX_DEVS='%s'\nC_TX_DEVS='%s'\nC_RX_RAW='%s'\nC_FALLBACK='%s'\n" \
-        "$now" "$BACKEND" "$RX_DEVS" "$TX_DEVS" "$RX_RAW" "$TC_FALLBACK" > "$tmp"; } 2>/dev/null \
+    { printf "C_V='2'\nC_UP='%s'\nC_BACKEND='%s'\nC_RX_DEVS='%s'\nC_TX_DEVS='%s'\nC_RX_RAW='%s'\nC_FALLBACK='%s'\n" \
+        "$now" "$BACKEND" "$RX_DEVS" "$TX_DEVS" "$RX_RAW" "$TC_FALLBACK" > "$tmp"
+      printf "C_IFACE_LIST='%s'\nC_FOUND_UPLOAD='%s'\nC_FOUND_DOWNLOAD='%s'\nC_TC_DIAG='%s'\nC_NWAN='%s'\nC_WAN_INFO='%s'\n" \
+        "$IFACE_LIST" "$FOUND_UPLOAD" "$FOUND_DOWNLOAD" "$TC_DIAG" "$NWAN" "$WAN_INFO" >> "$tmp"; } 2>/dev/null \
         && mv -f "$tmp" "$TC_CACHE" 2>/dev/null || rm -f "$tmp" 2>/dev/null
     return 0
+}
+
+# wording for the counter source strings (the end of tc_resolve, for the cache)
+tc_set_qtxt() {
+    if [ "$BACKEND" = "nss" ]; then
+        QTXT="tc qdisc, hw stats"
+        SYSNOTE=", unreliable under NSS offload"
+    else
+        QTXT="tc qdisc"
+        SYSNOTE=""
+    fi
 }
 
 # sums over all devices of each direction -> RX_BYTES/RX_SOURCE, TX_BYTES/TX_SOURCE

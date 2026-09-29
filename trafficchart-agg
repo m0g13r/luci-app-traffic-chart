@@ -208,7 +208,7 @@
 # ADAPT_INTERVAL INTERVAL_MAX ADAPT_BUDGET TOOLTIP_EVERY HOSTS_REFRESH_SEC GUA_REFRESH_SEC
 # L2_OVERHEAD L2_INIT L2_CANDIDATES CAL_WIN CAL_KEEP CAL_MIN CAL_PCTL CAL_TOL CAL_MAX_PKT
 # CAL_MIN_PKTS UN_WIN UN_WIN_RX UN_WIN_LONG APP_MAX MX_MAX PAIR_MAX TBL_IDLE_LONG TBL_IDLE_SHORT
-# TC_HELPER RATE_WIN PERSIST_DIR PERSIST_MOUNT PERSIST_SEC PERSIST_TIMEOUT HIST_HOUR_KEEP HIST_DAY_KEEP
+# TC_HELPER ROW_KEEP RATE_WIN PERSIST_DIR PERSIST_MOUNT PERSIST_SEC PERSIST_TIMEOUT HIST_HOUR_KEEP HIST_DAY_KEEP
 # HOUR_SEC DAY_SEC (tier lengths, testing only) TC_COMMON HOST_MAX
 #
 # Every variable can also be set in /etc/config/trafficchart (option = variable name in
@@ -286,6 +286,7 @@ if [ -r "$TC_COMMON" ]; then
     tc_cfg UN_WIN_LONG 300 int      # 0 = off (allowed)
     tc_cfg TOOLTIPS 1 int
     tc_cfg TC_STATS 1 int
+    tc_cfg ROW_KEEP 40 int          # 0 = off: devices/destinations listed individually in the live JSON, the rest is folded into "(other)"
     tc_cfg ATTR_TOTALS 1 int;         tc_cfg ATTR_TOPAPPS 0 int;       tc_cfg ATTR_PORTS "" list
     tc_cfg ATTR_SKIP_PORTS "22 53 67 68 80 123 443 853 5353 5355" list
     tc_cfg ATTR_WIN 60 int;           tc_cfg ATTR_TOL 0.6 num;         tc_cfg ATTR_MIN 262144 int
@@ -439,7 +440,7 @@ $AWK -v CT_FILE="$CT_FILE" -v OUT="$OUT_DIR" -v INTERVAL="$INTERVAL" \
     -v MAPFILE="$OUT_DIR/apps.map" -v HOSTS_HELPER="$HOSTS_HELPER" \
     -v HIST_SEC="$HIST_SEC" -v HIST_KEEP="$HIST_KEEP" -v ATTR_WIN="$ATTR_WIN" -v BIRTH_MAX="$BIRTH_MAX" -v GONE_GRACE="$GONE_GRACE" \
     -v ADAPT_INTERVAL="$ADAPT_INTERVAL" -v INTERVAL_MAX="$INTERVAL_MAX" -v ADAPT_BUDGET="$ADAPT_BUDGET" -v TOOLTIP_EVERY="$TOOLTIP_EVERY" -v HOSTS_REFRESH_SEC="$HOSTS_REFRESH_SEC" -v GUA_REFRESH_SEC="$GUA_REFRESH_SEC" \
-    -v TOOLTIPS="$TOOLTIPS" \
+    -v TOOLTIPS="$TOOLTIPS" -v ROW_KEEP="$ROW_KEEP" \
     -v RATE_WIN="$RATE_WIN" -v UN_WIN="$UN_WIN" -v TC_HELPER="$TC_HELPER" -v ATTR_TOL="$ATTR_TOL" -v ATTR_TOPAPPS="$ATTR_TOPAPPS" -v ATTR_TOTALS="$ATTR_TOTALS" -v ATTR_SKIP_PORTS="$ATTR_SKIP_PORTS" -v ATTR_PORTS="$ATTR_PORTS" -v ATTR_MIN="$ATTR_MIN" -v ATTR_SHARE="$ATTR_SHARE" -v ATTR_MAX_APPS="$ATTR_MAX_APPS" -v ATTR_MAX_DEVICES="$ATTR_MAX_DEVICES" -v L2_OVERHEAD="$L2_OVERHEAD" -v L2_INIT="$L2_INIT" -v L2_CANDIDATES="$L2_CANDIDATES" -v CAL_TOL="$CAL_TOL" -v CAL_WIN="$CAL_WIN" -v CAL_KEEP="$CAL_KEEP" -v CAL_MIN="$CAL_MIN" -v CAL_PCTL="$CAL_PCTL" -v CAL_MAX_PKT="$CAL_MAX_PKT" -v CAL_MIN_PKTS="$CAL_MIN_PKTS" \
     -v HOST_MAX="$HOST_MAX" -v UN_WIN_RX="$UN_WIN_RX" -v UN_WIN_LONG="$UN_WIN_LONG" -v APP_MAX="$APP_MAX" -v MX_MAX="$MX_MAX" -v PAIR_MAX="$PAIR_MAX" -v TBL_IDLE_LONG="$TBL_IDLE_LONG" -v TBL_IDLE_SHORT="$TBL_IDLE_SHORT" -v MAPVER="$OUT_DIR/apps.map.ver" '
 # "LAN-side" / non-WAN address? (RFC1918, loopback, link-local, multicast,
@@ -1357,8 +1358,9 @@ function rates_update(now,   slot, full, ot, k) {
 # that sample. The drop/ECN fields are optional (older/custom TC_HELPER
 # builds may only print two fields) - shd_rx/she_rx/shd_tx/she_tx simply stay
 # 0 and the history just carries no "sh" data, get_stats keeps working.
-function tc_update(   l, f, rx, tx, rxd, rxe, txd, txe, rxb, txb, T, tnow, dx, dy, dd, de, slot, full, ot, orx, otx, ok) {
+function tc_update(   l, f, fr, rx, tx, rxd, rxe, txd, txe, rxb, txb, T, tnow, dx, dy, dd, de, slot, full, ot, orx, otx, ok) {
     ok = 0; l = ""; rxd = -1; rxe = -1; txd = -1; txe = -1; rxb = -1; txb = -1
+    tcfrag = ""      # JSON members for the page (2nd helper line); empty = luci.trafficchart computes them itself
     if (TC_HELPER != "") {
         if ((TC_HELPER | getline l) > 0) {
             split(l, f, " ")
@@ -1370,6 +1372,8 @@ function tc_update(   l, f, rx, tx, rxd, rxe, txd, txe, rxb, txb, T, tnow, dx, d
                 if (f[6] ~ /^[0-9]+$/) txe = f[6] + 0
                 if (f[7] ~ /^[0-9]+$/) rxb = f[7] + 0
                 if (f[8] ~ /^[0-9]+$/) txb = f[8] + 0
+                fr = ""
+                if ((TC_HELPER | getline fr) > 0 && fr ~ /^"tc_diag":"/ && fr !~ /[\t]/) tcfrag = fr
             }
         }
         close(TC_HELPER)
@@ -1875,8 +1879,26 @@ function jcnt(ib, ip_, ob, op_) {
     return sprintf("\"in_bytes\":%.0f,\"in_packets\":%.0f,\"out_bytes\":%.0f,\"out_packets\":%.0f", ib + 0, ip_ + 0, ob + 0, op_ + 0)
 }
 
+# Live JSON size: the page shows at most ~22 rows per view, so only the ROW_KEEP most
+# active (by current rate) and the ROW_KEEP biggest (by volume) devices / destinations are
+# listed individually; everything else is summed into one "(other)" entry with a "count".
+# Rates and byte counts are additive, so the sums stay exact. History and totals are not
+# affected (they use the full tables). ROW_KEEP = 0 disables folding.
+function row_keep(t, seen, bi, bo, keep,   k, c, i, sc) {
+    c = 0
+    for (k in seen) c++
+    if (ROW_KEEP <= 0 || c <= ROW_KEEP + 5) { for (k in seen) keep[k] = 1; return }
+    split("", ktsc); split("", ktky); ktn = 0
+    for (k in seen) { sc = rt_in[t SUBSEP k] + rt_out[t SUBSEP k]; if (sc > 0) kt_ins(k, sc, ROW_KEEP) }
+    for (i = 1; i <= ktn; i++) keep[ktky[i]] = 1
+    split("", ktsc); split("", ktky); ktn = 0
+    for (k in seen) kt_ins(k, bi[k] + bo[k], ROW_KEEP)
+    for (i = 1; i <= ktn; i++) keep[ktky[i]] = 1
+}
+
 function emit(t,   s, tmp, a, first, k, nm, i, j, sc, nt, tsc, tky, pd, tot, n2, kp, dp, rem, ap, hh, tooltip_due, tooltip_period) {
-    s = "{\"since\":" since ",\"up\":" sprintf("%.2f", t) ",\"flows\":" nflows "," rate_json() "," load_json() "," persist_json() ",\"apps\":{"
+    tmp = OUT "/classes.json.tmp"
+    printf "%s", ("{\"since\":" since ",\"up\":" sprintf("%.2f", t) ",\"flows\":" nflows "," rate_json() "," load_json() "," persist_json() ",\"apps\":{") > tmp
     # tooltip data: top 10 destinations per application, top 10 devices per
     # destination - only for the 30 biggest of each (that is all the page shows)
     tooltip_period = (mxcnt > 6000 || npair > 3000) ? 10 : ((mxcnt > 2000 || npair > 1000) ? 5 : 1)
@@ -1908,29 +1930,50 @@ function emit(t,   s, tmp, a, first, k, nm, i, j, sc, nt, tsc, tky, pd, tot, n2,
         tooltip_last = n
     }
 
+    split("", keepD); split("", keepH)
+    row_keep("d", dseen, dib, dob, keepD)
+    row_keep("h", hseen, hib, hob, keepH)
+
     first = 1
     for (a in aseen) {
-        s = s sprintf("%s\"%s\":{%s%s%s}", (first ? "" : ","), a, jcnt(aib[a], aip[a], aob[a], aop[a]), jrate("a", a), ((a in keepa) ? top_json("a", a, 0) : ""))
+        printf "%s\"%s\":{%s%s%s}", (first ? "" : ","), a, jcnt(aib[a], aip[a], aob[a], aop[a]), jrate("a", a), ((a in keepa) ? top_json("a", a, 0) : "") > tmp
         first = 0
     }
 
-    s = s "},\"devices\":{"
+    printf "%s", "},\"devices\":{" > tmp
     first = 1
+    xo_n = 0; xo_ib = 0; xo_ob = 0; xo_ip = 0; xo_op = 0; xo_ri = 0; xo_ro = 0; xo_vi = 0; xo_vo = 0
     for (k in dseen) {
-        s = s sprintf("%s\"%s\":{\"name\":\"%s\",\"ip\":\"%s\",%s%s,\"via_in\":%.0f,\"via_out\":%.0f,\"top\":[", (first ? "" : ","), k, dev_label(k), ((k in dvip) ? dvip[k] : ""), \
-                      jcnt(dib[k], dipk[k], dob[k], dopk[k]), jrate("d", k), dvi[k] + 0, dvo[k] + 0)
+        if (k == "(other)" || !(k in keepD)) {
+            xo_n++; xo_ib += dib[k]; xo_ob += dob[k]; xo_ip += dipk[k]; xo_op += dopk[k]
+            xo_ri += rt_in["d" SUBSEP k]; xo_ro += rt_out["d" SUBSEP k]; xo_vi += dvi[k]; xo_vo += dvo[k]
+            continue
+        }
+        printf "%s\"%s\":{\"name\":\"%s\",\"ip\":\"%s\",%s%s,\"via_in\":%.0f,\"via_out\":%.0f,\"top\":[", (first ? "" : ","), k, dev_label(k), ((k in dvip) ? dvip[k] : ""), \
+                      jcnt(dib[k], dipk[k], dob[k], dopk[k]), jrate("d", k), dvi[k] + 0, dvo[k] + 0 > tmp
         for (j = 1; j <= tdn[k]; j++)
-            s = s sprintf("%s[\"%s\",%.0f,%.0f]", (j > 1 ? "," : ""), tda[k, j], tdi[k, j], tdo[k, j])
-        s = s "]}"
+            printf "%s[\"%s\",%.0f,%.0f]", (j > 1 ? "," : ""), tda[k, j], tdi[k, j], tdo[k, j] > tmp
+        printf "%s", "]}" > tmp
         first = 0
     }
+    if (xo_n > 0)
+        printf "%s\"(other)\":{\"name\":\"(other)\",\"ip\":\"\",\"count\":%d,%s,\"in_bps\":%.0f,\"out_bps\":%.0f,\"via_in\":%.0f,\"via_out\":%.0f,\"top\":[]}", \
+               (first ? "" : ","), xo_n, jcnt(xo_ib, xo_ip, xo_ob, xo_op), xo_ri, xo_ro, xo_vi, xo_vo > tmp
 
-    s = s "},\"hosts\":{"
+    printf "%s", "},\"hosts\":{" > tmp
     first = 1
+    xo_n = 0; xo_ib = 0; xo_ob = 0; xo_ip = 0; xo_op = 0; xo_ri = 0; xo_ro = 0
     for (k in hseen) {
-        s = s sprintf("%s\"%s\":{%s%s%s}", (first ? "" : ","), k, jcnt(hib[k], hip[k], hob[k], hop[k]), jrate("h", k), ((k in keeph) ? top_json("h", k, 1) : ""))
+        if (k == "(other)" || !(k in keepH)) {
+            xo_n++; xo_ib += hib[k]; xo_ob += hob[k]; xo_ip += hip[k]; xo_op += hop[k]
+            xo_ri += rt_in["h" SUBSEP k]; xo_ro += rt_out["h" SUBSEP k]
+            continue
+        }
+        printf "%s\"%s\":{%s%s%s}", (first ? "" : ","), k, jcnt(hib[k], hip[k], hob[k], hop[k]), jrate("h", k), ((k in keeph) ? top_json("h", k, 1) : "") > tmp
         first = 0
     }
+    if (xo_n > 0)
+        printf "%s\"(other)\":{\"count\":%d,%s,\"in_bps\":%.0f,\"out_bps\":%.0f}", (first ? "" : ","), xo_n, jcnt(xo_ib, xo_ip, xo_ob, xo_op), xo_ri, xo_ro > tmp
 
     # 25 busiest flows by smoothed rate
     nt = 0
@@ -1943,7 +1986,7 @@ function emit(t,   s, tmp, a, first, k, nm, i, j, sc, nt, tsc, tky, pd, tot, n2,
             tsc[i] = sc; tky[i] = k
         }
     }
-    s = s "},\"top_flows\":["
+    printf "%s", "},\"top_flows\":[" > tmp
     for (i = 1; i <= nt; i++) {
         k = tky[i]
         split(k, kp, "|")
@@ -1954,12 +1997,12 @@ function emit(t,   s, tmp, a, first, k, nm, i, j, sc, nt, tsc, tky, pd, tot, n2,
         gsub(/["\\]/, "_", ap)
         hh = ((k in lhost) && lhost[k] != "") ? lhost[k] : ""
         gsub(/[^A-Za-z0-9._:-]/, "_", hh)
-        s = s sprintf("%s{\"dev\":\"%s\",\"ip\":\"%s\",\"app\":\"%s\",\"host\":\"%s\",\"dst\":\"%s\",\"port\":\"%s\",\"proto\":\"%s\",\"class\":\"%s\",\"in_bps\":%.0f,\"out_bps\":%.0f,\"bytes\":%.0f}", \
-                      (i > 1 ? "," : ""), dev_label(fdev[k]), ((fdev[k] in dvip) ? dvip[fdev[k]] : ""), ap, hh, rem, dp, kp[1], cname[fcls[k]], fei[k], feo[k], ftot[k])
+        printf "%s{\"dev\":\"%s\",\"ip\":\"%s\",\"app\":\"%s\",\"host\":\"%s\",\"dst\":\"%s\",\"port\":\"%s\",\"proto\":\"%s\",\"class\":\"%s\",\"in_bps\":%.0f,\"out_bps\":%.0f,\"bytes\":%.0f}", \
+                      (i > 1 ? "," : ""), dev_label(fdev[k]), ((fdev[k] in dvip) ? dvip[fdev[k]] : ""), ap, hh, rem, dp, kp[1], cname[fcls[k]], fei[k], feo[k], ftot[k] > tmp
     }
-    s = s "]}"
-    tmp = OUT "/classes.json.tmp"
-    print s > tmp
+    printf "%s", "]" > tmp
+    if (tcfrag != "") printf ",%s", tcfrag > tmp
+    printf "%s\n", "}" > tmp
     close(tmp)
     system("mv -f " tmp " " OUT "/classes.json")
 }
@@ -2020,7 +2063,7 @@ BEGIN {
     IDLE_MIN_P = int(TBL_IDLE_SHORT / 5 / INTERVAL) + 2   # last resort: idle for about 2 minutes
     HOST_MAX += 0; if (HOST_MAX < 20) HOST_MAX = 20
     TBL_LOG_POLLS = int(3600 / INTERVAL) + 1
-    TOOLTIPS += 0
+    TOOLTIPS += 0; ROW_KEEP += 0
     ATTR_MIN += 0; ATTR_SHARE += 0; ATTR_TOL += 0; ATTR_TOPAPPS += 0; ATTR_TOTALS += 0
     ATTR_MAX_APPS += 0; ATTR_MAX_DEVICES += 0
     nskip = split(ATTR_SKIP_PORTS, skipl, " ")

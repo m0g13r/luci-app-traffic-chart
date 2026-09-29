@@ -1,7 +1,7 @@
 ###############################################################################
 # nss-rk.qos - SQM shaper for NSS hardware offload (nsstbl + nssfq_codel)
 # with port based traffic classes (nftables packet marks + DSCP).
-# version 0.9.1 (20260929)
+# version 0.9.2 (20260929)
 #
 # Based on simple.qos / nss.qos by ricsc, modified by rickk
 #   https://github.com/rickkdotnet/sqm-scripts-nss
@@ -173,15 +173,25 @@ calc_limit() {
 # as of 2026-09-27, not just "should be".
 QOS_DSCP="1:ef 2:af41 3:cs4 4:af21 5:af21 6:cs1 7:cs0 8:cs0 9:af31 a:af11 b:cs2 c:cs1 d:af21 e:af21 f:cs2 10:cs0 11:af21"
 
-# DSCP of a class mark ($1, e.g. 0x4)
-qos_dscp() {
-    local e
+# Rules of chain qos_dscp: one rule per distinct DSCP and IP family, the class
+# marks that share a DSCP are grouped in a set (generated from QOS_DSCP).
+qos_dscp_rules() {
+    local e d x list seen=""
     for e in ${QOS_DSCP}; do
-        [ "0x${e%%:*}" = "$1" ] && { echo "${e#*:}"; return; }
+        d="${e#*:}"
+        case " ${seen} " in *" ${d} "*) continue ;; esac
+        seen="${seen} ${d}"
+        list=""
+        for x in ${QOS_DSCP}; do
+            [ "${x#*:}" = "${d}" ] && list="${list:+${list}, }0x${x%%:*}"
+        done
+        echo "        meta mark & ${QOS_MASK} == { ${list} } meta nfproto ipv4 ip dscp set ${d}"
+        echo "        meta mark & ${QOS_MASK} == { ${list} } meta nfproto ipv6 ip6 dscp set ${d}"
     done
 }
 
-# Flows that already carry a class mark: only re-apply the DSCP.
+# Flows that already carry a class mark: take it over from conntrack. One rule per
+# class with a constant: nft/the kernel cannot OR two register values.
 qos_ctrestore() {
     local e m
     for e in ${QOS_DSCP}; do
@@ -190,30 +200,21 @@ qos_ctrestore() {
     done
 }
 
+# Already classified packet: re-apply the DSCP and stop.
 qos_restore() {
-    local e m d
-    for e in ${QOS_DSCP}; do
-        m="0x${e%%:*}"; d="${e#*:}"
-        echo "meta mark & ${QOS_MASK} == ${m} meta nfproto ipv4 ip dscp set ${d}"
-        echo "meta mark & ${QOS_MASK} == ${m} meta nfproto ipv6 ip6 dscp set ${d}"
-        echo "meta mark & ${QOS_MASK} == ${m} return"
-    done
+    echo "meta mark & ${QOS_MASK} == 0x1-0x11 jump qos_dscp"
+    echo "meta mark & ${QOS_MASK} == 0x1-0x11 return"
 }
 
-# End of a class ($1 = class mark): DSCP, remember the class in conntrack, done.
-qos_finish() {
-    local d="$(qos_dscp "$1")"
-    echo "meta mark & ${QOS_MASK} == $1 meta nfproto ipv4 ip dscp set ${d}"
-    echo "meta mark & ${QOS_MASK} == $1 meta nfproto ipv6 ip6 dscp set ${d}"
-    echo "meta mark & ${QOS_MASK} == $1 $(qos_cset $1)"
-    echo "meta mark & ${QOS_MASK} == $1 return"
-}
+# Classify: set packet + connection mark, then goto qos_dscp (DSCP). The first
+# matching rule wins, the order of the rules IS the priority.
+qos_set() { echo "$(qos_mset $1) $(qos_cset $1) goto qos_dscp"; }
 
 # Mark traffic of protocol $1 (tcp/udp) with class $3 if source OR destination
 # port is in the set $2.
 qos_ports() {
-    echo "$1 dport $2 $(qos_mset $3)"
-    echo "$1 sport $2 $(qos_mset $3)"
+    echo "$1 dport $2 $(qos_set $3)"
+    echo "$1 sport $2 $(qos_set $3)"
 }
 
 nft_setup() {
@@ -280,7 +281,7 @@ nft_setup() {
 "
         FTP_HELPER_SET="tcp dport 21 ct helper set \"ftp_helper\"
         tcp sport 21 ct helper set \"ftp_helper\""
-        FTP_HELPER_MATCH="ct helper \"ftp_helper\" $(qos_mset 0xc)"
+        FTP_HELPER_MATCH="ct helper \"ftp_helper\" $(qos_set 0xc)"
     else
         sqm_debug "nft_setup: nf_conntrack_ftp helper not loaded, passive-mode FTP data will fall through to BE"
     fi
@@ -337,12 +338,19 @@ nft_setup() {
     # One atomic transaction: add + delete + define. Classification never
     # disappears between removing the old and loading the new ruleset, and if
     # loading fails the old table stays in place.
-    nft -f - <<EOF
+    QOS_NFT_FILE=/tmp/nss-rk-qos.nft
+    cat > "${QOS_NFT_FILE}" <<EOF
 add table inet qos_custom
 delete table inet qos_custom
 table inet qos_custom {
 ${FTP_HELPER_DECL}
 ${NAT_CHAIN}${MSS_CLAMP_CHAIN}
+    # class mark -> DSCP (reached by goto/jump; when it ends, evaluation continues
+    # after the jump to qos_classify)
+    chain qos_dscp {
+$(qos_dscp_rules)
+    }
+
     chain prerouting_mangle {
         type filter hook prerouting priority mangle; policy accept;
         iifname { ${IFSET} } meta mark & ${QOS_MASK} == 0x00 jump qos_classify
@@ -367,9 +375,9 @@ ${TTL_RULES}    }
         oifname { ${IFSET} } meta mark & ${QOS_MASK} == 0x00 $(qos_mset 0x40)
     }
 
-    # Shared by both directions. Every class is a block of "set the mark"
-    # rules followed by DSCP + connmark + return, so the first class that
-    # matches wins - the order of the blocks IS the priority.
+    # Shared by both directions. Every rule sets the class mark (packet + conntrack)
+    # and goes to qos_dscp, so the first rule that matches wins - the
+    # order of the blocks IS the priority.
     chain qos_classify {
         # restore the class of an already classified flow; 0x40 = router traffic
 $(qos_ctrestore)
@@ -384,37 +392,31 @@ $(qos_restore)
 
         # 0x1 PRIO: ICMP, DNS (udp: dport only, tcp: both), DoT, DHCP/DHCPv6, legacy nameserver, mDNS, LLMNR
         # (DoH is plain HTTPS on 443 and cannot be told apart without DPI)
-        ip protocol icmp $(qos_mset 0x1)
-        ip6 nexthdr icmpv6 $(qos_mset 0x1)
-        udp dport { 53, 67, 68, 546, 547, 42, 5353, 5355 } $(qos_mset 0x1)
-        udp sport { 67, 68, 546, 547, 42, 5353, 5355 } $(qos_mset 0x1)
+        ip protocol icmp $(qos_set 0x1)
+        ip6 nexthdr icmpv6 $(qos_set 0x1)
+        udp dport { 53, 67, 68, 546, 547, 42, 5353, 5355 } $(qos_set 0x1)
+        udp sport { 67, 68, 546, 547, 42, 5353, 5355 } $(qos_set 0x1)
 $(qos_ports tcp "{ 53, 853, 42 }" 0x1)
-$(qos_finish 0x1)
 
         # 0x2 VOIP: SIP, STUN/TURN, Zoom RTP, Cisco SCCP. The generic udp
         # 10000-20000 range is NOT used: too many false positives (IPTV, WebRTC, games).
 $(qos_ports udp "{ 3478, 3479, 5060, 5061, 8801-8810 }" 0x2)
 $(qos_ports tcp "{ 5060, 5061, 8801-8810, 2000 }" 0x2)
-$(qos_finish 0x2)
 
         # 0x3 GAME: Xbox, PSN, Steam, Battle.net
 $(qos_ports udp "{ 3074, 3478-3480, 27000-27050, 6112-6119 }" 0x3)
 $(qos_ports tcp "{ 3478-3480, 6112-6119 }" 0x3)
-$(qos_finish 0x3)
 
         # 0x9 VPN: WireGuard, OpenVPN, IPsec/IKEv2, L2TP
 $(qos_ports udp "{ 51820, 1194, 500, 4500, 1701 }" 0x9)
 $(qos_ports tcp 1194 0x9)
-$(qos_finish 0x9)
 
         # 0xa MAIL: SMTP/IMAP/POP3 (+TLS), Exchange routing engine
 $(qos_ports tcp "{ 25, 465, 587, 110, 995, 143, 993, 691 }" 0xa)
-$(qos_finish 0xa)
 
         # 0xb NTP: NTP + legacy time protocol
 $(qos_ports udp "{ 123, 37 }" 0xb)
 $(qos_ports tcp 37 0xb)
-$(qos_finish 0xb)
 
         # 0xc FTP: FTP (+ passive data if the helper is loaded), TFTP, rpcbind/NFS,
         # NetBIOS, SMB, FTPS, rsync
@@ -422,56 +424,47 @@ $(qos_finish 0xb)
 $(qos_ports tcp "{ 20, 21, 111, 137, 139, 445, 989, 990, 873 }" 0xc)
         ${FTP_HELPER_MATCH}
 $(qos_ports udp "{ 69, 111, 137, 139 }" 0xc)
-$(qos_finish 0xc)
 
         # 0xd REMOTE: interactive admin sessions and auth - SSH, RDP, VNC,
         # Telnet, TACACS, Kerberos, LDAP(S), Webmin, Cockpit
 $(qos_ports tcp "{ 22, 3389, 5900, 23, 49, 88, 389, 464, 636, 5500, 10000, 9090 }" 0xd)
 $(qos_ports udp "{ 49, 88, 389, 464, 636 }" 0xd)
-$(qos_finish 0xd)
 
         # 0xe DB: MSSQL, Oracle, MySQL, PostgreSQL, MongoDB, Redis, Memcached
         # (1434/udp = MSSQL Browser)
 $(qos_ports tcp "{ 1433, 1521, 3306, 5432, 27017, 6379, 11211 }" 0xe)
 $(qos_ports udp "{ 1434, 11211 }" 0xe)
-$(qos_finish 0xe)
 
         # 0xf MGMT: passive monitoring - SNMP, syslog, IPMI, VMware
 $(qos_ports tcp "{ 161, 162, 902 }" 0xf)
 $(qos_ports udp "{ 161, 162, 514, 623, 902 }" 0xf)
-$(qos_finish 0xf)
 
         # 0x5 STREAM: QUIC on 443/8443 - the only way into STREAM. Other HTTP/3
         # ports cannot be caught without DPI.
 $(qos_ports udp "{ 443, 8443 }" 0x5)
-$(qos_finish 0x5)
 
         # 0x7 P2P: BitTorrent typical ports
 $(qos_ports udp "{ 6881-6999, 51413, 6969 }" 0x7)
 $(qos_ports tcp "{ 6881-6999, 51413, 6969 }" 0x7)
-$(qos_finish 0x7)
 
         # 0x4 WEB: HTTP/HTTPS (+ alt ports 8080/8443)
 $(qos_ports tcp "{ 80, 443, 8080, 8443 }" 0x4)
-$(qos_finish 0x4)
 
         # 0x10 CONTAINER: Docker API, Kubernetes API, Portainer
 $(qos_ports tcp "{ 2375, 2376, 6443, 9000 }" 0x10)
-$(qos_finish 0x10)
 
         # 0x11 IOT: MQTT, Home Assistant, SSDP/UPnP, CoAP
 $(qos_ports tcp "{ 1883, 8883, 8123 }" 0x11)
 $(qos_ports udp "{ 1900, 5683 }" 0x11)
-$(qos_finish 0x11)
 
         # 0x8 BE: everything else
-        meta mark & ${QOS_MASK} == 0x00 $(qos_mset 0x8)
-$(qos_finish 0x8)
+        meta mark & ${QOS_MASK} == 0x00 $(qos_set 0x8)
     }
 }
 EOF
+    nft -f "${QOS_NFT_FILE}"
     if [ $? -ne 0 ]; then
-        sqm_error "nft_setup: loading the nftables ruleset failed - table inet qos_custom unchanged"
+        sqm_error "nft_setup: loading the nftables ruleset failed (see ${QOS_NFT_FILE}, check with: nft -c -f ${QOS_NFT_FILE}) - table inet qos_custom unchanged"
         return 1
     fi
 

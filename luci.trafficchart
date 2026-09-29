@@ -97,6 +97,43 @@ case "$1" in
                 ;;
         esac
 
+        # --- Fast path: everything is already in classes.json ---
+        #
+        # trafficchart-agg stores the shaper / iface / sqm / wan / marking parts
+        # (tc_diag ... wan, computed once per poll by trafficchart-tc) in
+        # classes.json itself, so this script only has to serve that file - no
+        # tc, nft, uci or awk per request. Freshness is judged from the daemon's
+        # own uptime stamp ("up") against /proc/uptime, without forking. If the
+        # file has no such parts (tc_stats off, helper missing) or looks stale,
+        # the slow path below computes everything itself, as before.
+        tc_cfg AGG_MAX_AGE 10 int
+        if [ -r "$AGG_FILE" ]; then
+            AGG_JSON=$(cat "$AGG_FILE" 2>/dev/null)
+            case "$AGG_JSON" in
+                *'"tc_diag":"'*)
+                    K_UP='"up":'; K_LOAD='"load":{'; K_IV='"interval":'
+                    fp_t="${AGG_JSON#*"$K_UP"}"; fp_t="${fp_t%%,*}"; fp_t="${fp_t%.*}"
+                    fp_iv="${AGG_JSON#*"$K_LOAD"}"; fp_iv="${fp_iv#*"$K_IV"}"; fp_iv="${fp_iv%%,*}"
+                    case "$fp_iv" in ''|*[!0-9]*) fp_iv=0 ;; esac
+                    fp_lim=$((2 * fp_iv + 5))
+                    [ "$AGG_MAX_AGE" -ge "$fp_lim" ] && fp_lim="$AGG_MAX_AGE"
+                    fp_up=""; read fp_up _ 2>/dev/null < /proc/uptime; fp_up="${fp_up%.*}"
+                    case "$fp_t$fp_up" in
+                        ''|*[!0-9]*) ;;
+                        *)
+                            if [ "$fp_up" -ge "$fp_t" ] && [ $((fp_up - fp_t)) -le "$fp_lim" ]; then
+                                case "$AGG_JSON" in
+                                    *'"backend":"nss"'*'"marking":false'*)
+                                        echo '{"error": "table not found"}' ;;
+                                    *)
+                                        printf '%s\n' "$AGG_JSON" ;;
+                                esac
+                                exit 0
+                            fi ;;
+                    esac ;;
+            esac
+        fi
+
         # --- Short-TTL cache to avoid redundant conntrack parses ---
         #
         # The conntrack parse now lives in the trafficchart-agg daemon, so

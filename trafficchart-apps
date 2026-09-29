@@ -19,6 +19,22 @@
 # see trafficchart.config. Needs trafficchart-common (tc_cfg).
 . "${TC_COMMON:-/usr/libexec/trafficchart-common}" || exit 1
 tc_cfg SOCK /var/run/netifyd/netifyd.sock
+# Minimum time between two writes of apps.map (ms). A new flow's label has to reach the
+# aggregator before its hold time (APP_HOLD-1)*INTERVAL runs out; worst case is this delay
+# plus one aggregator poll, so half the aggregator interval is safe: realtime/balanced 1 s
+# (unchanged), low-cpu 2 s, very-low-cpu 3 s.
+tc_cfg PROFILE low-cpu string
+tc_cfg INTERVAL "" int
+if [ -n "$INTERVAL" ] && [ "$INTERVAL" -ge 1 ] 2>/dev/null; then
+    FLUSH_MS=$((INTERVAL * 500))
+else
+    case "$PROFILE" in
+        low-cpu) FLUSH_MS=2000 ;;
+        very-low-cpu) FLUSH_MS=3000 ;;
+        *) FLUSH_MS=1000 ;;
+    esac
+fi
+[ "$FLUSH_MS" -ge 1000 ] || FLUSH_MS=1000
 OUT_DIR="${OUT_DIR:-/tmp/trafficchart}"
 AWK="${AWK:-awk}"
 SOCAT="${SOCAT:-socat}"
@@ -34,7 +50,7 @@ fi
 run_reader() {
     # TMPID: private temp file name per instance, so two instances (or a stale
     # one after a restart) can never move each other's temp file away
-    exec $AWK -v MAP="$OUT_DIR/apps.map" -v TMPID="$$" '
+    exec $AWK -v MAP="$OUT_DIR/apps.map" -v TMPID="$$" -v FLUSH_MS="$FLUSH_MS" '
     # extract "key":"value" / "key":123 from a one-line JSON object.
     # The naive [^"]* pattern used before stopped at the first quote,
     # including an ESCAPED one (\"), so a value like
@@ -177,7 +193,7 @@ run_reader() {
         } else if (index($0, "\"type\":\"agent_status\"")) {
             now = jnum($0, "timestamp") * 1000
         } else next
-        if ((dirty || deadflag) && (now - lastflush >= 1000 || now < lastflush)) flush()
+        if ((dirty || deadflag) && (now - lastflush >= FLUSH_MS || now < lastflush)) flush()
     }
     END { flush() }
     '
