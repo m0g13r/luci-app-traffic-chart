@@ -12,6 +12,8 @@ Optional extras, OFF by default, in /etc/config/trafficchart (section global):
   option dns_redirect_exclude 'wg0'  interfaces left out of that redirect
   option ttl_fix '1'                 rewrite TTL / hop limit 63,127 -> 64
   option bulk_bytes '314572800'      flows above this size become BULK
+  option reset_ct_marks '0'          keep the ct marks on (re)start (default 1 = zero them
+                                     so every flow is classified again; use 0 with mwan3)
 
 Restart SQM after changing any of them.
 

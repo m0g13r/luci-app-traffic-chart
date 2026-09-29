@@ -122,12 +122,7 @@ case "$1" in
                         ''|*[!0-9]*) ;;
                         *)
                             if [ "$fp_up" -ge "$fp_t" ] && [ $((fp_up - fp_t)) -le "$fp_lim" ]; then
-                                case "$AGG_JSON" in
-                                    *'"backend":"nss"'*'"marking":false'*)
-                                        echo '{"error": "table not found"}' ;;
-                                    *)
-                                        printf '%s\n' "$AGG_JSON" ;;
-                                esac
+                                printf '%s\n' "$AGG_JSON"
                                 exit 0
                             fi ;;
                     esac ;;
@@ -167,7 +162,7 @@ case "$1" in
         # behaviour if this busybox build lacks flock.
         HAVE_FLOCK=0
         LOCKED=0
-        if command -v flock >/dev/null 2>&1; then
+        if command -v flock >/dev/null 2>&1 && flock --help 2>&1 | grep -q -- '-w'; then
             HAVE_FLOCK=1
             exec 9>"$CACHE_LOCK"
             if flock -w 2 9 2>/dev/null; then
@@ -197,17 +192,6 @@ case "$1" in
         fi
 
         BACKEND=$(tc_detect_backend)
-
-        # Quick existence check only - we no longer parse nft's own counters.
-        # "marking" = the port based nftables classifier (nss-rk.qos) is loaded.
-        # NSS needs it (its absence means the shaper is not up); with a stock
-        # shaper the chart works without it, flows are then just unclassified.
-        if nft list table inet qos_custom >/dev/null 2>&1; then MARKING=true; else MARKING=false; fi
-        if [ "$BACKEND" = "nss" ] && [ "$MARKING" = "false" ]; then
-            echo '{"error": "table not found"}'
-            [ "$LOCKED" = "1" ] && flock -u 9 2>/dev/null
-            exit 0
-        fi
 
         if [ ! -r "$AGG_FILE" ]; then
             echo '{"error": "aggregator not running - /etc/init.d/trafficchart start"}'
@@ -384,7 +368,6 @@ case "$1" in
 ${AGG_JSON},
   "tc_diag": "${TC_DIAG}",
   "backend": "${BACKEND}",
-  "marking": ${MARKING},
   "iface": {
     "name": "${IFACE_NAME}",
     "rx_bytes": ${RX_BYTES:-0},

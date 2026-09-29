@@ -5,10 +5,10 @@
 // Values a profile sets (must mirror the PROFILE_* settings in trafficchart-agg). An option
 // that is left empty uses the value of the selected profile, which is shown as grey placeholder.
 var PROFILES = {
-    'realtime':     { interval: 1, interval_max: 5, adapt_budget: 0.15, tooltip_every: 1, hosts_refresh_sec: 30,  gua_refresh_sec: 60,  bulk_bytes: 314572800, mx_max: 4000, pair_max: 2000 },
-    'balanced':     { interval: 2, interval_max: 10, adapt_budget: 0.30, tooltip_every: 0, hosts_refresh_sec: 60,  gua_refresh_sec: 120, bulk_bytes: 314572800, mx_max: 2000, pair_max: 1000 },
-    'low-cpu':      { interval: 4, interval_max: 20, adapt_budget: 0.45, tooltip_every: 2, hosts_refresh_sec: 180, gua_refresh_sec: 300, bulk_bytes: 314572800, mx_max: 1000, pair_max: 500 },
-    'very-low-cpu': { interval: 6, interval_max: 30, adapt_budget: 0.55, tooltip_every: 3, hosts_refresh_sec: 300, gua_refresh_sec: 600, bulk_bytes: 314572800, mx_max: 500,  pair_max: 250 }
+    'realtime':     { interval: 1, interval_max: 5, adapt_budget: 0.15, tooltip_every: 1, hosts_refresh_sec: 30,  gua_refresh_sec: 60, mx_max: 4000, pair_max: 2000 },
+    'balanced':     { interval: 2, interval_max: 10, adapt_budget: 0.30, tooltip_every: 0, hosts_refresh_sec: 60,  gua_refresh_sec: 120, mx_max: 2000, pair_max: 1000 },
+    'low-cpu':      { interval: 4, interval_max: 20, adapt_budget: 0.45, tooltip_every: 2, hosts_refresh_sec: 180, gua_refresh_sec: 300, mx_max: 1000, pair_max: 500 },
+    'very-low-cpu': { interval: 6, interval_max: 30, adapt_budget: 0.55, tooltip_every: 3, hosts_refresh_sec: 300, gua_refresh_sec: 600, mx_max: 500,  pair_max: 250 }
 };
 var PROFILE_DEFAULT = 'low-cpu';   // used by the daemon when no profile is set
 
@@ -79,12 +79,6 @@ return view.extend({
         o.datatype = 'uinteger';
         o.placeholder = String(PROFILES[PROFILE_DEFAULT].tooltip_every);
 
-        o = s.option(form.Value, 'bulk_bytes', _('Bulk threshold'),
-            _('Bytes: a WEB/P2P/BE flow above this size is shown as BULK. Shared with nss-rk.qos ' +
-              '(restart SQM after changing this so the classifier picks it up too).'));
-        o.datatype = 'uinteger';
-        o.placeholder = String(PROFILES[PROFILE_DEFAULT].bulk_bytes);
-
         o = s.option(form.Value, 'l2_overhead', _('Link header size'),
             _('Bytes per packet the shaper counts but conntrack does not (used for "Not attributed"). "auto" measures it; ' +
               'or a fixed number: 14 Ethernet, 18 +VLAN, 22 +PPPoE, 26 +PPPoE+VLAN, 0 = no correction.'));
@@ -117,6 +111,12 @@ return view.extend({
         o = s.option(form.Flag, 'ttl_fix', _('Normalise TTL / hop limit'),
             _('Rewrites packets with TTL/hop limit 63 or 127 to 64 (hides that traffic passed through a tethering device or an extra router hop).'));
         o.default = '0';
+        o.rmempty = false;
+
+        o = s.option(form.Flag, 'reset_ct_marks', _('Reset connection marks on SQM start'),
+            _('Zeroes the whole conntrack mark when SQM starts so every running flow is classified again. ' +
+              'Turn it off if mwan3 (or anything else) keeps state in the higher mark bits - running flows then keep their class until they end.'));
+        o.default = '1';
         o.rmempty = false;
 
         s = m.section(form.NamedSection, 'global', 'trafficchart', _('CPU / Performance'),
@@ -244,7 +244,7 @@ return view.extend({
         o.depends('apps', '1');
 
         o = s.option(form.Value, 'wan_dev', _('WAN device (fallback)'),
-            _('Only used when no enabled SQM queue is found: device (e.g. eth1, pppoe-wan) or logical interface (wan) whose counters are used for the link rate. Empty = auto-detect.'));
+            _('Empty = auto-detect (shaped devices are found in the kernel: ingress redirect to an ifb, or NSS nsstbl; otherwise the default route device). Set device names (e.g. eth1 pppoe-wan) or logical interfaces (wan), space separated, to override.'));
         o.placeholder = 'pppoe-wan';
 
         o = s.option(form.Value, 'agg_max_age', _('Stale threshold'), _('Seconds: aggregator data older than this is reported as stale on the chart page.'));

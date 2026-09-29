@@ -12,7 +12,7 @@
 # and ECN-mark counters, summed the same way; plus the momentary queue backlog in
 # bytes of those qdiscs). Any field that cannot be determined is printed as "-".
 #
-# Line 2: a JSON fragment (members without braces: tc_diag, backend, marking,
+# Line 2: a JSON fragment (members without braces: tc_diag, backend,
 # iface, shaper, sqm, wan). trafficchart-agg stores it in classes.json, so
 # luci.trafficchart only has to serve that file. It used to compute all of this
 # (tc_resolve, several tc/awk, nft, uci ...) on every page request.
@@ -37,7 +37,6 @@
 . "${TC_COMMON:-/usr/libexec/trafficchart-common}" || { echo "- - - - - - - -"; exit 0; }
 
 tc_resolve_cached
-tc_marking_cached
 
 # sysfs counter without a fork; SYSV = value, fails if not readable / numeric
 sysv() {

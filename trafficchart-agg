@@ -9,10 +9,6 @@
 #
 # Why per-flow deltas instead of "sum of all live flows" (the old approach):
 #   - a flow that closes/expires no longer removes its bytes from the totals
-#   - a flow crossing BULK_BYTES no longer moves its ENTIRE history from
-#     WEB to BULK in a single poll (that showed up as a fake multi-hundred-MB
-#     spike in BULK and a dip in WEB); only bytes transferred AFTER the
-#     crossing count as BULK
 #   - totals survive page reloads and are shared by all open tabs
 #
 # Flow-tuple reuse: /proc/net/nf_conntrack exposes no connection-generation
@@ -33,25 +29,15 @@
 # netlink events (a bigger architectural change) this residual gap cannot be
 # fully closed from procfs snapshots alone.
 #
-# Classification of a flow, per poll:
-#   mark & 0xff in 1..17   -> that class (0x40 = router self-traffic, ignored)
-#   mark & 0xff == 0       -> "0x0 UNMARKED": only if the flow is LAN client ->
-#                             non-local destination. Typical cause: flow was
-#                             already offloaded when the ct marks were wiped
-#                             (conntrack -U -m 0 in nft_setup) and therefore
-#                             never walks qos_classify again. Without the nftables
-#                             classifier at all (stock shaper, no nss-rk.qos) EVERY
-#                             flow is unmarked - that works, flows are just named
-#                             "[UNMARKED]" when netifyd does not label them. Also
-#                             counted: WAN-initiated flows to a LAN host (port
-#                             forward, IPv6 inbound). LAN<->LAN and router-local
-#                             flows are NOT counted here.
-#   BULK (0x6)             -> a flow of class WEB/P2P/BE whose total exceeds
-#                             BULK_BYTES. All other classes are exempt (they
-#                             are identified by protocol/port, see nss-rk.qos).
-#                             Class-based instead of port-list based, so
-#                             there is no second copy of the port lists to
-#                             keep in sync.
+# Which flows count: no class marks, DSCP or port lists are involved, so this works
+# with any shaper (nss-rk.qos, cake/htb SQM, qosmate, dscpclassify, none at all). The only
+# inputs are the two counters this daemon reads itself: per-flow bytes/packets from
+# /proc/net/nf_conntrack and the qdisc counters of the link (trafficchart-tc). A flow is
+# counted when it is LAN client -> non-local destination, router -> WAN, or WAN-initiated to
+# a LAN host (port forward, IPv6 inbound). LAN<->LAN and router-local flows are not WAN
+# traffic and are skipped (LAN device -> router service flows are only tracked for the
+# router attribution, see below). A flow without a netifyd label is named after its
+# protocol/port (e.g. "[tcp/443]"), or after the label netifyd gave the same port elsewhere.
 #
 # Per-application view (optional): trafficchart-apps writes $OUT_DIR/apps.map
 # (flow tuple -> application, from netifyd). Every active flow that has a
@@ -153,7 +139,7 @@
 # the LAN device that watches the stream only talks to the router (LAN-local,
 # not WAN traffic) - the stream was invisible for that device. Now
 #   - router-originated WAN flows are counted (device "Router", class from the
-#     ct mark, application/destination from netifyd like any other flow);
+#     application/destination from netifyd like any other flow);
 #   - LAN device -> router flows are NOT counted as WAN traffic, but their
 #     volume is tracked per device ("via_in"/"via_out") and used to
 #     ATTRIBUTE the router's WAN traffic: router WAN volume (per application)
@@ -170,7 +156,7 @@
 #
 # Rates: every entry (application / device / destination) also carries
 # "in_bps" / "out_bps" = bytes per second averaged over the last RATE_WIN
-# seconds (default 10), measured on the clock of THIS daemon. A plain moving
+# seconds (profile: realtime 10, balanced/low-cpu 20, very-low-cpu 30), measured on the clock of THIS daemon. A plain moving
 # average over a fixed window is unbiased: a new stream reaches its real rate
 # after exactly one window and drops to 0 exactly one window after it stopped
 # (the old browser side EMA needed ~50 s to show 90 % of a new stream). The link
@@ -203,7 +189,7 @@
 # the History tab are computed independently and are NOT affected by this flag.
 #
 # Environment overrides (mainly for testing): CT_FILE OUT_DIR INTERVAL
-# BULK_BYTES V6HELPER AWK APP_HOLD HOSTS_HELPER HIST_SEC HIST_KEEP ATTR_WIN BIRTH_MAX GONE_GRACE
+# V6HELPER AWK APP_HOLD HOSTS_HELPER HIST_SEC HIST_KEEP ATTR_WIN BIRTH_MAX GONE_GRACE
 # ATTR_PORTS ATTR_SKIP_PORTS ATTR_MIN ATTR_SHARE ATTR_TOL ATTR_MAX_APPS ATTR_MAX_DEVICES TOOLTIPS TC_STATS
 # ADAPT_INTERVAL INTERVAL_MAX ADAPT_BUDGET TOOLTIP_EVERY HOSTS_REFRESH_SEC GUA_REFRESH_SEC
 # L2_OVERHEAD L2_INIT L2_CANDIDATES CAL_WIN CAL_KEEP CAL_MIN CAL_PCTL CAL_TOL CAL_MAX_PKT
@@ -226,39 +212,38 @@ if [ -r "$TC_COMMON" ]; then
     PROFILE_HOSTS_REFRESH_SEC=60
     PROFILE_GUA_REFRESH_SEC=120
     PROFILE_RATE_WIN=30
-    PROFILE_BULK_BYTES=314572800
     PROFILE_MX_MAX=2000
     PROFILE_PAIR_MAX=1000
     case "$PROFILE" in
         realtime)
             PROFILE_INTERVAL=1;            PROFILE_ADAPT_INTERVAL=1;     PROFILE_INTERVAL_MAX=5
             PROFILE_ADAPT_BUDGET=0.15;     PROFILE_TOOLTIP_EVERY=1;      PROFILE_HOSTS_REFRESH_SEC=30
-            PROFILE_GUA_REFRESH_SEC=60;    PROFILE_RATE_WIN=10;           PROFILE_BULK_BYTES=314572800
+            PROFILE_GUA_REFRESH_SEC=60;    PROFILE_RATE_WIN=10
             PROFILE_MX_MAX=4000;           PROFILE_PAIR_MAX=2000
             ;;
         balanced)
             PROFILE_INTERVAL=2;            PROFILE_ADAPT_INTERVAL=1;     PROFILE_INTERVAL_MAX=10
             PROFILE_ADAPT_BUDGET=0.30;     PROFILE_TOOLTIP_EVERY=0;      PROFILE_HOSTS_REFRESH_SEC=60
-            PROFILE_GUA_REFRESH_SEC=120;   PROFILE_RATE_WIN=20;          PROFILE_BULK_BYTES=314572800
+            PROFILE_GUA_REFRESH_SEC=120;   PROFILE_RATE_WIN=20
             PROFILE_MX_MAX=2000;           PROFILE_PAIR_MAX=1000
             ;;
         low-cpu)
             PROFILE_INTERVAL=4;            PROFILE_ADAPT_INTERVAL=1;     PROFILE_INTERVAL_MAX=20
             PROFILE_ADAPT_BUDGET=0.45;     PROFILE_TOOLTIP_EVERY=2;      PROFILE_HOSTS_REFRESH_SEC=180
-            PROFILE_GUA_REFRESH_SEC=300;   PROFILE_RATE_WIN=20;          PROFILE_BULK_BYTES=314572800
+            PROFILE_GUA_REFRESH_SEC=300;   PROFILE_RATE_WIN=20
             PROFILE_MX_MAX=1000;           PROFILE_PAIR_MAX=500
             ;;
         very-low-cpu)
             PROFILE_INTERVAL=6;            PROFILE_ADAPT_INTERVAL=1;     PROFILE_INTERVAL_MAX=30
             PROFILE_ADAPT_BUDGET=0.55;     PROFILE_TOOLTIP_EVERY=3;      PROFILE_HOSTS_REFRESH_SEC=300
-            PROFILE_GUA_REFRESH_SEC=600;   PROFILE_RATE_WIN=30;          PROFILE_BULK_BYTES=314572800
+            PROFILE_GUA_REFRESH_SEC=600;   PROFILE_RATE_WIN=30
             PROFILE_MX_MAX=500;            PROFILE_PAIR_MAX=250
             ;;
         *)
             PROFILE=balanced
             PROFILE_INTERVAL=2;            PROFILE_ADAPT_INTERVAL=1;     PROFILE_INTERVAL_MAX=10
             PROFILE_ADAPT_BUDGET=0.30;     PROFILE_TOOLTIP_EVERY=0;      PROFILE_HOSTS_REFRESH_SEC=60
-            PROFILE_GUA_REFRESH_SEC=120;   PROFILE_RATE_WIN=20;          PROFILE_BULK_BYTES=314572800
+            PROFILE_GUA_REFRESH_SEC=120;   PROFILE_RATE_WIN=20
             PROFILE_MX_MAX=2000;           PROFILE_PAIR_MAX=1000
             ;;
     esac
@@ -270,7 +255,6 @@ if [ -r "$TC_COMMON" ]; then
     tc_cfg HOSTS_REFRESH_SEC "$PROFILE_HOSTS_REFRESH_SEC" pint
     tc_cfg GUA_REFRESH_SEC "$PROFILE_GUA_REFRESH_SEC" pint
     tc_cfg RATE_WIN "$PROFILE_RATE_WIN" pint
-    tc_cfg BULK_BYTES "$PROFILE_BULK_BYTES" int
     tc_cfg HIST_SEC 300 pint;         tc_cfg HIST_KEEP 288 pint
     tc_cfg HIST_HOUR_KEEP 192 pint;   tc_cfg HIST_DAY_KEEP 400 pint
     tc_cfg PERSIST_DIR "";            tc_cfg PERSIST_MOUNT "";         tc_cfg PERSIST_SEC 3600 int
@@ -303,7 +287,7 @@ HOSTS_HELPER="${HOSTS_HELPER:-/usr/libexec/trafficchart-hosts}"
 HIST_SEC="${HIST_SEC:-300}"
 HIST_KEEP="${HIST_KEEP:-288}"
 BIRTH_MAX="${BIRTH_MAX:-1073741824}"   # bytes: a flow first seen (or restarted) with more than this in ONE poll cannot be new - it is adopted as baseline instead of booked
-GONE_GRACE="${GONE_GRACE:-5}"          # polls a flow may be missing (short procfs read, mark flip) before its state is dropped
+GONE_GRACE="${GONE_GRACE:-5}"          # polls a flow may be missing (short procfs read) before its state is dropped
 ATTR_WIN="${ATTR_WIN:-60}"   # seconds: window in which router WAN volume and client delivery are matched
 # Attribution of router WAN traffic to LAN devices (see "Router-originated traffic" above):
 # LAN->router flows to these destination ports are infrastructure (SSH, DNS, DHCP,
@@ -436,7 +420,7 @@ $AWK -v CT_FILE="$CT_FILE" -v OUT="$OUT_DIR" -v INTERVAL="$INTERVAL" \
     -v PERSIST_DIR="$PERSIST_DIR" -v PERSIST_MOUNT="$PERSIST_MOUNT" -v PERSIST_SEC="$PERSIST_SEC" -v TOUT="$TOUT" -v TOUT4="$TOUT4" \
     -v HIST_HOUR_KEEP="$HIST_HOUR_KEEP" -v HIST_DAY_KEEP="$HIST_DAY_KEEP" -v HOUR_SEC="$HOUR_SEC" -v DAY_SEC="$DAY_SEC" \
     -v WPID="$$" -v STOPFILE="$STOPFILE" -v RESETFILE="$RESETFILE" -v PIDFILE="$PIDFILE" \
-    -v BULK_BYTES="$BULK_BYTES" -v V6HELPER="$V6HELPER" -v APP_HOLD="$APP_HOLD" \
+    -v V6HELPER="$V6HELPER" -v APP_HOLD="$APP_HOLD" \
     -v MAPFILE="$OUT_DIR/apps.map" -v HOSTS_HELPER="$HOSTS_HELPER" \
     -v HIST_SEC="$HIST_SEC" -v HIST_KEEP="$HIST_KEEP" -v ATTR_WIN="$ATTR_WIN" -v BIRTH_MAX="$BIRTH_MAX" -v GONE_GRACE="$GONE_GRACE" \
     -v ADAPT_INTERVAL="$ADAPT_INTERVAL" -v INTERVAL_MAX="$INTERVAL_MAX" -v ADAPT_BUDGET="$ADAPT_BUDGET" -v TOOLTIP_EVERY="$TOOLTIP_EVERY" -v HOSTS_REFRESH_SEC="$HOSTS_REFRESH_SEC" -v GUA_REFRESH_SEC="$GUA_REFRESH_SEC" \
@@ -1031,8 +1015,13 @@ function learn(sv, a) {
     else if (tolower(plab[sv]) != tolower(a)) { pamb[sv] = 1; delete plab[sv] }
 }
 
-function fbname(sv, ecls) {
-    return ((sv != "" && (sv in plab)) ? plab[sv] : "[" cname[ecls] "]")
+# name of a flow netifyd did not label: a learned service name, else "[proto/port]"
+# (well-known / registered ports only; random high ports would flood the table)
+function fbname(sv, proto,   i) {
+    if (sv != "" && (sv in plab)) return plab[sv]
+    i = index(sv, "|")
+    if (i > 0 && substr(sv, i + 1) + 0 < 32768) return "[" substr(sv, 1, i - 1) "/" substr(sv, i + 1) "]"
+    return "[" proto "]"
 }
 
 # POSIX-safe single-quoting for a value embedded in an awk-built shell
@@ -1068,7 +1057,7 @@ function pend_clear(key) {
 
 # Account one flow delta to an application. Only called for flows that
 # moved bytes/packets in this poll or are still waiting for their label.
-function app_account(key, dk, lan, ecls, proto, src, dst, pp, d1, d2, q1, q2,   a, hh, t, sp, dp, k1, k2, rem, sv) {
+function app_account(key, dk, lan, proto, src, dst, pp, d1, d2, q1, q2,   a, hh, t, sp, dp, k1, k2, rem, sv) {
     a = ""; hh = ""; sv = ""
     rem = v6short(lan ? dst : src)
     if ((proto == "tcp" || proto == "udp") && pp != "") {
@@ -1094,10 +1083,10 @@ function app_account(key, dk, lan, ecls, proto, src, dst, pp, d1, d2, q1, q2,   
         }
         acct(dk, a, (hh != "" ? regdom(hh) : rem), lan, d1, d2, q1, q2)
     } else if (key in giveup) {
-        acct(dk, fbname(sv, ecls), rem, lan, d1, d2, q1, q2)
+        acct(dk, fbname(sv, proto), rem, lan, d1, d2, q1, q2)
     } else {
         pdb1[key] += d1; pdb2[key] += d2; pdp1[key] += q1; pdp2[key] += q2
-        plan[key] = lan; pcls[key] = ecls; pdev[key] = dk; prem[key] = rem; ppk[key] = sv
+        plan[key] = lan; pcls[key] = proto; pdev[key] = dk; prem[key] = rem; ppk[key] = sv
         # Held for a wall-clock time, not a poll count: with the adaptive
         # interval a poll count stretches to minutes under load (audit).
         if (!(key in pdfirst)) pdfirst[key] = t0
@@ -1115,8 +1104,8 @@ function tcp_state_closing(s) {
     return (s == "TIME_WAIT" || s == "CLOSE" || s == "CLOSE_WAIT" || s == "LAST_ACK" || s == "FIN_WAIT")
 }
 
-function parse_pass(   line, r, h, proto, mark, pp, t, sp, b1, b2, p1, p2,
-                       src, dst, rsrc, key, m, lan, elig, d1, d2, q1, q2, ecls, k, flows, act, dk, ri, ro, rflow, vflow,
+function parse_pass(   line, r, h, proto, pp, t, sp, b1, b2, p1, p2,
+                       src, dst, rsrc, key, lan, d1, d2, q1, q2, k, flows, act, dk, ri, ro, rflow, vflow,
                        tcpstate, forced_reset) {
     flows = 0
     split("", rti); split("", rto); split("", rtip); split("", rtop); split("", vdl); split("", vul)
@@ -1134,7 +1123,7 @@ function parse_pass(   line, r, h, proto, mark, pp, t, sp, b1, b2, p1, p2,
         # (an all-caps/underscore token, not part of a truncated "src=..."
         # field that happened to land in that column) - see tcp_state_closing().
         tcpstate = (proto == "tcp" && h[6] ~ /^[A-Z_]+$/) ? h[6] : ""
-        src = ""; dst = ""; pp = ""; mark = -1
+        src = ""; dst = ""; pp = ""
         b1 = 0; b2 = 0; p1 = 0; p2 = 0
 
         if (!match(line, /src=[^ ]+/)) continue
@@ -1166,22 +1155,16 @@ function parse_pass(   line, r, h, proto, mark, pp, t, sp, b1, b2, p1, p2,
                 r = substr(r, RSTART + RLENGTH)
             }
         }
-        if (match(r, /mark=[0-9]+/)) mark = substr(r, RSTART + 5, RLENGTH - 5) + 0
         if (src == "") continue
 
-        # only the low byte is ours (IPT_MASK 0xff); other bits belong to
-        # other users of the mark (mwan3, ...)
-        m = (mark >= 0) ? mark % 256 : 0
-        if (m == 64 || m > 17) continue      # 0x40 router self-traffic / foreign
 
         lan = islocal(src)
         rflow = 0; vflow = 0
-        # Router-originated WAN flow (e.g. stream proxy upstream), whatever its
-        # class mark: the router is the initiator, so orig direction = upload.
-        # Without this a marked router flow (mark 1..17) was taken for a
-        # WAN-initiated port forward: directions swapped, device = remote server.
+        # Router-originated WAN flow (e.g. stream proxy upstream): the router is the
+        # initiator, so orig direction = upload (otherwise it would be taken for a
+        # WAN-initiated port forward: directions swapped, device = remote server).
         if ((src in rtr) && !islocal(dst)) { rflow = 1; lan = 1 }
-        if (m == 0) {
+        {
             if (rflow) { }                                                # router -> WAN, counted as device "Router"
             else if (lan && (dst in rtr) && !(src in rtr)) vflow = 1      # LAN device -> router service
             else if (!lan && rsrc != "" && islocal(rsrc) && !(rsrc in rtr)) { }   # WAN-initiated to a LAN host (port forward, IPv6 inbound)
@@ -1211,7 +1194,7 @@ function parse_pass(   line, r, h, proto, mark, pp, t, sp, b1, b2, p1, p2,
             if (d1 < 0 || d2 < 0 || q1 < 0 || q2 < 0 || forced_reset) {
                 if (forced_reset || b1 + b2 <= BIRTH_MAX) {
                     # same tuple reused by a new connection: counters restarted
-                    d1 = b1; d2 = b2; q1 = p1; q2 = p2; bulk[key] = 0
+                    d1 = b1; d2 = b2; q1 = p1; q2 = p2
                     # a new connection must not inherit the application label
                     # of the old one that used the same tuple
                     delete lab[key]; delete lhost[key]; delete giveup[key]
@@ -1224,16 +1207,16 @@ function parse_pass(   line, r, h, proto, mark, pp, t, sp, b1, b2, p1, p2,
             }
         } else if (warm) {
             # first pass after start: baseline only, count "since start"
-            d1 = 0; d2 = 0; q1 = 0; q2 = 0; bulk[key] = 0
+            d1 = 0; d2 = 0; q1 = 0; q2 = 0
         } else if (b1 + b2 > BIRTH_MAX) {
             # first seen after start but already huge: it cannot have been born
-            # within one poll, it was missed earlier (short read, mark flip).
+            # within one poll, it was missed earlier (short read).
             # Adopt as baseline instead of booking its whole history.
             glog_msg(sprintf("adopted flow first seen with %.0f bytes: %s", b1 + b2, key))
-            d1 = 0; d2 = 0; q1 = 0; q2 = 0; bulk[key] = 0
+            d1 = 0; d2 = 0; q1 = 0; q2 = 0
         } else {
             # flow born after start: everything it moved is new
-            d1 = b1; d2 = b2; q1 = p1; q2 = p2; bulk[key] = 0
+            d1 = b1; d2 = b2; q1 = p1; q2 = p2
         }
 
         if (vflow) {
@@ -1251,10 +1234,6 @@ function parse_pass(   line, r, h, proto, mark, pp, t, sp, b1, b2, p1, p2,
             if (tcpstate != "") laststate[key] = tcpstate; else delete laststate[key]
             continue
         }
-        elig = (m == 4 || m == 7 || m == 8)          # WEB / P2P / BE
-        if (!bulk[key] && elig && (b1 + b2) > BULK_BYTES) bulk[key] = 1
-        ecls = bulk[key] ? 6 : m
-
         act = (d1 > 0 || d2 > 0 || q1 > 0 || q2 > 0)
         dk = ""
         if (act) {
@@ -1262,13 +1241,13 @@ function parse_pass(   line, r, h, proto, mark, pp, t, sp, b1, b2, p1, p2,
             dev_add(dk, lan, d1, d2, q1, q2)
         } else if (key in pdage) dk = pdev[key]
         if (act || (key in pdage))
-            app_account(key, dk, lan, ecls, proto, src, dst, pp, d1, d2, q1, q2)
+            app_account(key, dk, lan, proto, src, dst, pp, d1, d2, q1, q2)
         if (act) {
             # live flow list: smoothed rate per flow (LAN view: in = download)
             if (lan) { ri = d2 / dtp; ro = d1 / dtp } else { ri = d1 / dtp; ro = d2 / dtp }
             if (key in fei) { fei[key] = fei[key] * 0.5 + ri * 0.5; feo[key] = feo[key] * 0.5 + ro * 0.5 }
             else { fei[key] = ri; feo[key] = ro }
-            fact[key] = n; fdev[key] = dk; fcls[key] = ecls
+            fact[key] = n; fdev[key] = dk
         }
         if (key in fei) ftot[key] = b1 + b2
 
@@ -1288,9 +1267,9 @@ function parse_pass(   line, r, h, proto, mark, pp, t, sp, b1, b2, p1, p2,
         if (n - gen[k] > 3 && t0 - gent[k] > GONE_SEC) {
             if (k in pdage) pend_release(k)
             delete gen[k]; delete gent[k]; delete pb1[k]; delete pb2[k]
-            delete pp1[k]; delete pp2[k]; delete bulk[k]
+            delete pp1[k]; delete pp2[k]
             delete lab[k]; delete lhost[k]; delete giveup[k]
-            delete fei[k]; delete feo[k]; delete fact[k]; delete fdev[k]; delete fcls[k]; delete ftot[k]
+            delete fei[k]; delete feo[k]; delete fact[k]; delete fdev[k]; delete ftot[k]
             delete laststate[k]
         }
     }
@@ -1947,6 +1926,7 @@ function emit(t,   s, tmp, a, first, k, nm, i, j, sc, nt, tsc, tky, pd, tot, n2,
 
     split("", keepD); split("", keepH)
     row_keep("d", dseen, dib, dob, keepD)
+    if ("router" in dseen) keepD["router"] = 1     # never fold the Router device into "(other)"
     row_keep("h", hseen, hib, hob, keepH)
 
     first = 1
@@ -2008,12 +1988,12 @@ function emit(t,   s, tmp, a, first, k, nm, i, j, sc, nt, tsc, tky, pd, tot, n2,
         dp = ""
         if (match(kp[4], /dport=[0-9]+/)) dp = substr(kp[4], RSTART + 6, RLENGTH - 6)
         rem = v6short(islocal(kp[2]) ? kp[3] : kp[2])
-        ap = (k in lab) ? lab[k] : fbname(kp[1] "|" dp, fcls[k])
+        ap = (k in lab) ? lab[k] : fbname((dp != "" ? kp[1] "|" dp : ""), kp[1])
         gsub(/["\\]/, "_", ap)
         hh = ((k in lhost) && lhost[k] != "") ? lhost[k] : ""
         gsub(/[^A-Za-z0-9._:-]/, "_", hh)
-        printf "%s{\"dev\":\"%s\",\"ip\":\"%s\",\"app\":\"%s\",\"host\":\"%s\",\"dst\":\"%s\",\"port\":\"%s\",\"proto\":\"%s\",\"class\":\"%s\",\"in_bps\":%.0f,\"out_bps\":%.0f,\"bytes\":%.0f}", \
-                      (i > 1 ? "," : ""), dev_label(fdev[k]), ((fdev[k] in dvip) ? dvip[fdev[k]] : ""), ap, hh, rem, dp, kp[1], cname[fcls[k]], fei[k], feo[k], ftot[k] > tmp
+        printf "%s{\"dev\":\"%s\",\"ip\":\"%s\",\"app\":\"%s\",\"host\":\"%s\",\"dst\":\"%s\",\"port\":\"%s\",\"proto\":\"%s\",\"in_bps\":%.0f,\"out_bps\":%.0f,\"bytes\":%.0f}", \
+                      (i > 1 ? "," : ""), dev_label(fdev[k]), ((fdev[k] in dvip) ? dvip[fdev[k]] : ""), ap, hh, rem, dp, kp[1], fei[k], feo[k], ftot[k] > tmp
     }
     printf "%s", "]" > tmp
     if (tcfrag != "") printf ",%s", tcfrag > tmp
@@ -2023,16 +2003,6 @@ function emit(t,   s, tmp, a, first, k, nm, i, j, sc, nt, tsc, tky, pd, tot, n2,
 }
 
 BEGIN {
-    # Class names: this "cn0" list (index 0 = UNMARKED, index N = mark 0xN)
-    # is duplicated in the QOS_DSCP table of nss-rk.qos (same 17 classes,
-    # same mark order) because nss-rk.qos deliberately does not source this
-    # file or trafficchart-common (it stays a standalone SQM shaper script
-    # that must keep working even without the traffic-chart app installed).
-    # If you add, remove or renumber a class here, make the matching change
-    # in the QOS_DSCP table of nss-rk.qos too - the two are content-verified
-    # identical as of 2026-09-27, not just "should be".
-    split("UNMARKED PRIO VOIP GAME WEB STREAM BULK P2P BE VPN MAIL NTP FTP REMOTE DB MGMT CONTAINER IOT", cn0, " ")
-    for (c = 0; c <= 17; c++) cname[c] = cn0[c + 1]
     "date +%s" | getline since
     close("date +%s")
     n = 0; warm = 1; nflows = 0

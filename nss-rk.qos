@@ -1,7 +1,7 @@
 ###############################################################################
 # nss-rk.qos - SQM shaper for NSS hardware offload (nsstbl + nssfq_codel)
 # with port based traffic classes (nftables packet marks + DSCP).
-# version 0.9.2 (20260929)
+# version 0.9.3 (20260929)
 #
 # Based on simple.qos / nss.qos by ricsc, modified by rickk
 #   https://github.com/rickkdotnet/sqm-scripts-nss
@@ -30,6 +30,7 @@
 #      dns_redirect '1'          redirect DNS (53) from all non-WAN interfaces
 #      dns_redirect_exclude '..' interfaces left out of the redirect (e.g. wg0)
 #      ttl_fix '1'               rewrite TTL/hop limit 63/127 to 64
+#      reset_ct_marks '0'        do not zero the ct marks on (re)start (default 1; needed with mwan3)
 ###############################################################################
 
 . /lib/functions.sh
@@ -316,8 +317,8 @@ nft_setup() {
     # the router's own resolver (no hardcoded LAN bridge name).
     chain prerouting_nat {
         type nat hook prerouting priority dstnat; policy accept;
-        iifname != { ${DNS_SET} } udp dport 53 redirect to 53
-        iifname != { ${DNS_SET} } tcp dport 53 redirect to 53
+        iifname != { ${DNS_SET} } fib daddr type != local udp dport 53 redirect to 53
+        iifname != { ${DNS_SET} } fib daddr type != local tcp dport 53 redirect to 53
     }
 "
     fi
@@ -470,7 +471,13 @@ EOF
 
     # reset old marks so every flow is classified again with the new ruleset
     # (conntrack cannot clear just the low byte: this zeroes the whole ct mark)
-    command -v conntrack >/dev/null 2>&1 && conntrack -U -m 0 >/dev/null 2>&1
+    # conntrack cannot clear just the low byte, this zeroes the WHOLE ct mark. With
+    # mwan3 (or anything else that keeps state in the higher bits) that can re-route
+    # running flows, so it can be switched off: option reset_ct_marks '0' (default 1).
+    # Without it flows keep the class they already have until they end.
+    if [ "$(qos_opt_flag reset_ct_marks 1)" = "1" ]; then
+        command -v conntrack >/dev/null 2>&1 && conntrack -U -m 0 >/dev/null 2>&1
+    fi
 }
 
 ###############################################################################
