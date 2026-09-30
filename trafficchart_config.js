@@ -48,6 +48,12 @@ return view.extend({
         o.placeholder = 'auto';
 
         o = s.option(form.Value, 'sock', _('netifyd socket'), _('Path of the netifyd JSON socket.'));
+        o.validate = function(section_id, value) {
+            if (value === null || value === '') return true;
+            return /^\/var\/run\/netifyd\/[A-Za-z0-9._-]+\.sock$/.test(value)
+                ? true
+                : _('The socket must be a .sock file directly below /var/run/netifyd.');
+        };
         o.placeholder = '/var/run/netifyd/netifyd.sock';
         o.depends('apps', '1');
 

@@ -22,7 +22,7 @@
 # device is still actively sending). Pinging each address here forces the
 # kernel to run Neighbour Discovery again, so the "ip neigh show" below has a
 # fresh entry for it.
-OUT_DIR="${OUT_DIR:-/tmp/trafficchart}"
+OUT_DIR="${OUT_DIR:-/var/run/trafficchart}"
 UNRESOLVED_FILE="${UNRESOLVED_FILE:-$OUT_DIR/unresolved_v6}"
 
 # At most UNRESOLVED_MAX pings run in the background per call (once per host refresh of the

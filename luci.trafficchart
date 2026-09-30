@@ -2,11 +2,11 @@
 # luci.trafficchart - rpcd plugin: serves what the trafficchart-agg daemon wrote.
 #
 # The daemon (procd service "trafficchart") walks /proc/net/nf_conntrack and reads the qdisc
-# counters; it writes everything the page needs to /tmp/trafficchart/classes.json (live data)
+# counters; it writes everything the page needs to /var/run/trafficchart/classes.json (live data)
 # and history*.json (history). This script only hands those files to the page, so its cost is
 # independent of how many browser tabs are open. It computes nothing itself.
-AGG_FILE="/tmp/trafficchart/classes.json"
-HIST_DIR="${TC_OUT_DIR:-/tmp/trafficchart}"
+AGG_FILE="/var/run/trafficchart/classes.json"
+HIST_DIR="${TC_OUT_DIR:-/var/run/trafficchart}"
 AGG_MAX_AGE=10          # seconds; at least two daemon intervals + 5 s are always allowed
 HIST_MAX_BYTES=800000   # never more than this many bytes (rpcd/ubus reply limit is 1 MB)
 HIST_MAX=600            # never return more buckets than this

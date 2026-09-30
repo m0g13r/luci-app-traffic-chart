@@ -44,7 +44,8 @@ tc_cfg PERSIST_DIR "";  tc_cfg PERSIST_MOUNT "";  tc_cfg PERSIST_SEC 3600 int;  
 tc_cfg TOOLTIPS 1 int;  tc_cfg L2_OVERHEAD auto l2
 
 CT_FILE="${CT_FILE:-/proc/net/nf_conntrack}"
-OUT_DIR="${OUT_DIR:-/tmp/trafficchart}"
+# Runtime state lives below /var/run by default; /var/run is root-owned on OpenWrt.
+OUT_DIR="${OUT_DIR:-/var/run/trafficchart}"
 export OUT_DIR   # trafficchart-hosts (spawned via awk's pipe) needs this to find unresolved_v6
 V6HELPER="${V6HELPER:-/usr/libexec/trafficchart-v6prefixes}"
 HOSTS_HELPER="${HOSTS_HELPER:-/usr/libexec/trafficchart-hosts}"

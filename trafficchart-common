@@ -98,6 +98,15 @@ tc_cfg_valid() {
         num)  case "$3" in ''|*[!0-9.]*|.*|*.|*.*.*) return 1 ;; esac ;;
         list) for t in $3; do case "$t" in ''|*[!0-9]*) return 1 ;; esac; done ;;
         l2)   case "$3" in auto|[0-9]|[0-9][0-9]) ;; *) return 1 ;; esac ;;
+        sock)
+            case "$3" in
+                /var/run/netifyd/*.sock) ;;
+                *) return 1 ;;
+            esac
+            case "${3#/var/run/netifyd/}" in
+                ''|*/*|*[!A-Za-z0-9._-]*) return 1 ;;
+            esac
+            ;;
     esac
     return 0
 }
@@ -489,7 +498,7 @@ tc_resolve() {
 # WAN_INFO QTXT SYSNOTE) plus NWAN, the number of configured queues.
 tc_resolve_cached() {
     local now up ttl f d ok=1 tmp t
-    TC_CACHE="${TC_CACHE:-${OUT_DIR:-${TC_OUT_DIR:-/tmp/trafficchart}}/tcdevs}"
+    TC_CACHE="${TC_CACHE:-${OUT_DIR:-${TC_OUT_DIR:-/var/run/trafficchart}}/tcdevs}"
     up=""; read up _ 2>/dev/null < /proc/uptime
     now="${up%.*}"
     case "$now" in ''|*[!0-9]*) now=0 ;; esac
