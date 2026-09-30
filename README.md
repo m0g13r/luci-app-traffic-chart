@@ -1,31 +1,66 @@
-# luci-app-traffic-chart
-Live and historic traffic view for OpenWrt routers running SQM, with special
-support for Qualcomm NSS hardware offload.
+# Traffic Chart (luci-app-traffic-chart)
 
-* Per application, device and destination, live and as history
-  (5 min / hourly / daily buckets, optionally persisted to USB/NAS)
-* Byte counts come from conntrack, application names from netifyd (optional)
-* Shaper health: drops, ECN marks, backlog (nsstbl/nssifb, cake, htb+fq_codel)
-* `nss-rk.qos`: SQM script for NSS with 17 port based traffic classes
+Live and historical traffic per application, device and destination, next to the real link rate.
+It uses two counters and nothing else: per-flow bytes/packets from `/proc/net/nf_conntrack` and the
+byte counters of the shaper qdiscs (`tc -s qdisc`). It does not depend on the shaper or classifier in
+use (nss-rk.qos, sqm-scripts, qosmate, dscpclassify, none at all): no marks, no DSCP, no port lists,
+no other tool's config files.
+
+## Files
+
+| File | Install as | Purpose |
+|---|---|---|
+| `trafficchart-agg` | `/usr/libexec/trafficchart-agg` | daemon: walks conntrack, keeps totals, rates, history; writes `/tmp/trafficchart/stats.json` |
+| `trafficchart-tc` | `/usr/libexec/trafficchart-tc` | link counters + shaper drops/ECN/backlog (called by the daemon every poll) |
+| `trafficchart-common` | `/usr/libexec/trafficchart-common` | settings helper (`tc_cfg`) and shaper detection (kernel: ingress redirect to an ifb, or NSS `nsstbl`) |
+| `trafficchart-hosts` | `/usr/libexec/trafficchart-hosts` | device identity: neighbour table (MAC), DHCP names, router addresses |
+| `trafficchart-v6prefixes` | `/usr/libexec/trafficchart-v6prefixes` | LAN IPv6 prefixes (what counts as LAN side) |
+| `trafficchart-apps` | `/usr/libexec/trafficchart-apps` | optional: netifyd flow labels -> application names (needs `socat`, `netifyd`) |
+| `trafficchart` | `/etc/init.d/trafficchart` | procd service |
+| `luci.trafficchart` | `/usr/libexec/rpcd/luci.trafficchart` | rpcd plugin: serves `stats.json` and `history*.json` to the page |
+| `traffic_chart.js` | `/www/luci-static/resources/view/network/traffic_chart.js` | the chart page |
+| `trafficchart_config.js` | `/www/luci-static/resources/view/network/trafficchart_config.js` | the settings page |
+| `luci-app-traffic-chart_menu.json` | `/usr/share/luci/menu.d/luci-app-traffic-chart.json` | menu entries |
+| `luci-app-traffic-chart.json` | `/usr/share/rpcd/acl.d/luci-app-traffic-chart.json` | ACL |
+| `trafficchart.config` | `/etc/config/trafficchart` | default settings |
+| `nss-rk.qos`, `nss-rk_qos.help` | `/usr/lib/sqm/nss-rk.qos`, `.../nss-rk.qos.help` | separate SQM shaper script for NSS; not needed by the chart |
+
+Scripts must be executable (`chmod +x`). After installing: `/etc/init.d/trafficchart enable && /etc/init.d/trafficchart restart`,
+then `/etc/init.d/rpcd restart`.
 
 ## Requirements
 
-`luci-base`, `rpcd`, `sqm-scripts`, `nftables`, `jsonfilter`, `tc` (tc-tiny/full).
-Optional: `socat` + `netifyd` (application names), `conntrack`.
-NSS shaper additionally needs an NSS build with `nss-ifb` / `nsstbl` / `nssfq_codel`.
+`tc` (tc-tiny or tc-full), conntrack accounting (the daemon switches `nf_conntrack_acct` on).
+Optional: `socat` + `netifyd` (application names; without them flows are named `[proto/port]`),
+`timeout` (persistent history on a network share).
 
-## Behaviour worth knowing
+## What is counted
 
-* **NSS offload:** accelerated flows are not classified again, so their kernel
-  mark/DSCP stays as it was. The chart demotes big WEB/P2P/BE flows to BULK
-  itself, so it can show BULK while the kernel mark is still WEB.
-* **One SQM instance** with NSS (single `nssifb`, single nft table).
-  The generic backend supports several queues.
-* **Marks:** only the low byte is used, other bits are preserved.
-  Restarting the classifier zeroes the whole conntrack mark (`conntrack -U -m 0`).
-* **DNS redirect and TTL rewrite** are OFF by default
-  (`dns_redirect`, `dns_redirect_exclude`, `ttl_fix`), see `nss-rk.qos.help`.
-* `attr_ports` empty = every port except `attr_skip_ports`.
+A flow counts when it is LAN client -> non-local destination, router -> WAN, or WAN-initiated to a
+LAN host (port forward, IPv6 inbound). LAN<->LAN and LAN -> router flows are not WAN traffic. The
+router's own WAN traffic is the device "Router". Totals are per-flow deltas, so closing flows never
+remove bytes. The link rate comes from the qdisc counters, so it can differ from the conntrack sum
+(router services, dropped packets, link layer headers).
+
+## Settings (`/etc/config/trafficchart`, section `global`)
+
+| Option | Default | Meaning |
+|---|---|---|
+| `enabled` | 1 | start the daemon |
+| `apps` | 1 | run `trafficchart-apps` (netifyd labels) |
+| `backend` | auto | `auto`, `nss` or `generic` |
+| `interval` | 4 | poll interval in seconds (stretches under load, max 20) |
+| `wan_dev` | (auto) | WAN device(s) or logical interface(s), space separated |
+| `sock` | `/var/run/netifyd/netifyd.sock` | netifyd socket |
+| `persist_dir`, `persist_mount`, `persist_sec`, `persist_timeout` | off | keep the history across reboots |
+
+Only for the `nss-rk.qos` script: `dns_redirect`, `dns_redirect_exclude`, `ttl_fix`, `bulk_bytes`, `reset_ct_marks`
+(restart SQM after changing them).
+
+## History
+
+5 minute buckets for 24 h, hourly buckets for 8 days, daily buckets for 400 days. They live in RAM
+(`/tmp/trafficchart/history*.json`) and, with `persist_dir`, are appended to `history-*.jsonl` there.
 
 <img width="1950" height="1363" alt="Bildschirmfoto vom 2026-09-29 01-05-22" src="https://github.com/user-attachments/assets/2a2589db-1969-4608-b04e-83a4ab8bb47d" />
 <img width="1950" height="1363" alt="Bildschirmfoto vom 2026-09-29 01-06-35" src="https://github.com/user-attachments/assets/2505da5a-d370-4fa7-a157-50a6899278dc" />
