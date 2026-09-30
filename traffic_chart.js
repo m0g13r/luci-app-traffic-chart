@@ -12,7 +12,7 @@ var callTrafficStats = rpc.declare({
 var callHistory = rpc.declare({
     object: 'luci.trafficchart',
     method: 'get_stats',
-    params: [ 'history', 'tier' ],
+    params: [ 'history', 'tier', 'dim' ],
     expect: { '': {} }
 });
  
@@ -611,7 +611,12 @@ return view.extend({
                 return nm;
             },
             function(n) { return _('Other (%d devices)').format(n); },
-            function(e) { return (e.top && e.top.length) ? e.top : null; }, _('Top applications'));
+            function(e) {
+                var t = (e.top || []).slice();
+                if ((e.via_in || 0) + (e.via_out || 0) > 0)
+                    t.push([ _('via router services (proxy, DNS, LuCI ...) - LAN side, not WAN'), e.via_in || 0, e.via_out || 0 ]);
+                return t.length ? t : null;
+            }, _('Top applications'));
         var hostsView = makeSlotView(MAX_ROWS - 1, _('Destinations'),
             function(name, e) { return (name === '(other)' && e && e.count) ? _('Other (%d destinations)').format(e.count) : name; },
             function(n) { return _('Other (%d destinations)').format(n); },
@@ -703,7 +708,7 @@ return view.extend({
             var RANGES = [
                 { id: '24h',  label: _('24 hours'), tier: '5m', span: 86400 },
                 { id: '7d',   label: _('Week'),     tier: '1h', span: 7 * 86400 },
-                { id: '30d',  label: _('Month'),    tier: '1d', span: 30 * 86400 },
+                { id: '30d',  label: _('Month'),    tier: '1h', span: 30 * 86400 },
                 { id: '365d', label: _('Year'),     tier: '1d', span: 365 * 86400 }
             ];
             var REFRESH_MS = { '5m': 60000, '1h': 300000, '1d': 900000 };
@@ -810,7 +815,7 @@ return view.extend({
             });
             dimDefs.forEach(function(d) {
                 var b = E('button', { type: 'button', style: btnStyle }, d[1]);
-                b.addEventListener('click', function(e) { e.stopPropagation(); st.dim = d[0]; mark(); render(); });
+                b.addEventListener('click', function(e) { e.stopPropagation(); st.dim = d[0]; st.data = {}; mark(); render(); v.load(); });
                 dimBtns.push(b);
             });
             dirDefs.forEach(function(d) {
@@ -912,13 +917,39 @@ return view.extend({
                 });
             };
  
+            function localDayStart(epoch) {
+                var d = new Date(epoch * 1000);
+                return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime() / 1000;
+            }
+            function localDayAdd(epoch, days) {
+                var d = new Date(epoch * 1000);
+                return new Date(d.getFullYear(), d.getMonth(), d.getDate() + days).getTime() / 1000;
+            }
             function windowOf(B, R) {
-                var end = B[B.length - 1].t;
+                var latest = B[B.length - 1].t;
                 var first = B[0].t - (B[0].dt || 0);
+
+                /* The Week view is seven LOCAL calendar days, not seven arbitrary
+                 * 24-hour chunks.  Keep the chart axis independent of bucket
+                 * boundaries so DST and partially closed buckets cannot produce
+                 * duplicate/missing day labels. */
+                if (R.id === '7d' || R.id === '30d' || R.id === '365d') {
+                    /* Window = the last 7 / 30 / 365 local calendar days, but never
+                     * longer than the data that exists: with little data the window
+                     * shrinks to it, so the data fills the full width. */
+                    var days = R.id === '7d' ? 7 : (R.id === '30d' ? 30 : 365);
+                    var startCal = localDayAdd(localDayStart(latest), -(days - 1));
+                    var wStart = Math.max(startCal, first);
+                    var selCal = B.filter(function(b) { return b.t > wStart && b.t - (b.dt || 0) < latest; });
+                    if (!selCal.length) selCal = [ B[B.length - 1] ];
+                    return { end: latest, start: wStart, sel: selCal, axisDays: true, axisRange: R.id, dataEnd: latest };
+                }
+
+                var end = latest;
                 var start = Math.max(end - R.span, first);
-                var sel = B.filter(function(b) { return b.t - (b.dt || 0) / 2 > start; });
+                var sel = B.filter(function(b) { return b.t - (b.dt || 0) > start; });
                 if (!sel.length) sel = [ B[B.length - 1] ];
-                return { end: end, start: start, sel: sel };
+                return { end: end, start: start, sel: sel, dataEnd: end };
             }
             function durTxt(sec) {
                 return sec >= 86400 ? _('%.1f days').format(sec / 86400) : sec >= 3600 ? _('%.1f h').format(sec / 3600) : _('%d min').format(Math.round(sec / 60));
@@ -1101,7 +1132,7 @@ return view.extend({
                 var pw = W - pl - pr, ph = PANEL_H - pt - pb;
  
                 var bl = medianDt(sel) || TIER_SEC[R.tier];
-                var maxCols = Math.max(20, Math.floor(pw / 3));
+                var maxCols = Math.max(20, Math.floor(pw / (win.axisDays ? 2.5 : 3)));
                 var m = Math.max(1, Math.ceil(((end - start) / maxCols) / bl - 0.01));
                 var colw = m * bl;
                 var ncols = Math.max(1, Math.ceil((end - start) / colw));
@@ -1109,20 +1140,35 @@ return view.extend({
                 var cols = [];
                 for (var ci0 = 0; ci0 < ncols; ci0++) cols.push({ dt: 0, src: {}, drop: { rx: 0, tx: 0 }, ecn: { rx: 0, tx: 0 }, bl: { rx: 0, tx: 0 } });
                 sel.forEach(function(b) {
-                    var mid = b.t - (b.dt || 0) / 2;
-                    var ci = ncols - 1 - Math.floor((end - mid) / colw);
-                    if (ci < 0) ci = 0;
-                    if (ci > ncols - 1) ci = ncols - 1;
-                    var c = cols[ci], src = b[st.dim] || {};
-                    c.dt += b.dt || 0;
-                    Object.keys(src).forEach(function(k) {
-                        var s = c.src[k] || (c.src[k] = [0, 0]);
-                        s[0] += src[k][0] || 0; s[1] += src[k][1] || 0;
-                    });
-                    if (b.sh) {
-                        c.drop.rx += (b.sh.rx && b.sh.rx[0]) || 0; c.drop.tx += (b.sh.tx && b.sh.tx[0]) || 0;
-                        c.ecn.rx += (b.sh.rx && b.sh.rx[1]) || 0; c.ecn.tx += (b.sh.tx && b.sh.tx[1]) || 0;
-                        c.bl.rx = Math.max(c.bl.rx, (b.sh.rx && b.sh.rx[2]) || 0); c.bl.tx = Math.max(c.bl.tx, (b.sh.tx && b.sh.tx[2]) || 0);
+                    var bd = b.dt || 0;
+                    if (bd <= 0) return;
+                    var b0 = b.t - bd, b1 = b.t;
+                    var c0 = Math.max(0, Math.floor((b0 - t0) / colw));
+                    var c1 = Math.min(ncols - 1, Math.floor((b1 - t0 - 1e-9) / colw));
+                    if (c1 < 0 || c0 > ncols - 1) return;
+                    c0 = Math.max(0, c0);
+                    c1 = Math.min(ncols - 1, c1);
+                    for (var cj = c0; cj <= c1; cj++) {
+                        var o0 = Math.max(b0, t0 + cj * colw);
+                        var o1 = Math.min(b1, t0 + (cj + 1) * colw);
+                        var ov = o1 - o0;
+                        if (ov <= 0) continue;
+                        var frac = ov / bd;
+                        var c = cols[cj], src = b[st.dim] || {};
+                        c.dt += ov;
+                        Object.keys(src).forEach(function(k) {
+                            var s = c.src[k] || (c.src[k] = [0, 0]);
+                            s[0] += (src[k][0] || 0) * frac;
+                            s[1] += (src[k][1] || 0) * frac;
+                        });
+                        if (b.sh) {
+                            c.drop.rx += ((b.sh.rx && b.sh.rx[0]) || 0) * frac;
+                            c.drop.tx += ((b.sh.tx && b.sh.tx[0]) || 0) * frac;
+                            c.ecn.rx += ((b.sh.rx && b.sh.rx[1]) || 0) * frac;
+                            c.ecn.tx += ((b.sh.tx && b.sh.tx[1]) || 0) * frac;
+                            c.bl.rx = Math.max(c.bl.rx, (b.sh.rx && b.sh.rx[2]) || 0);
+                            c.bl.tx = Math.max(c.bl.tx, (b.sh.tx && b.sh.tx[2]) || 0);
+                        }
                     }
                 });
  
@@ -1561,13 +1607,54 @@ return view.extend({
                     if (d !== dirs[dirs.length - 1]) yCursor += PANEL_GAP;
                 });
  
-                var nt = 5;
-                for (var nn = 0; nn < nt; nn++) {
-                    var fr = nn / (nt - 1);
-                    var tx = svgEl('text', { x: pl + fr * pw, y: totalH - 9, 'text-anchor': nn === 0 ? 'start' : (nn === nt - 1 ? 'end' : 'middle'), style: AXIS_TEXT_STYLE });
-                    tx.textContent = tickLabel(t0 + fr * (end - t0), end - t0);
-                    svg.appendChild(tx);
+                var ticks = [], spanT = end - t0;
+                if (win.axisDays) {
+                    /* labels per local day (week, month) or per month (year), placed at the
+                     * middle of the visible part of that day/month; thinned out if too dense */
+                    var axR = win.axisRange;
+                    var need = axR === '7d' ? 80 : (axR === '30d' ? 48 : 70);
+                    var segs = [], sc0, sc1, guard;
+                    if (axR === '365d') {
+                        var dm = new Date(t0 * 1000);
+                        sc0 = new Date(dm.getFullYear(), dm.getMonth(), 1).getTime() / 1000;
+                        for (guard = 0; sc0 < end && guard < 40; guard++) {
+                            var dn = new Date(sc0 * 1000);
+                            sc1 = new Date(dn.getFullYear(), dn.getMonth() + 1, 1).getTime() / 1000;
+                            segs.push([ sc0, sc1 ]); sc0 = sc1;
+                        }
+                    } else {
+                        sc0 = localDayStart(t0);
+                        for (guard = 0; sc0 < end && guard < 400; guard++) {
+                            sc1 = localDayAdd(sc0, 1);
+                            segs.push([ sc0, sc1 ]); sc0 = sc1;
+                        }
+                    }
+                    var vis = segs.map(function(sg) {
+                        var a = Math.max(sg[0], t0), b = Math.min(sg[1], end);
+                        return { a: a, b: b, px: (b - a) / spanT * pw };
+                    }).filter(function(x) { return x.px > 0; });
+                    var fullPx = 1;
+                    vis.forEach(function(x) { if (x.px > fullPx) fullPx = x.px; });
+                    var step = Math.max(1, Math.ceil(need / fullPx));
+                    vis.forEach(function(x, i) {
+                        if (i % step !== 0 || x.px < Math.min(need, fullPx) * 0.8) return;
+                        var ep = (x.a + x.b) / 2, d = new Date(ep * 1000), txt;
+                        if (axR === '7d') txt = d.toLocaleDateString([], { weekday: 'short', day: 'numeric', month: 'numeric' });
+                        else if (axR === '30d') txt = d.toLocaleDateString([], { day: 'numeric', month: 'short' });
+                        else txt = d.toLocaleDateString([], { month: 'short', year: 'numeric' });
+                        ticks.push({ x: pl + (ep - t0) / spanT * pw, text: txt });
+                    });
+                } else {
+                    for (var nn = 0; nn < 5; nn++) {
+                        var epoch = t0 + (nn / 4) * spanT;
+                        ticks.push({ x: pl + (nn / 4) * pw, text: tickLabel(epoch, spanT) });
+                    }
                 }
+                ticks.forEach(function(tk) {
+                    var tx = svgEl('text', { x: tk.x, y: totalH - 9, 'text-anchor': 'middle', style: AXIS_TEXT_STYLE });
+                    tx.textContent = tk.text;
+                    svg.appendChild(tx);
+                });
                 chartHost.appendChild(svg);
  
                 var legend = E('div', { style: 'display:flex; flex-wrap:wrap; gap:4px 18px; justify-content:center; margin-top:8px; font-size:11.5px;' });
@@ -1618,7 +1705,7 @@ return view.extend({
                 v.loadedAt = Date.now();
                 if (!st.err) st.err = {};
                 return Promise.all(tiers.map(function(t) {
-                    return callHistory(1, t).then(function(d) {
+                    return callHistory(1, t, st.dim).then(function(d) {
                         st.data[t] = (d && d.buckets) ? d.buckets : [];
                         st.err[t] = false;
                     }).catch(function() {

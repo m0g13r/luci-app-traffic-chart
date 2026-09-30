@@ -42,6 +42,10 @@ fi
 tc_cfg INTERVAL 4 pint
 tc_cfg PERSIST_DIR "";  tc_cfg PERSIST_MOUNT "";  tc_cfg PERSIST_SEC 3600 int;  tc_cfg PERSIST_TIMEOUT 10 int
 tc_cfg TOOLTIPS 1 int;  tc_cfg L2_OVERHEAD auto l2
+tc_cfg ATTR_TOTALS 1 int;         tc_cfg ATTR_TOPAPPS 0 int;       tc_cfg ATTR_PORTS "" list
+tc_cfg ATTR_SKIP_PORTS "22 53 67 68 80 123 443 853 5353 5355" list
+tc_cfg ATTR_WIN 60 int;           tc_cfg ATTR_TOL 0.6 num;         tc_cfg ATTR_MIN 262144 int
+tc_cfg ATTR_SHARE 0.25 ratio;     tc_cfg ATTR_MAX_APPS 64 int;     tc_cfg ATTR_MAX_DEVICES 64 int
 
 CT_FILE="${CT_FILE:-/proc/net/nf_conntrack}"
 # Runtime state lives below /var/run by default; /var/run is root-owned on OpenWrt.
@@ -50,13 +54,13 @@ export OUT_DIR   # trafficchart-hosts (spawned via awk's pipe) needs this to fin
 V6HELPER="${V6HELPER:-/usr/libexec/trafficchart-v6prefixes}"
 HOSTS_HELPER="${HOSTS_HELPER:-/usr/libexec/trafficchart-hosts}"
 AWK="${AWK:-awk}"
+tc_cfg HIST_SEC 300 pint;        tc_cfg HIST_KEEP 288 pint
+tc_cfg HIST_HOUR_KEEP 744 pint;  tc_cfg HIST_DAY_KEEP 400 pint
+tc_cfg HOST_MAX 200 int;         tc_cfg APP_MAX 400 int;         tc_cfg ROW_KEEP 40 int
 INTERVAL_MAX="${INTERVAL_MAX:-20}"; ADAPT_BUDGET="${ADAPT_BUDGET:-0.45}"
 HOSTS_REFRESH_SEC="${HOSTS_REFRESH_SEC:-180}"; GUA_REFRESH_SEC="${GUA_REFRESH_SEC:-300}"
 RATE_WIN="${RATE_WIN:-20}"
-HIST_SEC="${HIST_SEC:-300}"; HIST_KEEP="${HIST_KEEP:-288}"
-HIST_HOUR_KEEP="${HIST_HOUR_KEEP:-192}"; HIST_DAY_KEEP="${HIST_DAY_KEEP:-400}"
 HOUR_SEC="${HOUR_SEC:-3600}"; DAY_SEC="${DAY_SEC:-86400}"
-HOST_MAX="${HOST_MAX:-200}"; APP_MAX="${APP_MAX:-400}"; ROW_KEEP="${ROW_KEEP:-40}"
 TBL_IDLE_LONG="${TBL_IDLE_LONG:-3600}"; TBL_IDLE_SHORT="${TBL_IDLE_SHORT:-600}"
 APP_HOLD="${APP_HOLD:-3}"                # polls a new flow waits for its netifyd label
 BIRTH_MAX="${BIRTH_MAX:-1073741824}"     # bytes: a flow first seen with more than this in ONE poll cannot be new - adopted as baseline
@@ -98,8 +102,21 @@ fi
 #                   "not attributed")
 case "$L2_OVERHEAD" in auto|[0-9]|[0-9][0-9]) ;; *) L2_OVERHEAD=auto ;; esac
 
-# PERSIST_DIR / PERSIST_MOUNT: space separated absolute paths (letters, digits and . _ - / only);
-# an invalid entry is dropped and logged
+# PERSIST_DIR / PERSIST_MOUNT: persistence is deliberately restricted to external/storage
+# trees. The UI ACL is read-only for normal users, and this second boundary makes the
+# daemon safe even if malformed UCI is supplied by another caller. Targets must be
+# existing directories under /mnt, /media, or /tmp/mnt. Symlinks are resolved before use.
+_persist_path_allowed() {
+    _p="$1"
+    [ -d "$_p" ] || return 1
+    command -v readlink >/dev/null 2>&1 || return 1
+    _rp=$(readlink -f "$_p" 2>/dev/null) || return 1
+    case "$_rp" in
+        /mnt|/mnt/*|/media|/media/*|/tmp/mnt|/tmp/mnt/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 _clean() {
     _out=""
     for _w in $1; do
@@ -109,7 +126,9 @@ _clean() {
             *) _w2="" ;;
         esac
         if [ -z "$_w2" ]; then
-            logger -t trafficchart "config: ignoring invalid path '$_w' (absolute path of letters, digits and . _ - / only)" 2>/dev/null
+            logger -t trafficchart "config: ignoring invalid persistence path '$_w'" 2>/dev/null
+        elif ! _persist_path_allowed "$_w2"; then
+            logger -t trafficchart "config: ignoring persistence path '$_w': must be an existing real directory under /mnt, /media, or /tmp/mnt" 2>/dev/null
         else
             _out="${_out:+$_out }$_w2"
         fi
@@ -171,6 +190,9 @@ $AWK -v CT_FILE="$CT_FILE" -v OUT="$OUT_DIR" -v INTERVAL="$INTERVAL" \
     -v L2_OVERHEAD="$L2_OVERHEAD" -v L2_INIT="$L2_INIT" -v L2_CANDIDATES="$L2_CANDIDATES" -v CAL_WIN="$CAL_WIN" -v CAL_KEEP="$CAL_KEEP" \
     -v CAL_MIN="$CAL_MIN" -v CAL_PCTL="$CAL_PCTL" -v CAL_TOL="$CAL_TOL" -v CAL_MAX_PKT="$CAL_MAX_PKT" -v CAL_MIN_PKTS="$CAL_MIN_PKTS" \
     -v UN_WIN="$UN_WIN" -v UN_WIN_RX="$UN_WIN_RX" -v UN_WIN_LONG="$UN_WIN_LONG" \
+    -v ATTR_TOTALS="$ATTR_TOTALS" -v ATTR_TOPAPPS="$ATTR_TOPAPPS" -v ATTR_PORTS="$ATTR_PORTS" -v ATTR_SKIP_PORTS="$ATTR_SKIP_PORTS" \
+    -v ATTR_WIN="$ATTR_WIN" -v ATTR_TOL="$ATTR_TOL" -v ATTR_MIN="$ATTR_MIN" -v ATTR_SHARE="$ATTR_SHARE" \
+    -v ATTR_MAX_APPS="$ATTR_MAX_APPS" -v ATTR_MAX_DEVICES="$ATTR_MAX_DEVICES" \
     -v MAPFILE="$OUT_DIR/apps.map" -v MAPVER="$OUT_DIR/apps.map.ver" '
 # "LAN-side" / non-WAN address? (RFC1918, loopback, link-local, multicast,
 # ULA, plus the dynamically discovered LAN GUA prefixes in "gua").
@@ -297,6 +319,7 @@ function dev_merge(old, new,   i, j, k, T, pk2) {
     dib[new] += dib[old]; dob[new] += dob[old]
     dipk[new] += dipk[old]; dopk[new] += dopk[old]
     dib_rt[new] += dib_rt[old]; dob_rt[new] += dob_rt[old]
+    dvi[new] += dvi[old]; dvo[new] += dvo[old]
     if (!(new in dname) && (old in dname)) dname[new] = dname[old]
     if (!(new in dvip) && (old in dvip)) dvip[new] = dvip[old]
 
@@ -351,6 +374,7 @@ function dev_merge(old, new,   i, j, k, T, pk2) {
 
     delete dib[old]; delete dob[old]; delete dipk[old]; delete dopk[old]
     delete dib_rt[old]; delete dob_rt[old]
+    delete dvi[old]; delete dvo[old]
     delete dname[old]; delete dvip[old]; delete dseen[old]; ndev--
     glog_msg("merged temporarily IP-keyed device " old " into " new " after address resolution")
 }
@@ -573,6 +597,129 @@ function router_key() {
     return "router"
 }
 
+# move volume of router application a from the Router device to device d, booked
+# on the device under the label ta (a generic proxy row, or the real name)
+function pair_xfer(d, a, tin, tout, ta,   i, ri) {
+    if (!TOOLTIPS) return
+    pair_add(d, ta, 1, 0, 0)
+    pair_add("router", a, 1, 0, 0)
+    if (!((d SUBSEP ta) in pidx) || !(("router" SUBSEP a) in pidx)) return
+    i = pidx[d SUBSEP ta]; ri = pidx["router" SUBSEP a]
+    pin[i] += tin; pout[i] += tout
+    pin[ri] -= tin; pout[ri] -= tout
+}
+
+# Sliding-window attribution of router WAN traffic to LAN devices.
+# Pools (key = dir SUBSEP poll SUBSEP name, dir 0 = download, 1 = upload):
+#   qr/qrp  router WAN bytes/packets per application, not yet attributed
+#   qv      bytes delivered to a device by a router service, not yet matched
+# Each poll: add the new volumes, match min(router pool, device pool), drop
+# entries older than ATTR_POLLS polls (unmatched router bytes simply stay on
+# the Router device).
+function router_attribute(   a, d) {
+    if (!ATTR_TOTALS) return      # no attribution of router WAN traffic to devices at all
+    for (a in rti) if (rti[a] > 0) { qr[0, n, a] += rti[a]; qrp[0, n, a] += rtip[a] }
+    for (a in rto) if (rto[a] > 0) { qr[1, n, a] += rto[a]; qrp[1, n, a] += rtop[a] }
+    for (d in vdl) if (vdl[d] > 0) qv[0, n, d] += vdl[d]
+    for (d in vul) if (vul[d] > 0) qv[1, n, d] += vul[d]
+    attr_match(0)
+    attr_match(1)
+    attr_expire()
+}
+
+function attr_expire(   k, p) {
+    for (k in qr) { split(k, p, SUBSEP); if (n - p[2] >= ATTR_POLLS) { delete qr[k]; delete qrp[k] } }
+    for (k in qv) { split(k, p, SUBSEP); if (n - p[2] >= ATTR_POLLS) delete qv[k] }
+}
+
+function attr_match(dir,   k, p, a, d, ra, rap, sel, vd, rem, used, cr, cv, picka, pickd, R0, best, ba, bd, s, x, pk, f, hi, i, bv) {
+    split("", ra); split("", rap); split("", sel); split("", vd)
+    split("", rem); split("", used); split("", cr); split("", cv)
+    split("", picka); split("", pickd)
+    R0 = 0
+    for (k in qr) {
+        split(k, p, SUBSEP)
+        if (p[1] != dir) continue
+        ra[p[3]] += qr[k]; rap[p[3]] += qrp[k]; R0 += qr[k]
+    }
+    for (k in qv) {
+        split(k, p, SUBSEP)
+        if (p[1] != dir) continue
+        vd[p[3]] += qv[k]
+    }
+    # Candidates: real router applications only (background traffic stays on "Router")
+    for (i = 1; ATTR_MAX_APPS <= 0 || i <= ATTR_MAX_APPS; i++) {
+        a = ""; bv = -1
+        for (k in ra) if (!(k in picka) && ra[k] >= ATTR_MIN && ra[k] >= R0 * ATTR_SHARE && ra[k] > bv) { a = k; bv = ra[k] }
+        if (a == "") break
+        picka[a] = 1; sel[a] = 1; rem[a] = ra[a]
+    }
+    for (i = 1; ATTR_MAX_DEVICES <= 0 || i <= ATTR_MAX_DEVICES; i++) {
+        d = ""; bv = -1
+        for (k in vd) if (!(k in pickd) && vd[k] >= ATTR_MIN && vd[k] > bv) { d = k; bv = vd[k] }
+        if (d == "") break
+        pickd[d] = 1
+    }
+    for (d in vd) if (!(d in pickd)) delete vd[d]
+
+    # Greedy 1:1 pairing by volume: always take the (application, device) pair
+    # with the smallest relative volume difference; every device only once.
+    # A proxy passes roughly through what it downloads, so upstream bytes of
+    # a stream ~ bytes delivered to exactly the one client that watches it.
+    while (1) {
+        best = 9; ba = ""; bd = ""
+        for (a in sel) {
+            if (rem[a] <= 0) continue
+            for (d in vd) {
+                if (d in used) continue
+                hi = (rem[a] > vd[d]) ? rem[a] : vd[d]
+                s = ((rem[a] > vd[d]) ? rem[a] - vd[d] : vd[d] - rem[a]) / hi
+                if (s < best) { best = s; ba = a; bd = d }
+            }
+        }
+        if (ba == "" || best > ATTR_TOL) break
+        x = (rem[ba] < vd[bd]) ? rem[ba] : vd[bd]
+        pk = rap[ba] * x / ra[ba]
+        if (dir == 0) {
+            pair_xfer(bd, ba, x, 0, (ATTR_TOPAPPS ? ba : "Proxy-Stream (via Router)"))
+            dib[bd] += x; dib["router"] -= x; dipk[bd] += pk; dipk["router"] -= pk
+            dib_rt[bd] += x; dib_rt["router"] -= x
+        } else {
+            pair_xfer(bd, ba, 0, x, (ATTR_TOPAPPS ? ba : "Proxy-Stream (via Router)"))
+            dob[bd] += x; dob["router"] -= x; dopk[bd] += pk; dopk["router"] -= pk
+            dob_rt[bd] += x; dob_rt["router"] -= x
+        }
+        used[bd] = 1; rem[ba] -= x; cr[ba] += x; cv[bd] += x
+    }
+
+    # consume only what was actually credited; the rest stays in the pools
+    for (k in qr) {
+        split(k, p, SUBSEP)
+        if (p[1] != dir || !(p[3] in cr)) continue
+        f = 1 - cr[p[3]] / ra[p[3]]
+        qr[k] *= f; qrp[k] *= f
+        if (f <= 0 || qr[k] < 0.5) { delete qr[k]; delete qrp[k] }
+    }
+    for (k in qv) {
+        split(k, p, SUBSEP)
+        if (p[1] != dir || !(p[3] in cv)) continue
+        f = 1 - cv[p[3]] / vd[p[3]]
+        qv[k] *= f
+        if (f <= 0 || qv[k] < 0.5) delete qv[k]
+    }
+}
+
+# does a LAN->router flow (original tuple "sport=.. dport=..") count as a router
+# service delivering to the device? TCP/UDP only, infrastructure ports excluded
+function attr_port_ok(proto, pp,   dp) {
+    if (proto != "tcp" && proto != "udp") return 0
+    if (!match(pp, /dport=[0-9]+/)) return 0
+    dp = substr(pp, RSTART + 6, RLENGTH - 6) + 0
+    if (nallow > 0) return (dp in aallow)
+    return !(dp in askip)
+}
+
+
 # trafficchart-apps writes apps.map, THEN bumps apps.map.ver. The map is only re-read
 # when that version changed (a tiny read instead of parsing the whole map every poll).
 # No version file (older trafficchart-apps) or an unreadable/empty one: read every poll.
@@ -617,6 +764,7 @@ function app_name(a) {
 # application names are bounded: beyond APP_MAX distinct ones the rest is summed as "(other)"
 function acct(dk, a, host, lan, d1, d2, q1, q2,   hk) {
     a = app_name(a)
+    if (dk == "router" && lan) { rti[a] += d2; rto[a] += d1; rtip[a] += q2; rtop[a] += q1 }
     app_add(a, lan, d1, d2, q1, q2)
     hk = host_add(host, lan, d1, d2, q1, q2)
     # TOOLTIPS=0: skip the per-flow tooltip-matrix bookkeeping entirely (2 mx_add +
@@ -716,9 +864,10 @@ function tcp_state_closing(s) {
 }
 
 function parse_pass(   line, r, h, proto, pp, t, sp, b1, b2, p1, p2,
-                       src, dst, rsrc, key, lan, d1, d2, q1, q2, k, flows, act, dk, ri, ro, rflow,
+                       src, dst, rsrc, key, lan, d1, d2, q1, q2, k, flows, act, dk, ri, ro, rflow, vflow,
                        tcpstate, forced_reset) {
     flows = 0
+    split("", rti); split("", rto); split("", rtip); split("", rtop); split("", vdl); split("", vul)
     while ((r = (getline line < CT_FILE)) > 0) {
         # Sequential match() extraction instead of split() + per-token tests:
         # roughly 7x faster in busybox awk, which is what OpenWrt ships.
@@ -775,14 +924,14 @@ function parse_pass(   line, r, h, proto, pp, t, sp, b1, b2, p1, p2,
 
 
         lan = src_local
-        rflow = 0
+        rflow = 0; vflow = 0
         # Router-originated WAN flow (e.g. stream proxy upstream): the router is the
         # initiator, so orig direction = upload (otherwise it would be taken for a
         # WAN-initiated port forward: directions swapped, device = remote server).
         if ((src in rtr) && !dst_local) { rflow = 1; lan = 1 }
         {
             if (rflow) { }                                                # router -> WAN, counted as device "Router"
-            else if (lan && (dst in rtr) && !(src in rtr)) continue       # LAN device -> router itself: not WAN traffic
+            else if (lan && (dst in rtr) && !(src in rtr)) vflow = 1      # LAN device -> router service
             else if (!lan && rsrc != "" && rsrc_local && !(rsrc in rtr)) { }   # WAN-initiated to a LAN host (port forward, IPv6 inbound)
             else if (!(lan && !dst_local)) continue                    # not LAN->WAN
         }
@@ -835,6 +984,22 @@ function parse_pass(   line, r, h, proto, pp, t, sp, b1, b2, p1, p2,
             d1 = b1; d2 = b2; q1 = p1; q2 = p2
         }
 
+        if (vflow) {
+            # LAN-local traffic to a router service: not WAN traffic. Volume is
+            # kept per device and used to attribute the WAN traffic of the router.
+            if (d1 > 0 || d2 > 0) {
+                dk = dev_key(1, src, "")
+                dvi[dk] += d2; dvo[dk] += d1
+                # Keep eligible LAN->router bytes in the attribution pool only.  They
+                # enter the device rate total when attr_match() actually pairs them
+                # with router WAN bytes in the same direction.
+                if (attr_port_ok(proto, pp)) { vdl[dk] += d2; vul[dk] += d1 }
+            }
+            pb1[key] = b1; pb2[key] = b2; pp1[key] = p1; pp2[key] = p2; gen[key] = n; gent[key] = t0
+            if (tcpstate != "") laststate[key] = tcpstate; else delete laststate[key]
+            continue
+        }
+
         act = (d1 > 0 || d2 > 0 || q1 > 0 || q2 > 0)
         dk = ""
         if (act) {
@@ -857,6 +1022,7 @@ function parse_pass(   line, r, h, proto, pp, t, sp, b1, b2, p1, p2,
     }
     close(CT_FILE)
     if (r < 0) return      # unreadable: keep state, do not sweep
+    router_attribute()
 
     # forget flows that are gone (their bytes stay in the class totals) -
     # but not after a pass that saw less than half of the previous flows:
@@ -1298,6 +1464,9 @@ function hist_reset(   T, i) {
     split("", aseen); split("", aib); split("", aob); split("", aip); split("", aop); napp = 0
     split("", dseen); split("", dib); split("", dob); split("", dipk); split("", dopk)
     split("", dib_rt); split("", dob_rt)
+    split("", dvi); split("", dvo)
+    split("", qr); split("", qrp); split("", qv)
+    split("", rti); split("", rto); split("", rtip); split("", rtop); split("", vdl); split("", vul)
     split("", dname); split("", dvip); ndev = 0
     split("", hseen); split("", hib); split("", hob); split("", hip); split("", hop); split("", hlast); nhost = 0
     split("", pidx); split("", pdv); split("", pap); split("", pin); split("", pout); split("", plast)
@@ -1330,9 +1499,12 @@ function hist_reset(   T, i) {
 # file I/O, so a hanging network share can stall the daemon for that timeout at most.
 # Per bucket and target only its timestamp is remembered (psv), not a position.
 
-function sh_t(cmd) { return system(tout_cur " sh -c \"" cmd "\" 2>/dev/null") }
+function sh_t(op, a, b, c) {
+    # Fixed helper operations only; no dynamically constructed shell program is executed.
+    return system(tout_cur " /usr/libexec/trafficchart-persist-exec " shq(op) " " shq(a) " " shq(b) " " shq(c) " 2>/dev/null")
+}
 
-function pname(i, T) { return shq(ptd[i]) "/history-" tname[T] ".jsonl" }
+function pname(i, T) { return ptd[i] "/history-" tname[T] ".jsonl" }
 
 # merge the buckets read from target i (pl2, pn2) into the RAM buckets of tier T:
 # union by timestamp, sorted, trimmed to the keep limit
@@ -1364,13 +1536,13 @@ function persist_fail(i, t, why, delay) {
 # first (or renewed) contact with target i
 function persist_attach1(i, t,   T, f, l, pn, rtmp) {
     if (pmt[i] != "" && system("grep -q \" " pmt[i] " \" /proc/mounts") != 0) { persist_fail(i, t, "mount", 30); return 0 }
-    if (sh_t("mkdir -p " shq(ptd[i]) " && [ -w " shq(ptd[i]) " ]") != 0) { persist_fail(i, t, "fs", 300); return 0 }
+    if (sh_t("check", ptd[i], "", "") != 0) { persist_fail(i, t, "fs", 300); return 0 }
     rtmp = OUT "/persist.rd"
     split("", prl); split("", pn2)
     for (T = 1; T <= 3; T++) {
         f = pname(i, T)
         system("rm -f " shq(rtmp))
-        if (sh_t("[ ! -e " f " ] || cat " f " > " shq(rtmp)) != 0) { persist_fail(i, t, "fs", 300); system("rm -f " shq(rtmp)); return 0 }
+        if (sh_t("read", f, rtmp, "") != 0) { persist_fail(i, t, "fs", 300); system("rm -f " shq(rtmp)); return 0 }
         pn = 0
         while ((getline l < rtmp) > 0) if (hist_valid(l)) prl[T, ++pn] = l
         close(rtmp)
@@ -1407,8 +1579,8 @@ function persist_flush_one(i, t,   T, j, k, c, f, comp, rc, ok, tt, tmp) {
             printf "" > tmp
             for (j = 1; j <= hn[T]; j++) print hj[T, j] > tmp
             close(tmp)
-            rc = sh_t("cp " shq(tmp) " " f ".tmp && mv -f " f ".tmp " f " || { rm -f " f ".tmp; false; }")
-        } else rc = sh_t("cat " shq(tmp) " >> " f)
+            rc = sh_t("replace", tmp, f, "")
+        } else rc = sh_t("append", tmp, f, "")
         if (rc != 0) { ok = 0; break }
         if (comp) { for (j = 1; j <= hn[T]; j++) psv[i, T, hist_t(hj[T, j])] = 1; hpfile[i, T] = hn[T] }
         else { for (k = 1; k <= c; k++) psv[i, T, ts[k]] = 1; hpfile[i, T] += c }
@@ -1537,23 +1709,24 @@ function emit(t,   s, tmp, a, first, k, nm, i, j, sc, nt, tsc, tky, pd, tot, n2,
 
     printf "%s", "},\"devices\":{" > tmp
     first = 1
-    xo_n = 0; xo_ib = 0; xo_ob = 0; xo_ip = 0; xo_op = 0; xo_ri = 0; xo_ro = 0
+    xo_n = 0; xo_ib = 0; xo_ob = 0; xo_ip = 0; xo_op = 0; xo_ri = 0; xo_ro = 0; xo_vi = 0; xo_vo = 0
     for (k in dseen) {
         if (k == "(other)" || !(k in keepD)) {
             xo_n++; xo_ib += dib[k]; xo_ob += dob[k]; xo_ip += dipk[k]; xo_op += dopk[k]
             xo_ri += rt_in["d" SUBSEP k]; xo_ro += rt_out["d" SUBSEP k]
+            xo_vi += dvi[k]; xo_vo += dvo[k]
             continue
         }
-        printf "%s\"%s\":{\"name\":\"%s\",\"ip\":\"%s\",%s%s,\"top\":[", (first ? "" : ","), k, dev_label(k), ((k in dvip) ? dvip[k] : ""), \
-                      jcnt(dib[k], dipk[k], dob[k], dopk[k]), jrate("d", k) > tmp
+        printf "%s\"%s\":{\"name\":\"%s\",\"ip\":\"%s\",%s%s,\"via_in\":%.0f,\"via_out\":%.0f,\"top\":[", (first ? "" : ","), k, dev_label(k), ((k in dvip) ? dvip[k] : ""), \
+                      jcnt(dib[k], dipk[k], dob[k], dopk[k]), jrate("d", k), dvi[k] + 0, dvo[k] + 0 > tmp
         for (j = 1; j <= tdn[k]; j++)
             printf "%s[\"%s\",%.0f,%.0f]", (j > 1 ? "," : ""), tda[k, j], tdi[k, j], tdo[k, j] > tmp
         printf "%s", "]}" > tmp
         first = 0
     }
     if (xo_n > 0)
-        printf "%s\"(other)\":{\"name\":\"(other)\",\"ip\":\"\",\"count\":%d,%s,\"in_bps\":%.0f,\"out_bps\":%.0f,\"top\":[]}", \
-               (first ? "" : ","), xo_n, jcnt(xo_ib, xo_ip, xo_ob, xo_op), xo_ri, xo_ro > tmp
+        printf "%s\"(other)\":{\"name\":\"(other)\",\"ip\":\"\",\"count\":%d,%s,\"in_bps\":%.0f,\"out_bps\":%.0f,\"via_in\":%.0f,\"via_out\":%.0f,\"top\":[]}", \
+               (first ? "" : ","), xo_n, jcnt(xo_ib, xo_ip, xo_ob, xo_op), xo_ri, xo_ro, xo_vi, xo_vo > tmp
 
     printf "%s", "},\"hosts\":{" > tmp
     first = 1
@@ -1648,6 +1821,14 @@ BEGIN {
     IDLE_SHORT_P = int(TBL_IDLE_SHORT / INTERVAL) + 5
     IDLE_MIN_P = int(TBL_IDLE_SHORT / 5 / INTERVAL) + 2   # last resort: idle for about 2 minutes
     HOST_MAX += 0; if (HOST_MAX < 20) HOST_MAX = 20
+    ATTR_MIN += 0; ATTR_SHARE += 0; ATTR_TOL += 0; ATTR_TOPAPPS += 0; ATTR_TOTALS += 0
+    ATTR_MAX_APPS += 0; ATTR_MAX_DEVICES += 0
+    nskip = split(ATTR_SKIP_PORTS, skipl, " ")
+    for (i = 1; i <= nskip; i++) askip[skipl[i] + 0] = 1
+    nallow = split(ATTR_PORTS, allowl, " ")
+    for (i = 1; i <= nallow; i++) aallow[allowl[i] + 0] = 1
+    ATTR_POLLS = int(ATTR_WIN / INTERVAL) + 1
+    if (ATTR_POLLS < 2) ATTR_POLLS = 2
     TBL_LOG_POLLS = int(3600 / INTERVAL) + 1
     ROW_KEEP += 0
     dtp = INTERVAL + 0

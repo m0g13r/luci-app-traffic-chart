@@ -9,7 +9,7 @@ AGG_FILE="/var/run/trafficchart/classes.json"
 HIST_DIR="${TC_OUT_DIR:-/var/run/trafficchart}"
 AGG_MAX_AGE=10          # seconds; at least two daemon intervals + 5 s are always allowed
 HIST_MAX_BYTES=800000   # never more than this many bytes (rpcd/ubus reply limit is 1 MB)
-HIST_MAX=600            # never return more buckets than this
+HIST_MAX=800            # never return more buckets than this (744 hourly buckets = 31 days)
 
 
 case "$1" in
@@ -17,7 +17,7 @@ case "$1" in
         # "history" is an optional parameter of get_stats (rather than a second
         # method) so no rpcd ACL change is needed for it. "tier" (5m | 1h | 1d)
         # selects the resolution, "n" limits the answer to the newest n buckets.
-        echo '{"get_stats": {"history": 1, "tier": "5m", "n": 1}, "restart": {}, "reset_history": {}}'
+        echo '{"get_stats": {"history": 1, "tier": "5m", "n": 1, "dim": "a"}, "restart": {}, "reset_history": {}}'
         ;;
     call)
         # rpcd exec protocol passes the method name as $2; "restart" and
@@ -67,6 +67,8 @@ case "$1" in
                 # get_stats {"history":1,"tier":"1h","n":200} -> newest n buckets of that tier
                 TIER=$(echo "$PARAMS" | sed -n 's/.*"tier" *: *"\([a-z0-9]*\)".*/\1/p')
                 HN=$(echo "$PARAMS" | sed -n 's/.*"n" *: *\([0-9][0-9]*\).*/\1/p')
+                # "dim" (a | d | h) = only that dimension per bucket (keeps long ranges under the ubus limit)
+                DIM=$(echo "$PARAMS" | sed -n 's/.*"dim" *: *"\([adh]\)".*/\1/p')
                 case "$TIER" in
                     1h) HIST_FILE="$HIST_DIR/history_1h.json" ;;
                     1d) HIST_FILE="$HIST_DIR/history_1d.json" ;;
@@ -76,8 +78,22 @@ case "$1" in
                 [ "$HN" -gt "$HIST_MAX" ] && HN=$HIST_MAX
                 if [ -r "$HIST_FILE" ]; then
                     # file = JSON array, one bucket per line; keep the newest HN
-                    awk -v N="$HN" -v TIER="$TIER" -v MAXB="$HIST_MAX_BYTES" '
-                        /^\{/ { sub(/,$/, ""); b[++c] = $0 }
+                    awk -v N="$HN" -v TIER="$TIER" -v MAXB="$HIST_MAX_BYTES" -v DIM="$DIM" '
+                        # bucket layout: {"t":..,"in":..,"out":..,"a":{..},"d":{..},"h":{..},"sh":{..}}
+                        # cut by position of the section keys (quotes in names are sanitized, so
+                        # these markers cannot occur inside a name)
+                        /^\{/ {
+                            sub(/,$/, "")
+                            if (DIM != "") {
+                                pa = index($0, ",\"a\":{"); pd = index($0, ",\"d\":{")
+                                ph = index($0, ",\"h\":{"); ps = index($0, ",\"sh\":")
+                                if (pa > 0 && pd > pa && ph > pd && ps > ph) {
+                                    keep = (DIM == "a") ? substr($0, pa, pd - pa) : (DIM == "d") ? substr($0, pd, ph - pd) : substr($0, ph, ps - ph)
+                                    $0 = substr($0, 1, pa - 1) keep substr($0, ps)
+                                }
+                            }
+                            b[++c] = $0
+                        }
                         END {
                             s = c - N + 1; if (s < 1) s = 1
                             tot = 0

@@ -63,7 +63,7 @@ qos_opt_flag() {
 # is no qdisc on nssifb yet (interface was not up when SQM started at boot).
 if [ -n "${ACTION}" ] && [ -n "${INTERFACE}" ] && [ -n "${DEVICE}" ]; then
   sqm_debug "${SCRIPT}: triggered by hotplug ${ACTION} for ${INTERFACE} (${DEVICE})"
-  if $TC qdisc show dev nssifb >/dev/null 2>&1; then
+  if "$TC" qdisc show dev nssifb >/dev/null 2>&1; then
     sqm_log "${SCRIPT}: TC qdisc is already installed on nssifb, not restarting to minimize the risk of crashes"
     exit 0
   fi
@@ -489,7 +489,7 @@ add_nsstbl() {
   # round to a multiple of the MTU
   BURST=`echo ${BURST} | awk -v MTU=$MTU '{print sprintf("%.0f",$0/MTU)*MTU}'`
 
-  $TC qdisc add dev $IF root handle 1: nsstbl rate ${SPEED}kbit burst ${BURST} mtu ${MTU}b || return 1
+  "$TC" qdisc add dev "$IF" root handle 1: nsstbl rate ${SPEED}kbit burst ${BURST} mtu ${MTU}b || return 1
   return 0
 }
 
@@ -526,7 +526,7 @@ add_nssfq_codel() {
     *) QDISC_OPTS="flows 1024 ${QDISC_OPTS}" ;;
   esac
 
-  $TC qdisc add dev $IF parent 1: handle 10: nssfq_codel `get_limit $LIMIT` `get_target ${TARGET} ${SPEED}` ${QDISC_OPTS} set_default || return 1
+  "$TC" qdisc add dev "$IF" parent 1: handle 10: nssfq_codel `get_limit $LIMIT` `get_target ${TARGET} ${SPEED}` ${QDISC_OPTS} set_default || return 1
   return 0
 }
 
@@ -564,7 +564,7 @@ ingress() {
   sqm_debug "ingress: Sleeping for a second.. "
   sleep 1
   sqm_debug "ingress: Enabling the $DEV ifb interface.. "
-  $IP link set up $DEV || return 1
+  "$IP" link set up "$DEV" || return 1
   return 0
 }
 
@@ -573,7 +573,7 @@ ingress() {
 sqm_prepare_script() {
     if [ ! -d /sys/module/nss_ifb ]; then
       sqm_log "sqm_prepare_script: required nss_ifb kernel module not detected, loading it now.. "
-      $INSMOD nss-ifb 2>>${OUTPUT_TARGET} || { sqm_error "Kernel module failed to load"; return 1; }
+      "$INSMOD" nss-ifb 2>>${OUTPUT_TARGET} || { sqm_error "Kernel module failed to load"; return 1; }
     fi
 
     # in theory allows changing the device the ifb is active on (not tested)
@@ -582,7 +582,7 @@ sqm_prepare_script() {
     # the stock sqm-stop deletes nssifb
     if [ ! -d /sys/devices/virtual/net/nssifb ]; then
       sqm_log "sqm_prepare_script: nssifb interface does not exist, creating.. "
-      $IP link add dev nssifb type nss_ifb || return 1
+      "$IP" link add dev nssifb type nss_ifb || return 1
     fi
     # one SQM instance only with NSS (see header)
     if [ "$(uci -q show sqm 2>/dev/null | grep -c "\.enabled='1'")" -gt 1 ]; then
@@ -610,7 +610,7 @@ sqm_start() {
         sqm_warn "sqm_start: ${SCRIPT} lacks egress() function or exited with an error"
       fi
     else
-      SILENT=1 $TC qdisc del dev ${IFACE} root
+      SILENT=1 "$TC" qdisc del dev "${IFACE}" root
       sqm_log "sqm_start: egress shaping deactivated"
     fi
 
@@ -622,7 +622,7 @@ sqm_start() {
         sqm_warn "sqm_start: ${SCRIPT} lacks ingress() function or exited with an error"
       fi
     else
-      SILENT=1 $TC qdisc del dev ${DEV} root
+      SILENT=1 "$TC" qdisc del dev "${DEV}" root
       sqm_log "sqm_start: ingress shaping deactivated"
     fi
 
@@ -634,18 +634,18 @@ sqm_start() {
 sqm_stop() {
     # egress shaper: independent of the download setting (silent, there is
     # nothing to delete if upload shaping was off)
-    SILENT=1 $TC qdisc del dev $IFACE root
+    SILENT=1 "$TC" qdisc del dev "$IFACE" root
 
     if [ "${DOWNLINK}" -ne 0 ] && [ -n "$CUR_IFB" ]; then
-       $TC qdisc del dev $CUR_IFB root
+       "$TC" qdisc del dev "$CUR_IFB" root
        sqm_debug "${0}: ${CUR_IFB} shaper deleted"
     fi
 
     nft delete table inet qos_custom 2>/dev/null
 
     if [ -n "$DELETENSSIFB" ]; then
-        [ -n "$CUR_IFB" ] && $IP link set dev "${CUR_IFB}" down
-        [ -n "$CUR_IFB" ] && $IP link delete "${CUR_IFB}" type nss_ifb
+        [ -n "$CUR_IFB" ] && "$IP" link set dev "${CUR_IFB}" down
+        [ -n "$CUR_IFB" ] && "$IP" link delete "${CUR_IFB}" type nss_ifb
         [ -n "$CUR_IFB" ] && sqm_debug "${0}: ${CUR_IFB} interface deleted"
     else
         # workaround for a bug in nssifb on kernel 5.10

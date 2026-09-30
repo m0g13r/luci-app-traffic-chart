@@ -17,7 +17,7 @@
             "path": "network/trafficchart_config"
         },
         "depends": {
-            "acl": [ "luci-app-traffic-chart" ]
+            "acl": [ "luci-app-traffic-chart-admin" ]
         }
     }
 }

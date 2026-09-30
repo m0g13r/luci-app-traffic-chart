@@ -47,6 +47,22 @@ return view.extend({
               'or a fixed number: 14 Ethernet, 18 +VLAN, 22 +PPPoE, 26 +PPPoE+VLAN, 0 = no correction.'));
         o.placeholder = 'auto';
 
+        o = s.option(form.Flag, 'attr_totals', _('Router proxy attribution'),
+            _('Tries to attribute the router\'s own WAN traffic (e.g. a stream proxy) to the LAN device it served, ' +
+              'instead of showing it generically as "Router".'));
+        o.default = '1';
+
+        o = s.option(form.Value, 'attr_ports', _('Router proxy port(s)'),
+            _('Port(s) of a stream proxy running on the router itself, space separated. Traffic served to LAN devices ' +
+              'through these ports is credited to the device instead of showing up as generic "Router" traffic. Leave empty to use every port except the infrastructure ports below.'));
+        o.placeholder = _('all except the infrastructure ports below');
+        o.depends('attr_totals', '1');
+
+        o = s.option(form.Value, 'attr_skip_ports', _('Router infrastructure ports'),
+            _('Only used when the field above is empty: ports that never count as "router is serving this device" (SSH, DNS, DHCP, NTP, DoT, mDNS, LuCI ...).'));
+        o.placeholder = '22 53 67 68 80 123 443 853 5353 5355';
+        o.depends('attr_totals', '1');
+
         o = s.option(form.Value, 'sock', _('netifyd socket'), _('Path of the netifyd JSON socket.'));
         o.validate = function(section_id, value) {
             if (value === null || value === '') return true;
@@ -57,18 +73,75 @@ return view.extend({
         o.placeholder = '/var/run/netifyd/netifyd.sock';
         o.depends('apps', '1');
 
+        s = m.section(form.NamedSection, 'global', 'trafficchart', _('Router proxy attribution – thresholds'),
+            _('Fine-tuning for the attribution algorithm. The defaults work well for typical stream proxies. ' +
+              'Only relevant when "Router proxy attribution" is enabled above.'));
+
+        o = s.option(form.Value, 'attr_win', _('Attribution window'),
+            _('Seconds: how long accumulated bytes stay in the pairing pool. Router WAN bytes that find no matching ' +
+              'device pool within this window stay on the Router device. Default: 60 s.'));
+        o.datatype = 'min(1)';
+        o.placeholder = '60';
+        o.depends('attr_totals', '1');
+
+        o = s.option(form.Value, 'attr_tol', _('Volume tolerance'),
+            _('Maximum fractional volume difference between a router application and a device pool for a match (0 – 1). ' +
+              'Lower = stricter matching. Default: 0.6 (60 %).'));
+        o.validate = function(section_id, value) {
+            if (value === null || value === '') return true;
+            var v = parseFloat(value);
+            return (v >= 0 && v <= 1) ? true : _('A fraction between 0 and 1 (e.g. 0.6).');
+        };
+        o.placeholder = '0.6';
+        o.depends('attr_totals', '1');
+
+        o = s.option(form.Value, 'attr_min', _('Minimum bytes for pairing'),
+            _('Both the router application pool and the device pool must hold at least this many bytes before a pair ' +
+              'is attempted. Prevents tiny background flows from being mis-attributed. Default: 262144 (256 KiB).'));
+        o.datatype = 'uinteger';
+        o.placeholder = '262144';
+        o.depends('attr_totals', '1');
+
+        o = s.option(form.Value, 'attr_share', _('Minimum router application share'),
+            _('A router application must account for at least this fraction of total router WAN volume to be a ' +
+              'candidate for attribution (prevents background traffic from being mis-credited). Default: 0.25 (25 %).'));
+        o.validate = function(section_id, value) {
+            if (value === null || value === '') return true;
+            var v = parseFloat(value);
+            return (v > 0 && v < 1) ? true : _('A fraction greater than 0 and less than 1 (e.g. 0.25).');
+        };
+        o.placeholder = '0.25';
+        o.depends('attr_totals', '1');
+
+        o = s.option(form.Value, 'attr_max_apps', _('Max candidate applications'),
+            _('Maximum number of router applications considered for attribution per poll (largest first). ' +
+              '0 = unlimited. Default: 64.'));
+        o.datatype = 'uinteger';
+        o.placeholder = '64';
+        o.depends('attr_totals', '1');
+
+        o = s.option(form.Value, 'attr_max_devices', _('Max candidate devices'),
+            _('Maximum number of LAN devices considered for attribution per poll (largest pool first). ' +
+              '0 = unlimited. Default: 64.'));
+        o.datatype = 'uinteger';
+        o.placeholder = '64';
+        o.depends('attr_totals', '1');
+
         s = m.section(form.NamedSection, 'global', 'trafficchart', _('History and persistent storage'),
-            _('The History tab keeps 5 minute buckets (24 hours), hourly buckets (week) and daily buckets (month, year). ' +
+            _('The History tab keeps 5 minute buckets (24 hours), hourly buckets (week, month) and daily buckets (year). ' +
               'Without a storage path they live in RAM only and are lost on reboot.'));
 
         function validPaths(section_id, value) {
             if (value === null || value === '') return true;
-            var ok = value.trim().split(/\s+/).every(function(w) { return w !== '/' && /^\/[A-Za-z0-9._\/-]+$/.test(w); });
-            return ok ? true : _('Absolute paths, separated by spaces; only letters, digits and . _ - / are allowed.');
+            var ok = value.trim().split(/\s+/).every(function(w) {
+                return /^\/(mnt|media|tmp\/mnt)(\/[A-Za-z0-9._-]+)+$/.test(w);
+            });
+            return ok ? true : _('Use existing directories below /mnt, /media, or /tmp/mnt; paths are separated by spaces.');
         }
 
         o = s.option(form.Value, 'persist_dir', _('Storage path(s)'),
             _('Directory (or several, separated by spaces) the history is saved to and reloaded from after a reboot; empty = RAM only. ' +
+              'Targets must already exist below /mnt, /media or /tmp/mnt; symlinks outside those storage trees are rejected by the daemon. ' +
               'All available targets are written (mirrors); a missing one is caught up when it is back. About 1 MB per day. ' +
               'The router mounts nothing itself.'));
         o.placeholder = '/mnt/nas/traffic /mnt/sda1/trafficchart';
@@ -95,6 +168,26 @@ return view.extend({
             _('Seconds an access to a target may take before it is given up (3-120). Use the "soft" mount option for network shares.'));
         o.datatype = 'range(3,120)';
         o.placeholder = '10';
+
+        o = s.option(form.Value, 'hist_sec', _('5-minute bucket length'),
+            _('Seconds per bucket of the finest resolution (24 hours view). Default: 300.'));
+        o.datatype = 'min(1)';
+        o.placeholder = '300';
+
+        o = s.option(form.Value, 'hist_keep', _('5-minute buckets kept'),
+            _('Default: 288 × 300 s = 24 h.'));
+        o.datatype = 'min(1)';
+        o.placeholder = '288';
+
+        o = s.option(form.Value, 'hist_hour_keep', _('Hourly buckets kept'),
+            _('Week and month view. Default: 744 = 31 days.'));
+        o.datatype = 'min(1)';
+        o.placeholder = '192';
+
+        o = s.option(form.Value, 'hist_day_keep', _('Daily buckets kept'),
+            _('Year view. Default: 400 days.'));
+        o.datatype = 'min(1)';
+        o.placeholder = '400';
 
         s = m.section(form.NamedSection, 'global', 'trafficchart', _('SQM classifier (nss-rk.qos)'),
             _('Optional extras of the nss-rk.qos nftables classifier (not used by the chart). All OFF by default. Restart SQM after changing them.'));
@@ -125,6 +218,24 @@ return view.extend({
             _('Zeroes the whole conntrack mark when SQM starts. Turn it off if mwan3 (or anything else) keeps state in the higher mark bits.'));
         o.default = '1';
         o.rmempty = false;
+
+        s = m.section(form.NamedSection, 'global', 'trafficchart', _('Advanced'));
+
+        o = s.option(form.Value, 'app_max', _('Max applications'),
+            _('Applications kept individually; further ones are summed as "(other)". Default: 400.'));
+        o.datatype = 'uinteger';
+        o.placeholder = '400';
+
+        o = s.option(form.Value, 'host_max', _('Max destinations'),
+            _('Destinations kept individually; idle ones are folded into "(other)" when the table is full. Default: 200.'));
+        o.datatype = 'uinteger';
+        o.placeholder = '200';
+
+        o = s.option(form.Value, 'row_keep', _('Rows listed individually'),
+            _('Devices and destinations listed individually in the live data (the most active ones); the rest is summed as "(other)". ' +
+              '0 = list everything. Default: 40.'));
+        o.datatype = 'uinteger';
+        o.placeholder = '40';
 
         return m.render();
     }
