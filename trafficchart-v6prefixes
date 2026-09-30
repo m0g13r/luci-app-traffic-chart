@@ -8,12 +8,12 @@
 # ("2a02:1234:5678:0001:..."), so each route is expanded to 8 groups first.
 #
 # Prefix lengths that are not a multiple of 16 (e.g. /65, /60, /68 - not
-# unusual with some ISPs' DHCPv6-PD allocations) used to be silently rounded
+# unusual with some ISPs' DHCPv6-PD allocations) were silently rounded
 # DOWN to the nearest full 16-bit group: int(mask/16) simply dropped the
 # leftover bits, so a /65 was matched as if it were a /64. That widens the
 # matched range to twice the real delegation and can misclassify addresses
 # outside it (in the other half of that /64) as LAN, which feeds straight
-# into trafficchart-agg's islocal() and therefore device/router attribution.
+# into trafficchart-agg's islocal() and therefore device attribution.
 #
 # This version matches the prefix exactly: full 16-bit groups are matched
 # literally, and a partially covered group is matched with a hex-digit

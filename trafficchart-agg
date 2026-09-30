@@ -1,323 +1,82 @@
 #!/bin/sh
-# trafficchart-agg - persistent conntrack aggregator for luci.trafficchart
+# trafficchart-agg - conntrack aggregator for luci.trafficchart
 #
-# Runs as a procd service (see trafficchart.init). Every INTERVAL seconds it
-# walks /proc/net/nf_conntrack ONCE, remembers the last-seen counters of every
-# flow, and adds only the per-flow DELTA to monotonically growing totals per
-# application, device and destination. Result is written atomically to
-# $OUT_DIR/classes.json (file name kept), which luci.trafficchart just serves.
+# Runs as a procd service (see the init script). Every INTERVAL seconds it walks
+# /proc/net/nf_conntrack once, remembers the last counters of every flow and adds only the
+# per-flow DELTA to monotonically growing totals per application, device and destination
+# (so closing flows never remove bytes). The link rate comes from the qdisc counters
+# (trafficchart-tc), read in the same loop iteration. Result: $OUT_DIR/classes.json,
+# which luci.trafficchart just serves; history: history.json / _1h / _1d (RAM mirror,
+# optionally persisted).
 #
-# Why per-flow deltas instead of "sum of all live flows" (the old approach):
-#   - a flow that closes/expires no longer removes its bytes from the totals
-#   - totals survive page reloads and are shared by all open tabs
+# Inputs: /proc/net/nf_conntrack, the qdisc counters, and optionally the netifyd flow labels
+# (trafficchart-apps) and the neighbour table / DHCP names (trafficchart-hosts).
+# Nothing depends on which shaper or classifier is in use (no marks, no DSCP, no port lists).
 #
-# Flow-tuple reuse: /proc/net/nf_conntrack exposes no connection-generation
-# id, only a 5-tuple, so a brand new connection that reuses the exact same
-# tuple as a just-closed one (common for short HTTP/API connections, made
-# more likely by GONE_GRACE keeping a "gone" tuple's baseline around for a
-# few more polls) looks identical to the old one continuing - counted as a
-# jump backward (handled below) only if the new connection happens to have
-# fewer bytes than the old one's last known total; if it already has MORE by
-# the time we see it, the old connection's total is silently lost. For TCP,
-# parse_pass() also tracks the conntrack state word per tuple and forces a
-# reset whenever a tuple that was last seen winding down (TIME_WAIT/CLOSE/...)
-# is seen active again (see tcp_state_closing()) - a real single connection
-# can never make that transition, so this catches the common short-TCP-flow
-# case regardless of the byte counts involved. It does NOT help UDP/ICMP
-# (no state field) or a TCP reuse that lands squarely within one still-active
-# state (e.g. two connections both caught mid-ESTABLISHED). Short of conntrack
-# netlink events (a bigger architectural change) this residual gap cannot be
-# fully closed from procfs snapshots alone.
+# A flow counts when it is LAN client -> non-local destination, router -> WAN, or
+# WAN-initiated to a LAN host (port forward, IPv6 inbound). LAN<->LAN and LAN -> router
+# flows are not WAN traffic. Devices are identified by MAC (IPv4 and all IPv6 addresses of
+# one host end up in one device); the router's own WAN traffic is the device "Router".
+# A flow without a netifyd label is named "[proto/port]".
 #
-# Which flows count: no class marks, DSCP or port lists are involved, so this works
-# with any shaper (nss-rk.qos, cake/htb SQM, qosmate, dscpclassify, none at all). The only
-# inputs are the two counters this daemon reads itself: per-flow bytes/packets from
-# /proc/net/nf_conntrack and the qdisc counters of the link (trafficchart-tc). A flow is
-# counted when it is LAN client -> non-local destination, router -> WAN, or WAN-initiated to
-# a LAN host (port forward, IPv6 inbound). LAN<->LAN and router-local flows are not WAN
-# traffic and are skipped (LAN device -> router service flows are only tracked for the
-# router attribution, see below). A flow without a netifyd label is named after its
-# protocol/port (e.g. "[tcp/443]"), or after the label netifyd gave the same port elsewhere.
+# Tooltips (option tooltips, default 1): per application the top destinations, per destination
+# the top devices, per device the top applications (bounded tables, see MX_MAX / PAIR_MAX;
+# tooltips 0 switches the bookkeeping off, totals and history are not affected).
 #
-# Per-application view (optional): trafficchart-apps writes $OUT_DIR/apps.map
-# (flow tuple -> application, from netifyd). Every active flow that has a
-# label adds its conntrack DELTA to that application; netifyd only names
-# flows, it never supplies numbers. A new flow is held for up to APP_HOLD
-# polls waiting for its label (netifyd -> map file -> this poll takes a
-# moment); if none arrives its bytes go to "[<class>]" (e.g. "[WEB]") so the
-# application totals always add up to the class totals. Without apps.map
-# everything simply lands in the "[<class>]" buckets.
-# Unlabelled flows first try a learned service name: the netifyd label seen
-# for the same protocol/port (e.g. udp/123 -> "ntp"), used only while that
-# label is unambiguous; otherwise the "[<class>]" bucket. This keeps one
-# service from appearing twice ("ntp" and "[NTP]").
+# "Not attributed": what the shaper (tc) carries but conntrack does not count, after
+# subtracting the link layer header (tc counts it, conntrack does not). The header size is
+# measured automatically (option l2_overhead 'auto', or a fixed number of bytes per packet).
 #
-# Per-device view: every flow delta is also added to the LAN device that
-# owns the flow (initiator = original source; for WAN-initiated flows the
-# port-forward target = source of the reply tuple). Devices are identified by
-# MAC via trafficchart-hosts (neighbour table + DHCP names), so IPv4 and all
-# IPv6 (privacy) addresses of one host end up in one device; unknown MACs
-# fall back to the IP address.
-#
-# Why an IPv4 client's IPv6 (privacy) address can show up as its OWN device
-# instead of folding into the same MAC: with NSS hardware offload, once a
-# flow is fast-pathed its packets stop reaching the kernel entirely, so the
-# kernel's IPv6 Neighbour Unreachability Detection never sees confirming
-# traffic for that address, times it out (STALE -> FAILED) and drops it from
-# "ip neigh show" - even though the device is still actively sending via the
-# hardware fast path. The next new flow from that (now unresolved) address is
-# then keyed by the raw IPv6 address instead of the MAC. To fix this, every
-# raw-IPv6 device key seen here is remembered in v6seen[] and, every
-# refresh_hosts() cycle, written to OUT_DIR/unresolved_v6 (see
-# write_unresolved()) BEFORE trafficchart-hosts runs; that script pings each
-# address, which makes the kernel re-run Neighbour Discovery, so the
-# following "ip neigh show" has a fresh entry and the address folds back into
-# the right MAC-keyed device again. Bytes already booked under the old
-# IP-keyed device are not retroactively merged - this only prevents the
-# split from recurring going forward.
-#
-# Live flows: per-flow smoothed rate (EMA over the polls); the 25 busiest
-# flows are published with device, application, destination and class.
-#
-# Destinations ("hosts"): netifyd supplies the SNI / DNS-cache host name of a
-# flow (3rd column of apps.map); it is folded to the registrable domain
-# (rr4.sn-x.googlevideo.com -> googlevideo.com). Flows without a name use the
-# remote IP.
-#
-# Per-device top applications: cumulative device x application matrix, the
-# 10 biggest applications of every device are published with the device.
-#
-# History: three resolutions, all computed from the full totals (not from each other):
-#   5m  every HIST_SEC seconds (default 300)       HIST_KEEP       buckets (288 = 24 h)
-#   1h  every full local hour                      HIST_HOUR_KEEP  buckets (192 = 8 days)
-#   1d  every local midnight                       HIST_DAY_KEEP   buckets (400 days)
-# Each bucket holds the deltas of the top applications / devices / destinations,
-# plus the shaper's dropped/ECN packet deltas of that period (see "sh" below).
-# They are kept in RAM and mirrored to $OUT_DIR/history.json, history_1h.json,
-# history_1d.json (reloaded when the daemon restarts).
-#
-# Shaper health in the history ("sh" key of each bucket, {"rx":[drop,ecn,peak_backlog_bytes],"tx":[...]}):
-# (the backlog is momentary, so each open bucket keeps the highest value seen at a poll)
-# trafficchart-tc additionally prints the shaper qdiscs' CUMULATIVE dropped-packet
-# and ECN-mark counters (tc_shaper_drops() in trafficchart-common), read in the
-# same loop iteration as the byte counters (tc_update() below). This daemon turns
-# them into per-poll deltas the same way tc bytes become tc_rx_rate/tc_tx_rate,
-# and hist_close() turns the running per-poll sums into a per-bucket delta the
-# same way it already does for aib/aob etc. A history full of application/device
-# byte totals but no idea when the link was actually congested (drops, ECN) was
-# the main thing "lost" in the old History tab - this puts it back.
-#
-# Persistence (option persist_dir, empty = off): the buckets are additionally appended
-# to PERSIST_DIR/history-{5m,1h,1d}.jsonl every PERSIST_SEC seconds (only the new
-# buckets, so flash wear stays tiny; the files are rewritten when they got twice as
-# long as needed) and reloaded after a reboot. PERSIST_DIR may list several targets
-# (space separated, e.g. a NAS mount and a USB stick): all usable targets are written
-# (mirrors). An unusable one is retried; when it is back it gets what it missed and
-# what it holds is merged in. PERSIST_MOUNT (optional, list): a target below one of
-# these paths is only used while that path is a mount point (otherwise mkdir would
-# create the directory on the flash below a mount that is not there yet). Every access
-# runs under "timeout PERSIST_TIMEOUT" so a hanging share cannot block the daemon for
-# longer. When the service is stopped (also on reboot / restart) the init script asks
-# the daemon (stop.req) to close the open buckets as partial buckets and flush them, so
-# nothing is lost on a clean stop; a power failure loses at most PERSIST_SEC seconds
-# plus the open bucket.
-# Bucket boundaries of 1h / 1d are only used while the clock is plausible.
-#
-# History reset (reset.req, separate from a service restart): luci.trafficchart's
-# "reset_history" ubus call touches $OUT_DIR/reset.req. This daemon checks for it once
-# per poll (same mechanism as stop.req) and, if present, clears the cumulative
-# application/device/destination/shaper totals and the in-RAM history of all three
-# tiers (see hist_reset()), then keeps running - no procd bounce, no re-attaching of
-# persistence targets, live per-flow tracking (and so the "top flows" list) is
-# unaffected. Buckets already written to a persistent storage path are left alone
-# (only the RAM view is cleared); delete those files yourself if you also want the
-# on-disk archive gone. Before this, the only way to reset the totals shown on the
-# page was "Restart service", which also bounces the whole daemon.
-#
-# Router-originated traffic (e.g. a stream proxy running on the router):
-# such flows have the router as source, so they used to be ignored, while
-# the LAN device that watches the stream only talks to the router (LAN-local,
-# not WAN traffic) - the stream was invisible for that device. Now
-#   - router-originated WAN flows are counted (device "Router", class from the
-#     application/destination from netifyd like any other flow);
-#   - LAN device -> router flows are NOT counted as WAN traffic, but their
-#     volume is tracked per device ("via_in"/"via_out") and used to
-#     ATTRIBUTE the router's WAN traffic: router WAN volume (per application)
-#     and per-device delivery are kept in two pools and matched within a
-#     sliding window of ATTR_WIN seconds, regardless of which poll each fell
-#     into (a segment proxy downloads upstream first and serves the client in
-#     a later poll). Per poll min(router pool, device pool) is credited to the
-#     devices. Only flows to real router services take part: DNS, DHCP, NTP,
-#     SSH and the LuCI page itself (ATTR_SKIP_PORTS) never pull router traffic
-#     onto a device, and only router applications that are a real part of the
-#     router's WAN volume (ATTR_MIN, ATTR_SHARE) are candidates - background
-#     traffic of the router (netifyd, updates ...) stays on the Router device.
-#     Unmatched router bytes stay on the Router device as well.
-#
-# Rates: every entry (application / device / destination) also carries
-# "in_bps" / "out_bps" = bytes per second averaged over the last RATE_WIN
-# seconds (profile: realtime 10, balanced/low-cpu 20, very-low-cpu 30), measured on the clock of THIS daemon. A plain moving
-# average over a fixed window is unbiased: a new stream reaches its real rate
-# after exactly one window and drops to 0 exactly one window after it stopped
-# (the old browser side EMA needed ~50 s to show 90 % of a new stream). The link
-# rate comes from the tc qdisc counters (helper trafficchart-tc), read in the SAME
-# loop iteration and timed with the same clock, so the numbers of one sample
-# belong together no matter how many browser tabs are open or how late they poll.
-# Traffic that the shaper carries but conntrack accounting does not (WAN traffic to
-# router services, inbound packets the firewall drops, multicast, control frames,
-# flows the classifier above skips) is reported as "un_rx_*" / "un_tx_*" and shown as
-# its own "Not attributed" row instead of being spread over the real applications:
-#     d(tc bytes) - d(conntrack bytes) - L2 header * d(conntrack packets)
-# The link layer header (tc counts it, conntrack does not) is measured automatically,
-# see L2_OVERHEAD below. LAN-local flows never reach the WAN shaper and are not part
-# of it. Rates over UN_WIN seconds (download: UN_WIN_RX, longer, because the counter
-# sync of big NSS downloads jitters more). Reported is the SMALLER of that short-window rate
-# and a UN_WIN_LONG rate (default 300s, 0 = off): a start/end timing offset between the shaper
-# and conntrack counters shows up as a swing in the short window that nets out to about zero
-# over the long one, so it is suppressed; a persistently missing volume is not.
-#
-# Bounded memory: applications (APP_MAX), tooltip matrices (MX_MAX, PAIR_MAX) have a
-# size limit; when one is full, long idle entries are dropped first (TBL_IDLE_*).
-#
-# apps.map: trafficchart-apps bumps apps.map.ver after every write; the map is only
-# re-read when that changed.
-#
-# TOOLTIPS (default 1): 0 disables the per-flow tooltip-matrix bookkeeping (application x
-# destination, destination x device, device x application - the "top applications" /
-# "top destinations" lists in the Live tabs' tooltips). Real CPU cost, paid on every
-# accounted flow delta regardless of whether tooltip_every ever renders it. Totals and
-# the History tab are computed independently and are NOT affected by this flag.
-#
-# Environment overrides (mainly for testing): CT_FILE OUT_DIR INTERVAL
-# V6HELPER AWK APP_HOLD HOSTS_HELPER HIST_SEC HIST_KEEP ATTR_WIN BIRTH_MAX GONE_GRACE
-# ATTR_PORTS ATTR_SKIP_PORTS ATTR_MIN ATTR_SHARE ATTR_TOL ATTR_MAX_APPS ATTR_MAX_DEVICES TOOLTIPS TC_STATS
-# ADAPT_INTERVAL INTERVAL_MAX ADAPT_BUDGET TOOLTIP_EVERY HOSTS_REFRESH_SEC GUA_REFRESH_SEC
-# L2_OVERHEAD L2_INIT L2_CANDIDATES CAL_WIN CAL_KEEP CAL_MIN CAL_PCTL CAL_TOL CAL_MAX_PKT
-# CAL_MIN_PKTS UN_WIN UN_WIN_RX UN_WIN_LONG APP_MAX MX_MAX PAIR_MAX TBL_IDLE_LONG TBL_IDLE_SHORT
-# TC_HELPER ROW_KEEP RATE_WIN PERSIST_DIR PERSIST_MOUNT PERSIST_SEC PERSIST_TIMEOUT HIST_HOUR_KEEP HIST_DAY_KEEP
-# HOUR_SEC DAY_SEC (tier lengths, testing only) TC_COMMON HOST_MAX
-#
-# Every variable can also be set in /etc/config/trafficchart (option = variable name in
-# lower case, see trafficchart.config). The environment wins over UCI.
+# Settings (/etc/config/trafficchart, section global; the environment wins):
+#   interval (s, default 4)          poll interval, stretches automatically under load
+#   persist_dir / persist_mount / persist_sec / persist_timeout   optional, see the settings page
+# Everything else is fixed below. Environment overrides for testing: CT_FILE OUT_DIR AWK
+# V6HELPER HOSTS_HELPER TC_HELPER TC_COMMON and every constant below.
 
 TC_COMMON="${TC_COMMON:-/usr/libexec/trafficchart-common}"
 if [ -r "$TC_COMMON" ]; then
     . "$TC_COMMON"
-    tc_cfg PROFILE low-cpu string
-    PROFILE_INTERVAL=2
-    PROFILE_ADAPT_INTERVAL=1
-    PROFILE_INTERVAL_MAX=10
-    PROFILE_ADAPT_BUDGET=0.30
-    PROFILE_TOOLTIP_EVERY=0
-    PROFILE_HOSTS_REFRESH_SEC=60
-    PROFILE_GUA_REFRESH_SEC=120
-    PROFILE_RATE_WIN=30
-    PROFILE_MX_MAX=2000
-    PROFILE_PAIR_MAX=1000
-    case "$PROFILE" in
-        realtime)
-            PROFILE_INTERVAL=1;            PROFILE_ADAPT_INTERVAL=1;     PROFILE_INTERVAL_MAX=5
-            PROFILE_ADAPT_BUDGET=0.15;     PROFILE_TOOLTIP_EVERY=1;      PROFILE_HOSTS_REFRESH_SEC=30
-            PROFILE_GUA_REFRESH_SEC=60;    PROFILE_RATE_WIN=10
-            PROFILE_MX_MAX=4000;           PROFILE_PAIR_MAX=2000
-            ;;
-        balanced)
-            PROFILE_INTERVAL=2;            PROFILE_ADAPT_INTERVAL=1;     PROFILE_INTERVAL_MAX=10
-            PROFILE_ADAPT_BUDGET=0.30;     PROFILE_TOOLTIP_EVERY=0;      PROFILE_HOSTS_REFRESH_SEC=60
-            PROFILE_GUA_REFRESH_SEC=120;   PROFILE_RATE_WIN=20
-            PROFILE_MX_MAX=2000;           PROFILE_PAIR_MAX=1000
-            ;;
-        low-cpu)
-            PROFILE_INTERVAL=4;            PROFILE_ADAPT_INTERVAL=1;     PROFILE_INTERVAL_MAX=20
-            PROFILE_ADAPT_BUDGET=0.45;     PROFILE_TOOLTIP_EVERY=2;      PROFILE_HOSTS_REFRESH_SEC=180
-            PROFILE_GUA_REFRESH_SEC=300;   PROFILE_RATE_WIN=20
-            PROFILE_MX_MAX=1000;           PROFILE_PAIR_MAX=500
-            ;;
-        very-low-cpu)
-            PROFILE_INTERVAL=6;            PROFILE_ADAPT_INTERVAL=1;     PROFILE_INTERVAL_MAX=30
-            PROFILE_ADAPT_BUDGET=0.55;     PROFILE_TOOLTIP_EVERY=3;      PROFILE_HOSTS_REFRESH_SEC=300
-            PROFILE_GUA_REFRESH_SEC=600;   PROFILE_RATE_WIN=30
-            PROFILE_MX_MAX=500;            PROFILE_PAIR_MAX=250
-            ;;
-        *)
-            PROFILE=balanced
-            PROFILE_INTERVAL=2;            PROFILE_ADAPT_INTERVAL=1;     PROFILE_INTERVAL_MAX=10
-            PROFILE_ADAPT_BUDGET=0.30;     PROFILE_TOOLTIP_EVERY=0;      PROFILE_HOSTS_REFRESH_SEC=60
-            PROFILE_GUA_REFRESH_SEC=120;   PROFILE_RATE_WIN=20
-            PROFILE_MX_MAX=2000;           PROFILE_PAIR_MAX=1000
-            ;;
-    esac
-    tc_cfg INTERVAL "$PROFILE_INTERVAL" pint
-    tc_cfg ADAPT_INTERVAL "$PROFILE_ADAPT_INTERVAL" int
-    tc_cfg INTERVAL_MAX "$PROFILE_INTERVAL_MAX" pint
-    tc_cfg ADAPT_BUDGET "$PROFILE_ADAPT_BUDGET" ratio
-    tc_cfg TOOLTIP_EVERY "$PROFILE_TOOLTIP_EVERY" int
-    tc_cfg HOSTS_REFRESH_SEC "$PROFILE_HOSTS_REFRESH_SEC" pint
-    tc_cfg GUA_REFRESH_SEC "$PROFILE_GUA_REFRESH_SEC" pint
-    tc_cfg RATE_WIN "$PROFILE_RATE_WIN" pint
-    tc_cfg HIST_SEC 300 pint;         tc_cfg HIST_KEEP 288 pint
-    tc_cfg HIST_HOUR_KEEP 192 pint;   tc_cfg HIST_DAY_KEEP 400 pint
-    tc_cfg PERSIST_DIR "";            tc_cfg PERSIST_MOUNT "";         tc_cfg PERSIST_SEC 3600 int
-    tc_cfg PERSIST_TIMEOUT 10 int
-    tc_cfg HOST_MAX 200 int
-    tc_cfg APP_HOLD 3 int;            tc_cfg APP_MAX 400 int;          tc_cfg MX_MAX "$PROFILE_MX_MAX" int
-    tc_cfg PAIR_MAX "$PROFILE_PAIR_MAX" int;   tc_cfg TBL_IDLE_LONG 3600 int;   tc_cfg TBL_IDLE_SHORT 600 int
-    tc_cfg BIRTH_MAX 1073741824 int;  tc_cfg GONE_GRACE 5 int
-    tc_cfg L2_OVERHEAD auto l2;       tc_cfg L2_INIT 18 int;           tc_cfg L2_CANDIDATES "0 14 18 22 26" list
-    tc_cfg CAL_WIN 30 pint;           tc_cfg CAL_KEEP 60 pint;         tc_cfg CAL_MIN 8 pint
-    tc_cfg CAL_PCTL 25 int;           tc_cfg CAL_MAX_PKT 400 int;      tc_cfg CAL_MIN_PKTS 500 pint
-    tc_cfg CAL_TOL 1 int;             tc_cfg UN_WIN 30 pint;           tc_cfg UN_WIN_RX 60 pint
-    tc_cfg UN_WIN_LONG 300 int      # 0 = off (allowed)
-    tc_cfg TOOLTIPS 1 int
-    tc_cfg TC_STATS 1 int
-    tc_cfg ROW_KEEP 40 int          # 0 = off: devices/destinations listed individually in the live JSON, the rest is folded into "(other)"
-    tc_cfg ATTR_TOTALS 1 int;         tc_cfg ATTR_TOPAPPS 0 int;       tc_cfg ATTR_PORTS "" list
-    tc_cfg ATTR_SKIP_PORTS "22 53 67 68 80 123 443 853 5353 5355" list
-    tc_cfg ATTR_WIN 60 int;           tc_cfg ATTR_TOL 0.6 num;         tc_cfg ATTR_MIN 262144 int
-    tc_cfg ATTR_SHARE 0.25 ratio;       tc_cfg ATTR_MAX_APPS 64 int;     tc_cfg ATTR_MAX_DEVICES 64 int
+else
+    tc_cfg() { eval "[ -n \"\${$1+x}\" ] || $1=\"\$2\""; }
 fi
+tc_cfg INTERVAL 4 pint
+tc_cfg PERSIST_DIR "";  tc_cfg PERSIST_MOUNT "";  tc_cfg PERSIST_SEC 3600 int;  tc_cfg PERSIST_TIMEOUT 10 int
+tc_cfg TOOLTIPS 1 int;  tc_cfg L2_OVERHEAD auto l2
 
 CT_FILE="${CT_FILE:-/proc/net/nf_conntrack}"
 OUT_DIR="${OUT_DIR:-/tmp/trafficchart}"
 export OUT_DIR   # trafficchart-hosts (spawned via awk's pipe) needs this to find unresolved_v6
 V6HELPER="${V6HELPER:-/usr/libexec/trafficchart-v6prefixes}"
-AWK="${AWK:-awk}"
-APP_HOLD="${APP_HOLD:-3}"
 HOSTS_HELPER="${HOSTS_HELPER:-/usr/libexec/trafficchart-hosts}"
-HIST_SEC="${HIST_SEC:-300}"
-HIST_KEEP="${HIST_KEEP:-288}"
-BIRTH_MAX="${BIRTH_MAX:-1073741824}"   # bytes: a flow first seen (or restarted) with more than this in ONE poll cannot be new - it is adopted as baseline instead of booked
-GONE_GRACE="${GONE_GRACE:-5}"          # polls a flow may be missing (short procfs read) before its state is dropped
-ATTR_WIN="${ATTR_WIN:-60}"   # seconds: window in which router WAN volume and client delivery are matched
-# Attribution of router WAN traffic to LAN devices (see "Router-originated traffic" above):
-# LAN->router flows to these destination ports are infrastructure (SSH, DNS, DHCP,
-# NTP, DoT, mDNS/LLMNR, LuCI on 80/443) and never count as "device is being served
-# by a router service". Remove 80/443 if the stream proxy itself listens there.
-# ATTR_SKIP_PORTS was loaded above.
-# Stricter: if set, ONLY LAN->router flows to these ports count (ATTR_SKIP_PORTS is then ignored).
-# Port of the stream proxy on the router; empty = every port except ATTR_SKIP_PORTS.
- # ATTR_PORTS, ATTR_TOTALS, ATTR_TOPAPPS, RATE_WIN and UN_WIN were loaded above.
-TC_HELPER="${TC_HELPER:-/usr/libexec/trafficchart-tc}"   # prints "<rx_bytes> <tx_bytes> <rx_drop> <rx_ecn> <tx_drop> <tx_ecn>" of the shapers; without it the page falls back to browser side rates and no shaper history
-# run via sh so a missing execute bit no longer disables it silently
+AWK="${AWK:-awk}"
+INTERVAL_MAX="${INTERVAL_MAX:-20}"; ADAPT_BUDGET="${ADAPT_BUDGET:-0.45}"
+HOSTS_REFRESH_SEC="${HOSTS_REFRESH_SEC:-180}"; GUA_REFRESH_SEC="${GUA_REFRESH_SEC:-300}"
+RATE_WIN="${RATE_WIN:-20}"
+HIST_SEC="${HIST_SEC:-300}"; HIST_KEEP="${HIST_KEEP:-288}"
+HIST_HOUR_KEEP="${HIST_HOUR_KEEP:-192}"; HIST_DAY_KEEP="${HIST_DAY_KEEP:-400}"
+HOUR_SEC="${HOUR_SEC:-3600}"; DAY_SEC="${DAY_SEC:-86400}"
+HOST_MAX="${HOST_MAX:-200}"; APP_MAX="${APP_MAX:-400}"; ROW_KEEP="${ROW_KEEP:-40}"
+TBL_IDLE_LONG="${TBL_IDLE_LONG:-3600}"; TBL_IDLE_SHORT="${TBL_IDLE_SHORT:-600}"
+APP_HOLD="${APP_HOLD:-3}"                # polls a new flow waits for its netifyd label
+BIRTH_MAX="${BIRTH_MAX:-1073741824}"     # bytes: a flow first seen with more than this in ONE poll cannot be new - adopted as baseline
+TOOLTIP_EVERY="${TOOLTIP_EVERY:-2}"; MX_MAX="${MX_MAX:-1000}"; PAIR_MAX="${PAIR_MAX:-500}"   # tooltip tables: rebuild every N polls, size limits
+# "Not attributed" (what the shaper carries but conntrack does not count) and the automatic
+# link layer header measurement behind it
+L2_INIT="${L2_INIT:-18}"; L2_CANDIDATES="${L2_CANDIDATES:-0 14 18 22 26}"
+CAL_WIN="${CAL_WIN:-30}"; CAL_KEEP="${CAL_KEEP:-60}"; CAL_MIN="${CAL_MIN:-8}"; CAL_PCTL="${CAL_PCTL:-25}"
+CAL_TOL="${CAL_TOL:-1}"; CAL_MAX_PKT="${CAL_MAX_PKT:-400}"; CAL_MIN_PKTS="${CAL_MIN_PKTS:-500}"
+UN_WIN="${UN_WIN:-30}"; UN_WIN_RX="${UN_WIN_RX:-60}"; UN_WIN_LONG="${UN_WIN_LONG:-300}"
+GONE_GRACE="${GONE_GRACE:-5}"            # polls a flow may be missing (short procfs read) before its state is dropped
+
+# link counters: run via sh so a missing execute bit does not disable it silently
+TC_HELPER="${TC_HELPER:-/usr/libexec/trafficchart-tc}"
 if [ -r "$TC_HELPER" ]; then
     TC_HELPER="sh $TC_HELPER"
 else
-    TC_HELPER=""   # not installed: no link rate, the page falls back to browser side rates
+    TC_HELPER=""
     logger -t trafficchart "trafficchart-tc not found - no link rate" 2>/dev/null
 fi
-# TC_STATS (option tc_stats, default 1): trafficchart-tc itself forks "tc -s qdisc show"
-# once per RX device and once per TX device (twice that with multi-WAN), PLUS
-# tc_resolve()'s own config_load/config_foreach over uci sqm - all of that on every
-# single INTERVAL poll of THIS daemon, independent of whether a browser tab is even
-# open (unlike luci.trafficchart's own tc calls, which only run on an actual page
-# request and are 1s-cached). 0 disables it the same way a missing trafficchart-tc
-# binary already does: no daemon-side link rate, no "Not attributed" ring segment, and
-# the History tab's shaper drop/ECN/backlog row stays empty. The live shaper health
-# line at the top of the page (drops/ECN sparkline) is unaffected either way - that one
-# always comes from luci.trafficchart's own per-request tc call, not from this daemon.
-TC_STATS="${TC_STATS:-1}"
-[ "$TC_STATS" = "1" ] || TC_HELPER=""
- # ATTR_TOL, ATTR_MIN, ATTR_SHARE, ATTR_MAX_APPS and ATTR_MAX_DEVICES were loaded above.
+
 # Bytes per packet that the shaper (tc) counts but conntrack does not: the link layer
 # header (Ethernet 14, +4 VLAN, +8 PPPoE). Without this the "not attributed" estimate
 # is dominated by it wherever packets are small (the upload of a download is almost
@@ -337,13 +96,9 @@ TC_STATS="${TC_STATS:-1}"
 #   <number>        fixed bytes per packet (0 = old behaviour: everything shows up as
 #                   "not attributed")
 case "$L2_OVERHEAD" in auto|[0-9]|[0-9][0-9]) ;; *) L2_OVERHEAD=auto ;; esac
- # L2_INIT, L2_CANDIDATES, calibration settings, UN_WIN_RX and table limits were loaded above.
 
-# --- persistent history: validate the settings (they end up in shell commands of the daemon) ---
- # Persistent/history settings and HOST_MAX were loaded above.
-HOUR_SEC="${HOUR_SEC:-3600}"; DAY_SEC="${DAY_SEC:-86400}"
-# PERSIST_DIR and PERSIST_MOUNT are space separated lists of absolute paths (letters, digits and
-# . _ - / only, no trailing slash); an invalid entry is dropped and logged
+# PERSIST_DIR / PERSIST_MOUNT: space separated absolute paths (letters, digits and . _ - / only);
+# an invalid entry is dropped and logged
 _clean() {
     _out=""
     for _w in $1; do
@@ -362,8 +117,7 @@ _clean() {
 }
 PERSIST_DIR=$(_clean "$PERSIST_DIR")
 PERSIST_MOUNT=$(_clean "$PERSIST_MOUNT")
-# every access to a target (a NAS may hang) runs under "timeout"; TOUT4 = shorter one used
-# while the service is being stopped
+# every access to a target (a NAS may hang) runs under "timeout"; TOUT4 = shorter one used while stopping
 case "$PERSIST_TIMEOUT" in ''|*[!0-9]*) PERSIST_TIMEOUT=10 ;; esac
 [ "$PERSIST_TIMEOUT" -ge 3 ] || PERSIST_TIMEOUT=3
 [ "$PERSIST_TIMEOUT" -le 120 ] || PERSIST_TIMEOUT=120
@@ -375,27 +129,14 @@ else
 fi
 case "$PERSIST_SEC" in ''|*[!0-9]*) PERSIST_SEC=3600 ;; esac
 [ "$PERSIST_SEC" -ge 60 ] || PERSIST_SEC=60
-case "$HIST_HOUR_KEEP" in ''|*[!0-9]*|0) HIST_HOUR_KEEP=192 ;; esac
-case "$HIST_DAY_KEEP" in ''|*[!0-9]*|0) HIST_DAY_KEEP=400 ;; esac
-# Same guards for values that came from the environment (tc_cfg keeps those
-# untouched) or when trafficchart-common is missing: 0 would close and write the
-# 5 min bucket at every poll (HIST_SEC) or drop every bucket at once (HIST_KEEP).
-case "$HIST_SEC"  in ''|*[!0-9]*) HIST_SEC=300 ;; esac
-[ "$HIST_SEC" -ge 1 ] 2>/dev/null || HIST_SEC=300
-case "$HIST_KEEP" in ''|*[!0-9]*) HIST_KEEP=288 ;; esac
-[ "$HIST_KEEP" -ge 1 ] 2>/dev/null || HIST_KEEP=288
 
 mkdir -p "$OUT_DIR" || exit 1
 
 # --- process control: the init script stops us with SIGTERM; the wrapper turns that into
 # a stop request file the daemon polls, so it can flush its history before it exits.
-# A previous instance that is still flushing is waited for (max 20 s), so the new one
-# does not read the history before the old one has written it.
+# A previous instance that is still flushing is waited for (max 20 s).
 STOPFILE="$OUT_DIR/stop.req"
-# Separate, lighter request: clear cumulative totals + in-RAM history without
-# restarting the daemon (luci.trafficchart's "reset_history" ubus call writes this;
-# see the "History reset" header comment above).
-RESETFILE="$OUT_DIR/reset.req"
+RESETFILE="$OUT_DIR/reset.req"     # written by luci.trafficchart "reset_history"
 PIDFILE="$OUT_DIR/agg.pid"
 if [ -r "$PIDFILE" ]; then
     _old=$(cat "$PIDFILE" 2>/dev/null)
@@ -410,23 +151,24 @@ fi
 rm -f "$STOPFILE"
 echo $$ > "$PIDFILE"
 
-# The byte/packet counters in /proc/net/nf_conntrack only exist with conntrack
-# accounting. It is usually already on (NSS builds), but not on every stock
-# OpenWrt; flows created before it was switched on simply start counting later.
+# byte/packet counters in /proc/net/nf_conntrack only exist with conntrack accounting
 ACCT=/proc/sys/net/netfilter/nf_conntrack_acct
 [ -w "$ACCT" ] && [ "$(cat "$ACCT" 2>/dev/null)" != "1" ] && echo 1 > "$ACCT"
 
 $AWK -v CT_FILE="$CT_FILE" -v OUT="$OUT_DIR" -v INTERVAL="$INTERVAL" \
     -v PERSIST_DIR="$PERSIST_DIR" -v PERSIST_MOUNT="$PERSIST_MOUNT" -v PERSIST_SEC="$PERSIST_SEC" -v TOUT="$TOUT" -v TOUT4="$TOUT4" \
-    -v HIST_HOUR_KEEP="$HIST_HOUR_KEEP" -v HIST_DAY_KEEP="$HIST_DAY_KEEP" -v HOUR_SEC="$HOUR_SEC" -v DAY_SEC="$DAY_SEC" \
-    -v WPID="$$" -v STOPFILE="$STOPFILE" -v RESETFILE="$RESETFILE" -v PIDFILE="$PIDFILE" \
-    -v V6HELPER="$V6HELPER" -v APP_HOLD="$APP_HOLD" \
-    -v MAPFILE="$OUT_DIR/apps.map" -v HOSTS_HELPER="$HOSTS_HELPER" \
-    -v HIST_SEC="$HIST_SEC" -v HIST_KEEP="$HIST_KEEP" -v ATTR_WIN="$ATTR_WIN" -v BIRTH_MAX="$BIRTH_MAX" -v GONE_GRACE="$GONE_GRACE" \
-    -v ADAPT_INTERVAL="$ADAPT_INTERVAL" -v INTERVAL_MAX="$INTERVAL_MAX" -v ADAPT_BUDGET="$ADAPT_BUDGET" -v TOOLTIP_EVERY="$TOOLTIP_EVERY" -v HOSTS_REFRESH_SEC="$HOSTS_REFRESH_SEC" -v GUA_REFRESH_SEC="$GUA_REFRESH_SEC" \
-    -v TOOLTIPS="$TOOLTIPS" -v ROW_KEEP="$ROW_KEEP" \
-    -v RATE_WIN="$RATE_WIN" -v UN_WIN="$UN_WIN" -v TC_HELPER="$TC_HELPER" -v ATTR_TOL="$ATTR_TOL" -v ATTR_TOPAPPS="$ATTR_TOPAPPS" -v ATTR_TOTALS="$ATTR_TOTALS" -v ATTR_SKIP_PORTS="$ATTR_SKIP_PORTS" -v ATTR_PORTS="$ATTR_PORTS" -v ATTR_MIN="$ATTR_MIN" -v ATTR_SHARE="$ATTR_SHARE" -v ATTR_MAX_APPS="$ATTR_MAX_APPS" -v ATTR_MAX_DEVICES="$ATTR_MAX_DEVICES" -v L2_OVERHEAD="$L2_OVERHEAD" -v L2_INIT="$L2_INIT" -v L2_CANDIDATES="$L2_CANDIDATES" -v CAL_TOL="$CAL_TOL" -v CAL_WIN="$CAL_WIN" -v CAL_KEEP="$CAL_KEEP" -v CAL_MIN="$CAL_MIN" -v CAL_PCTL="$CAL_PCTL" -v CAL_MAX_PKT="$CAL_MAX_PKT" -v CAL_MIN_PKTS="$CAL_MIN_PKTS" \
-    -v HOST_MAX="$HOST_MAX" -v UN_WIN_RX="$UN_WIN_RX" -v UN_WIN_LONG="$UN_WIN_LONG" -v APP_MAX="$APP_MAX" -v MX_MAX="$MX_MAX" -v PAIR_MAX="$PAIR_MAX" -v TBL_IDLE_LONG="$TBL_IDLE_LONG" -v TBL_IDLE_SHORT="$TBL_IDLE_SHORT" -v MAPVER="$OUT_DIR/apps.map.ver" '
+    -v HIST_SEC="$HIST_SEC" -v HIST_KEEP="$HIST_KEEP" -v HIST_HOUR_KEEP="$HIST_HOUR_KEEP" -v HIST_DAY_KEEP="$HIST_DAY_KEEP" \
+    -v HOUR_SEC="$HOUR_SEC" -v DAY_SEC="$DAY_SEC" -v WPID="$$" -v STOPFILE="$STOPFILE" -v RESETFILE="$RESETFILE" -v PIDFILE="$PIDFILE" \
+    -v V6HELPER="$V6HELPER" -v HOSTS_HELPER="$HOSTS_HELPER" -v TC_HELPER="$TC_HELPER" \
+    -v INTERVAL_MAX="$INTERVAL_MAX" -v ADAPT_BUDGET="$ADAPT_BUDGET" -v HOSTS_REFRESH_SEC="$HOSTS_REFRESH_SEC" -v GUA_REFRESH_SEC="$GUA_REFRESH_SEC" \
+    -v RATE_WIN="$RATE_WIN" -v HOST_MAX="$HOST_MAX" -v APP_MAX="$APP_MAX" -v ROW_KEEP="$ROW_KEEP" \
+    -v TBL_IDLE_LONG="$TBL_IDLE_LONG" -v TBL_IDLE_SHORT="$TBL_IDLE_SHORT" \
+    -v APP_HOLD="$APP_HOLD" -v BIRTH_MAX="$BIRTH_MAX" -v GONE_GRACE="$GONE_GRACE" \
+    -v TOOLTIPS="$TOOLTIPS" -v TOOLTIP_EVERY="$TOOLTIP_EVERY" -v MX_MAX="$MX_MAX" -v PAIR_MAX="$PAIR_MAX" \
+    -v L2_OVERHEAD="$L2_OVERHEAD" -v L2_INIT="$L2_INIT" -v L2_CANDIDATES="$L2_CANDIDATES" -v CAL_WIN="$CAL_WIN" -v CAL_KEEP="$CAL_KEEP" \
+    -v CAL_MIN="$CAL_MIN" -v CAL_PCTL="$CAL_PCTL" -v CAL_TOL="$CAL_TOL" -v CAL_MAX_PKT="$CAL_MAX_PKT" -v CAL_MIN_PKTS="$CAL_MIN_PKTS" \
+    -v UN_WIN="$UN_WIN" -v UN_WIN_RX="$UN_WIN_RX" -v UN_WIN_LONG="$UN_WIN_LONG" \
+    -v MAPFILE="$OUT_DIR/apps.map" -v MAPVER="$OUT_DIR/apps.map.ver" '
 # "LAN-side" / non-WAN address? (RFC1918, loopback, link-local, multicast,
 # ULA, plus the dynamically discovered LAN GUA prefixes in "gua").
 # IPv6 addresses in /proc/net/nf_conntrack are fully expanded (%pI6).
@@ -544,7 +286,7 @@ function dev_key(lan, src, rsrc,   addr, mac, key, nm) {
 # This does NOT retroactively fix history buckets already closed under the
 # old key (those are already written out and would need re-writing history
 # files, not just in-RAM state) - only the cumulative totals, per-flow rate
-# rings, and the tooltip/top-applications tables are merged, so from this
+# rings are merged, so from this
 # point on the device reports as one device instead of splitting again.
 function dev_merge(old, new,   i, j, k, T, pk2) {
     if (old == new || !(old in dseen)) return
@@ -552,7 +294,6 @@ function dev_merge(old, new,   i, j, k, T, pk2) {
     dib[new] += dib[old]; dob[new] += dob[old]
     dipk[new] += dipk[old]; dopk[new] += dopk[old]
     dib_rt[new] += dib_rt[old]; dob_rt[new] += dob_rt[old]
-    dvi[new] += dvi[old]; dvo[new] += dvo[old]
     if (!(new in dname) && (old in dname)) dname[new] = dname[old]
     if (!(new in dvip) && (old in dvip)) dvip[new] = dvip[old]
 
@@ -606,7 +347,7 @@ function dev_merge(old, new,   i, j, k, T, pk2) {
     }
 
     delete dib[old]; delete dob[old]; delete dipk[old]; delete dopk[old]
-    delete dib_rt[old]; delete dob_rt[old]; delete dvi[old]; delete dvo[old]
+    delete dib_rt[old]; delete dob_rt[old]
     delete dname[old]; delete dvip[old]; delete dseen[old]; ndev--
     glog_msg("merged temporarily IP-keyed device " old " into " new " after address resolution")
 }
@@ -712,11 +453,23 @@ function host_add(h, lan, d1, d2, q1, q2) {
 # entries not touched for TBL_IDLE_LONG seconds are dropped (if that frees too little:
 # TBL_IDLE_SHORT). Active entries are never dropped; if nothing can be freed the new
 # entry is skipped (and logged once an hour). The totals per application / device /
-# destination are not affected, only the tooltip lists lose long idle entries.
+# destination are not affected.
 function tbl_full_log(what) {
     if (!(what in tbl_log_at) || n - tbl_log_at[what] >= TBL_LOG_POLLS) { tbl_log_at[what] = n; glog_msg(what " table full and nothing idle to drop - new entries are skipped") }
 }
 
+# keep the N biggest entries (used by row_keep)
+function kt_ins(k, sc, N,   i) {
+    if (ktn < N || sc > ktsc[ktn]) {
+        if (ktn < N) ktn++
+        i = ktn
+        while (i > 1 && ktsc[i - 1] < sc) { ktsc[i] = ktsc[i - 1]; ktky[i] = ktky[i - 1]; i-- }
+        ktsc[i] = sc; ktky[i] = k
+    }
+}
+
+# Bounded tooltip tables (device x application, application x destination, destination x device):
+# when one is full, long idle entries are dropped first; if nothing can be freed the new entry is skipped.
 function pair_gc(   i, pass, lim, freed) {
     if (pgc_at == n) return 0
     pgc_at = n
@@ -779,16 +532,7 @@ function mx_add(t, x, y, lan, d1, d2,   pk, i) {
     if (lan) { mxout[i] += d1; mxin[i] += d2 } else { mxin[i] += d1; mxout[i] += d2 }
 }
 
-# keep the N biggest applications / destinations (only those get a tooltip list)
-function kt_ins(k, sc, N,   i) {
-    if (ktn < N || sc > ktsc[ktn]) {
-        if (ktn < N) ktn++
-        i = ktn
-        while (i > 1 && ktsc[i - 1] < sc) { ktsc[i] = ktsc[i - 1]; ktky[i] = ktky[i - 1]; i-- }
-        ktsc[i] = sc; ktky[i] = k
-    }
-}
-
+# the biggest applications / destinations get a tooltip list (kt_ins above)
 function mx_top(K,   i, key, tot, n2, j) {
     split("", xn); split("", xv); split("", xa); split("", xi); split("", xo)
     for (i = 1; i <= mxcnt; i++) {
@@ -824,127 +568,6 @@ function router_key() {
     if (!("router" in dseen)) { dseen["router"] = 1; ndev++ }
     dname["router"] = "Router"
     return "router"
-}
-
-# move volume of router application a from the Router device to device d, booked
-# on the device under the label ta (a generic proxy row, or the real name)
-function pair_xfer(d, a, tin, tout, ta,   i, ri) {
-    pair_add(d, ta, 1, 0, 0)
-    pair_add("router", a, 1, 0, 0)
-    if (!((d SUBSEP ta) in pidx) || !(("router" SUBSEP a) in pidx)) return
-    i = pidx[d SUBSEP ta]; ri = pidx["router" SUBSEP a]
-    pin[i] += tin; pout[i] += tout
-    pin[ri] -= tin; pout[ri] -= tout
-}
-
-# Sliding-window attribution of router WAN traffic to LAN devices.
-# Pools (key = dir SUBSEP poll SUBSEP name, dir 0 = download, 1 = upload):
-#   qr/qrp  router WAN bytes/packets per application, not yet attributed
-#   qv      bytes delivered to a device by a router service, not yet matched
-# Each poll: add the new volumes, match min(router pool, device pool), drop
-# entries older than ATTR_POLLS polls (unmatched router bytes simply stay on
-# the Router device).
-function router_attribute(   a, d) {
-    if (!ATTR_TOTALS) return      # no attribution of router WAN traffic to devices at all
-    for (a in rti) if (rti[a] > 0) { qr[0, n, a] += rti[a]; qrp[0, n, a] += rtip[a] }
-    for (a in rto) if (rto[a] > 0) { qr[1, n, a] += rto[a]; qrp[1, n, a] += rtop[a] }
-    for (d in vdl) if (vdl[d] > 0) qv[0, n, d] += vdl[d]
-    for (d in vul) if (vul[d] > 0) qv[1, n, d] += vul[d]
-    attr_match(0)
-    attr_match(1)
-    attr_expire()
-}
-
-function attr_expire(   k, p) {
-    for (k in qr) { split(k, p, SUBSEP); if (n - p[2] >= ATTR_POLLS) { delete qr[k]; delete qrp[k] } }
-    for (k in qv) { split(k, p, SUBSEP); if (n - p[2] >= ATTR_POLLS) delete qv[k] }
-}
-
-function attr_match(dir,   k, p, a, d, ra, rap, sel, vd, rem, used, cr, cv, picka, pickd, R0, best, ba, bd, s, x, pk, f, hi, i, bv) {
-    split("", ra); split("", rap); split("", sel); split("", vd)
-    split("", rem); split("", used); split("", cr); split("", cv)
-    split("", picka); split("", pickd)
-    R0 = 0
-    for (k in qr) {
-        split(k, p, SUBSEP)
-        if (p[1] != dir) continue
-        ra[p[3]] += qr[k]; rap[p[3]] += qrp[k]; R0 += qr[k]
-    }
-    for (k in qv) {
-        split(k, p, SUBSEP)
-        if (p[1] != dir) continue
-        vd[p[3]] += qv[k]
-    }
-    # Candidates: real router applications only (background traffic stays on "Router")
-    for (i = 1; ATTR_MAX_APPS <= 0 || i <= ATTR_MAX_APPS; i++) {
-        a = ""; bv = -1
-        for (k in ra) if (!(k in picka) && ra[k] >= ATTR_MIN && ra[k] >= R0 * ATTR_SHARE && ra[k] > bv) { a = k; bv = ra[k] }
-        if (a == "") break
-        picka[a] = 1; sel[a] = 1; rem[a] = ra[a]
-    }
-    for (i = 1; ATTR_MAX_DEVICES <= 0 || i <= ATTR_MAX_DEVICES; i++) {
-        d = ""; bv = -1
-        for (k in vd) if (!(k in pickd) && vd[k] >= ATTR_MIN && vd[k] > bv) { d = k; bv = vd[k] }
-        if (d == "") break
-        pickd[d] = 1
-    }
-    for (d in vd) if (!(d in pickd)) delete vd[d]
-
-    # Greedy 1:1 pairing by volume: always take the (application, device) pair
-    # with the smallest relative volume difference; every device only once.
-    # A proxy passes roughly through what it downloads, so upstream bytes of
-    # a stream ~ bytes delivered to exactly the one client that watches it.
-    while (1) {
-        best = 9; ba = ""; bd = ""
-        for (a in sel) {
-            if (rem[a] <= 0) continue
-            for (d in vd) {
-                if (d in used) continue
-                hi = (rem[a] > vd[d]) ? rem[a] : vd[d]
-                s = ((rem[a] > vd[d]) ? rem[a] - vd[d] : vd[d] - rem[a]) / hi
-                if (s < best) { best = s; ba = a; bd = d }
-            }
-        }
-        if (ba == "" || best > ATTR_TOL) break
-        x = (rem[ba] < vd[bd]) ? rem[ba] : vd[bd]
-        pk = rap[ba] * x / ra[ba]
-        if (dir == 0) {
-            pair_xfer(bd, ba, x, 0, (ATTR_TOPAPPS ? ba : "Proxy-Stream (via Router)"))
-            dib[bd] += x; dib["router"] -= x; dipk[bd] += pk; dipk["router"] -= pk
-            dib_rt[bd] += x; dib_rt["router"] -= x
-        } else {
-            pair_xfer(bd, ba, 0, x, (ATTR_TOPAPPS ? ba : "Proxy-Stream (via Router)"))
-            dob[bd] += x; dob["router"] -= x; dopk[bd] += pk; dopk["router"] -= pk
-            dob_rt[bd] += x; dob_rt["router"] -= x
-        }
-        used[bd] = 1; rem[ba] -= x; cr[ba] += x; cv[bd] += x
-    }
-
-    # consume only what was actually credited; the rest stays in the pools
-    for (k in qr) {
-        split(k, p, SUBSEP)
-        if (p[1] != dir || !(p[3] in cr)) continue
-        f = 1 - cr[p[3]] / ra[p[3]]
-        qr[k] *= f; qrp[k] *= f
-        if (f <= 0 || qr[k] < 0.5) { delete qr[k]; delete qrp[k] }
-    }
-    for (k in qv) {
-        split(k, p, SUBSEP)
-        if (p[1] != dir || !(p[3] in cv)) continue
-        f = 1 - cv[p[3]] / vd[p[3]]
-        qv[k] *= f
-        if (f <= 0 || qv[k] < 0.5) delete qv[k]
-    }
-}
-
-# does a LAN->router flow (original tuple "sport=.. dport=..") count as a router
-# service delivering to the device? TCP/UDP only, infrastructure ports excluded
-function attr_port_ok(proto, pp,   dp) {
-    if (proto != "tcp" && proto != "udp") return 0
-    if (!match(pp, /dport=[0-9]+/)) return 0
-    dp = substr(pp, RSTART + 6, RLENGTH - 6) + 0
-    if (nallow > 0) return (dp in aallow)
-    return !(dp in askip)
 }
 
 # trafficchart-apps writes apps.map, THEN bumps apps.map.ver. The map is only re-read
@@ -987,38 +610,24 @@ function app_name(a) {
     return a
 }
 
+# one accounting step: application + destination
+# application names are bounded: beyond APP_MAX distinct ones the rest is summed as "(other)"
 function acct(dk, a, host, lan, d1, d2, q1, q2,   hk) {
     a = app_name(a)
-    if (dk == "router" && lan) { rti[a] += d2; rto[a] += d1; rtip[a] += q2; rtop[a] += q1 }
     app_add(a, lan, d1, d2, q1, q2)
     hk = host_add(host, lan, d1, d2, q1, q2)
     # TOOLTIPS=0: skip the per-flow tooltip-matrix bookkeeping entirely (2 mx_add +
     # 1 pair_add per accounted delta, each a hash lookup plus a possible mx_gc/pair_gc
-    # sweep once the table is full) - this is the actual CPU cost of the tooltip
-    # feature, not just how often emit() renders it. Totals (app/device/destination)
-    # and the History tab are unaffected: they never read these matrices.
+    # sweep once the table is full). Totals and the History tab never read these matrices.
     if (!TOOLTIPS) return
     pair_add(dk, a, lan, d1, d2)
     mx_add("a", a, hk, lan, d1, d2)
     mx_add("h", hk, dk, lan, d1, d2)
 }
 
-# Learned service names: netifyd labels a flow by application ("ntp",
-# "github", ...); flows it never labels used to land in a "[CLASS]" bucket,
-# so the same service showed up twice ("[NTP]" and "ntp"). plab remembers, per
-# protocol|port, the netifyd label seen for it - but only while that label is
-# unambiguous (same name, case-insensitive). Ports shared by many applications
-# (tcp/443, udp/53 ...) become ambiguous and keep the "[CLASS]" fallback.
-function learn(sv, a) {
-    if (a == "Unknown" || (sv in pamb)) return
-    if (!(sv in plab)) plab[sv] = a
-    else if (tolower(plab[sv]) != tolower(a)) { pamb[sv] = 1; delete plab[sv] }
-}
-
-# name of a flow netifyd did not label: a learned service name, else "[proto/port]"
-# (well-known / registered ports only; random high ports would flood the table)
+# name of a flow netifyd did not label: "[proto/port]" (well-known / registered ports only,
+# random high ports would flood the table), else "[proto]"
 function fbname(sv, proto,   i) {
-    if (sv != "" && (sv in plab)) return plab[sv]
     i = index(sv, "|")
     if (i > 0 && substr(sv, i + 1) + 0 < 32768) return "[" substr(sv, 1, i - 1) "/" substr(sv, i + 1) "]"
     return "[" proto "]"
@@ -1072,7 +681,6 @@ function app_account(key, dk, lan, proto, src, dst, pp, d1, d2, q1, q2,   a, hh,
         }
     } else giveup[key] = 1
 
-    if (a != "" && sv != "") learn(sv, a)
     if (a != "") { lab[key] = a; lhost[key] = hh }
     else if (key in lab) { a = lab[key]; hh = lhost[key] }
 
@@ -1105,10 +713,9 @@ function tcp_state_closing(s) {
 }
 
 function parse_pass(   line, r, h, proto, pp, t, sp, b1, b2, p1, p2,
-                       src, dst, rsrc, key, lan, d1, d2, q1, q2, k, flows, act, dk, ri, ro, rflow, vflow,
+                       src, dst, rsrc, key, lan, d1, d2, q1, q2, k, flows, act, dk, ri, ro, rflow,
                        tcpstate, forced_reset) {
     flows = 0
-    split("", rti); split("", rto); split("", rtip); split("", rtop); split("", vdl); split("", vul)
     while ((r = (getline line < CT_FILE)) > 0) {
         # Sequential match() extraction instead of split() + per-token tests:
         # roughly 7x faster in busybox awk, which is what OpenWrt ships.
@@ -1159,14 +766,14 @@ function parse_pass(   line, r, h, proto, pp, t, sp, b1, b2, p1, p2,
 
 
         lan = islocal(src)
-        rflow = 0; vflow = 0
+        rflow = 0
         # Router-originated WAN flow (e.g. stream proxy upstream): the router is the
         # initiator, so orig direction = upload (otherwise it would be taken for a
         # WAN-initiated port forward: directions swapped, device = remote server).
         if ((src in rtr) && !islocal(dst)) { rflow = 1; lan = 1 }
         {
             if (rflow) { }                                                # router -> WAN, counted as device "Router"
-            else if (lan && (dst in rtr) && !(src in rtr)) vflow = 1      # LAN device -> router service
+            else if (lan && (dst in rtr) && !(src in rtr)) continue       # LAN device -> router itself: not WAN traffic
             else if (!lan && rsrc != "" && islocal(rsrc) && !(rsrc in rtr)) { }   # WAN-initiated to a LAN host (port forward, IPv6 inbound)
             else if (!(lan && !islocal(dst))) continue                    # not LAN->WAN
         }
@@ -1219,21 +826,6 @@ function parse_pass(   line, r, h, proto, pp, t, sp, b1, b2, p1, p2,
             d1 = b1; d2 = b2; q1 = p1; q2 = p2
         }
 
-        if (vflow) {
-            # LAN-local traffic to a router service: not WAN traffic. Volume is
-            # kept per device and used to attribute the WAN traffic of the router.
-            if (d1 > 0 || d2 > 0) {
-                dk = dev_key(1, src, "")
-                dvi[dk] += d2; dvo[dk] += d1
-                # Keep eligible LAN->router bytes in the attribution pool only.  They
-                # enter the device rate total when attr_match() actually pairs them
-                # with router WAN bytes in the same direction.
-                if (attr_port_ok(proto, pp)) { vdl[dk] += d2; vul[dk] += d1 }
-            }
-            pb1[key] = b1; pb2[key] = b2; pp1[key] = p1; pp2[key] = p2; gen[key] = n; gent[key] = t0
-            if (tcpstate != "") laststate[key] = tcpstate; else delete laststate[key]
-            continue
-        }
         act = (d1 > 0 || d2 > 0 || q1 > 0 || q2 > 0)
         dk = ""
         if (act) {
@@ -1256,7 +848,6 @@ function parse_pass(   line, r, h, proto, pp, t, sp, b1, b2, p1, p2,
     }
     close(CT_FILE)
     if (r < 0) return      # unreadable: keep state, do not sweep
-    router_attribute()
 
     # forget flows that are gone (their bytes stay in the class totals) -
     # but not after a pass that saw less than half of the previous flows:
@@ -1686,7 +1277,7 @@ function hist_tick(t,   lt, kh, kd) {
 # ---- history / cumulative-totals reset (reset.req, see the header comment
 # "History reset" above) ----
 # Clears everything the page shows as "totals since start" (applications,
-# devices, destinations, the device x application and tooltip matrices, and
+# devices, destinations and
 # the in-RAM history of all three tiers) and resets "since" to now, WITHOUT
 # touching per-flow tracking (gen/pb1/pb2/...), so ongoing flows keep being
 # delta-accounted correctly into the fresh totals instead of being treated as
@@ -1937,23 +1528,23 @@ function emit(t,   s, tmp, a, first, k, nm, i, j, sc, nt, tsc, tky, pd, tot, n2,
 
     printf "%s", "},\"devices\":{" > tmp
     first = 1
-    xo_n = 0; xo_ib = 0; xo_ob = 0; xo_ip = 0; xo_op = 0; xo_ri = 0; xo_ro = 0; xo_vi = 0; xo_vo = 0
+    xo_n = 0; xo_ib = 0; xo_ob = 0; xo_ip = 0; xo_op = 0; xo_ri = 0; xo_ro = 0
     for (k in dseen) {
         if (k == "(other)" || !(k in keepD)) {
             xo_n++; xo_ib += dib[k]; xo_ob += dob[k]; xo_ip += dipk[k]; xo_op += dopk[k]
-            xo_ri += rt_in["d" SUBSEP k]; xo_ro += rt_out["d" SUBSEP k]; xo_vi += dvi[k]; xo_vo += dvo[k]
+            xo_ri += rt_in["d" SUBSEP k]; xo_ro += rt_out["d" SUBSEP k]
             continue
         }
-        printf "%s\"%s\":{\"name\":\"%s\",\"ip\":\"%s\",%s%s,\"via_in\":%.0f,\"via_out\":%.0f,\"top\":[", (first ? "" : ","), k, dev_label(k), ((k in dvip) ? dvip[k] : ""), \
-                      jcnt(dib[k], dipk[k], dob[k], dopk[k]), jrate("d", k), dvi[k] + 0, dvo[k] + 0 > tmp
+        printf "%s\"%s\":{\"name\":\"%s\",\"ip\":\"%s\",%s%s,\"top\":[", (first ? "" : ","), k, dev_label(k), ((k in dvip) ? dvip[k] : ""), \
+                      jcnt(dib[k], dipk[k], dob[k], dopk[k]), jrate("d", k) > tmp
         for (j = 1; j <= tdn[k]; j++)
             printf "%s[\"%s\",%.0f,%.0f]", (j > 1 ? "," : ""), tda[k, j], tdi[k, j], tdo[k, j] > tmp
         printf "%s", "]}" > tmp
         first = 0
     }
     if (xo_n > 0)
-        printf "%s\"(other)\":{\"name\":\"(other)\",\"ip\":\"\",\"count\":%d,%s,\"in_bps\":%.0f,\"out_bps\":%.0f,\"via_in\":%.0f,\"via_out\":%.0f,\"top\":[]}", \
-               (first ? "" : ","), xo_n, jcnt(xo_ib, xo_ip, xo_ob, xo_op), xo_ri, xo_ro, xo_vi, xo_vo > tmp
+        printf "%s\"(other)\":{\"name\":\"(other)\",\"ip\":\"\",\"count\":%d,%s,\"in_bps\":%.0f,\"out_bps\":%.0f,\"top\":[]}", \
+               (first ? "" : ","), xo_n, jcnt(xo_ib, xo_ip, xo_ob, xo_op), xo_ri, xo_ro > tmp
 
     printf "%s", "},\"hosts\":{" > tmp
     first = 1
@@ -2008,10 +1599,9 @@ BEGIN {
     n = 0; warm = 1; nflows = 0
     LCACHE_MAX = 4096; nlcache = 0
     INTERVAL += 0; if (INTERVAL < 1) INTERVAL = 1
-    ADAPT_INTERVAL += 0; INTERVAL_MAX += 0; ADAPT_BUDGET += 0
-    TOOLTIP_EVERY += 0; HOSTS_REFRESH_SEC += 0; GUA_REFRESH_SEC += 0
+    INTERVAL_MAX += 0; ADAPT_BUDGET += 0
+    HOSTS_REFRESH_SEC += 0; GUA_REFRESH_SEC += 0
     if (INTERVAL_MAX < INTERVAL) INTERVAL_MAX = INTERVAL
-    if (ADAPT_BUDGET <= 0 || ADAPT_BUDGET >= 1) ADAPT_BUDGET = 0.30
     poll_interval = INTERVAL
     last_hosts_refresh = -1e9; last_gua_refresh = -1e9; tooltip_last = 0
     BIRTH_MAX += 0; GONE_GRACE += 0; APP_HOLD += 0
@@ -2042,21 +1632,15 @@ BEGIN {
     if (CAL_KEEP < 4) CAL_KEEP = 4
     if (CAL_MIN > CAL_KEEP) CAL_MIN = CAL_KEEP
     CAL_K = int(CAL_WIN / INTERVAL + 0.5); if (CAL_K < 2) CAL_K = 2
-    APP_MAX += 0; MX_MAX += 0; PAIR_MAX += 0
+    HOUR_SEC += 0; DAY_SEC += 0
+    if (HOUR_SEC < 1) HOUR_SEC = 3600; if (DAY_SEC < 1) DAY_SEC = 86400   # divisors in hist_tick()
+    APP_MAX += 0; MX_MAX += 0; PAIR_MAX += 0; TOOLTIPS += 0; TOOLTIP_EVERY += 0
     IDLE_LONG_P = int(TBL_IDLE_LONG / INTERVAL) + 5
     IDLE_SHORT_P = int(TBL_IDLE_SHORT / INTERVAL) + 5
     IDLE_MIN_P = int(TBL_IDLE_SHORT / 5 / INTERVAL) + 2   # last resort: idle for about 2 minutes
     HOST_MAX += 0; if (HOST_MAX < 20) HOST_MAX = 20
     TBL_LOG_POLLS = int(3600 / INTERVAL) + 1
-    TOOLTIPS += 0; ROW_KEEP += 0
-    ATTR_MIN += 0; ATTR_SHARE += 0; ATTR_TOL += 0; ATTR_TOPAPPS += 0; ATTR_TOTALS += 0
-    ATTR_MAX_APPS += 0; ATTR_MAX_DEVICES += 0
-    nskip = split(ATTR_SKIP_PORTS, skipl, " ")
-    for (sk = 1; sk <= nskip; sk++) askip[skipl[sk] + 0] = 1
-    nallow = split(ATTR_PORTS, allowl, " ")
-    for (sk = 1; sk <= nallow; sk++) aallow[allowl[sk] + 0] = 1
-    ATTR_POLLS = int(ATTR_WIN / INTERVAL) + 1
-    if (ATTR_POLLS < 2) ATTR_POLLS = 2
+    ROW_KEEP += 0
     dtp = INTERVAL + 0
     UNRESOLVED_FILE = OUT "/unresolved_v6"
     V6_STALE_POLLS = int(60 / INTERVAL + 0.5); if (V6_STALE_POLLS < 2) V6_STALE_POLLS = 2   # ~60s: how long an unresolved v6 address is still offered for re-resolution
@@ -2099,12 +1683,10 @@ BEGIN {
         persist_tick(tn)
         warm = 0
         work_elapsed = uptime() - t0
-        if (ADAPT_INTERVAL) {
-            if (work_elapsed > poll_interval * ADAPT_BUDGET && poll_interval < INTERVAL_MAX)
-                poll_interval += 1
-            else if (work_elapsed < poll_interval * ADAPT_BUDGET * 0.5 && poll_interval > INTERVAL)
-                poll_interval -= 1
-        } else poll_interval = INTERVAL
+        if (work_elapsed > poll_interval * ADAPT_BUDGET && poll_interval < INTERVAL_MAX)
+            poll_interval += 1
+        else if (work_elapsed < poll_interval * ADAPT_BUDGET * 0.5 && poll_interval > INTERVAL)
+            poll_interval -= 1
         # Diagnostics for audit item #2: the adaptive interval protects
         # responsiveness but does not solve the underlying scaling limit of a
         # full conntrack-table walk every poll. Rather than silently letting
@@ -2114,12 +1696,12 @@ BEGIN {
         # entries-parsed-per-poll) in the JSON so the page/operator can see it.
         load_work_ms = work_elapsed * 1000
         load_interval = poll_interval
-        if (ADAPT_INTERVAL && poll_interval >= INTERVAL_MAX && work_elapsed > poll_interval * ADAPT_BUDGET)
+        if (poll_interval >= INTERVAL_MAX && work_elapsed > poll_interval * ADAPT_BUDGET)
             load_sat_polls++
         else
             load_sat_polls = 0
         if (load_sat_polls == 5)
-            glog_msg(sprintf("aggregation is falling behind: %d consecutive polls at the interval ceiling (%ds) with %.0fms of work per poll (entries=%d) - consider a lower profile, a smaller table (see the CPU/Performance settings), or raising the max interval", load_sat_polls, poll_interval, load_work_ms, nflows))
+            glog_msg(sprintf("aggregation is falling behind: %d consecutive polls at the interval ceiling (%ds) with %.0fms of work per poll (entries=%d) - the conntrack table is too big for this CPU", load_sat_polls, poll_interval, load_work_ms, nflows))
         sleep_for = int(poll_interval - work_elapsed + 0.999)
         if (sleep_for < 1) sleep_for = 1
         system("sleep " sleep_for)

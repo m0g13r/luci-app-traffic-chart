@@ -1,10 +1,10 @@
 #!/bin/sh /etc/rc.common
 # /etc/init.d/trafficchart
 #
-# Settings: /etc/config/trafficchart (section "global"). "enabled" and "apps" are
-# read here, all tunables of the daemon by trafficchart-agg itself. A "uci commit
-# trafficchart" restarts the service (reload trigger below), so changes apply
-# at once. Restarting resets the cumulative totals, the history survives.
+# Settings: /etc/config/trafficchart (section "global"). "enabled" and "apps" are read here,
+# "interval" and the persistence options by trafficchart-agg, "sock" by trafficchart-apps.
+# A "uci commit trafficchart" restarts the service (reload trigger below), so changes apply at
+# once. Restarting resets the cumulative totals, the history survives.
 
 START=99
 STOP=10

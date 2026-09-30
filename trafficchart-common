@@ -1,18 +1,15 @@
 #!/bin/sh
 # trafficchart-common - shared shaper/device detection (sourced, not executed)
 #
-# Install as /usr/libexec/trafficchart-common. Sourced by
-#   /usr/libexec/rpcd/luci.trafficchart   (page data)
-#   /usr/libexec/trafficchart-tc          (link counters for trafficchart-agg)
-# so both always look at the same devices (before: two copies "keep in sync").
+# Install as /usr/libexec/trafficchart-common. Sourced by trafficchart-tc (link counters
+# for trafficchart-agg), trafficchart-apps and trafficchart-hosts (tc_cfg for settings).
+# Shapers are found in the kernel (tc qdisc / tc filter), no sqm / qosmate / ... config is read.
 #
 # Usage:
 #   . /usr/libexec/trafficchart-common
 #   tc_resolve          # who is shaped, and where
-#   tc_read_counters    # post-shaping byte counters (needs tc_resolve first)
-#   tc_shaper_drops DEV BACKEND   # "<dropped> <ecn> <backlog bytes>" of DEV's qdisc (drops/ECN cumulative, backlog momentary)
 #   tc_dev_stats DEV BACKEND [KBIT]  # "<bytes> <dropped> <ecn> <backlog> <shaper json>" with ONE tc + ONE awk
-#   tc_build_frag                 # FRAG = the JSON members luci.trafficchart used to build per request
+#   tc_build_frag                 # FRAG = the JSON members the page needs about the link (stored in classes.json)
 #   tc_resolve_cached             # tc_resolve with a cache (cheap enough for every poll)
 #
 # tc_resolve sets:
@@ -34,13 +31,13 @@
 #   TX_DEVS        devices carrying the upload shaper (NSS: VLAN suffix removed)
 #   RX_DEVS        devices carrying the download shaper (ifb / nssifb)
 #   TC_DIAG        human readable reason when detection had to fall back / failed
-#   TC_FALLBACK    1 = no SQM queue, raw counters of the detected WAN device
+#   TC_FALLBACK    1 = no shaper found, raw counters of the detected WAN device
 #   RX_RAW         interfaces whose ifb does not exist (ingress shaping inactive):
 #                  their raw rx counter is used as the best available signal
 #   RX_DEV / TX_IFACE   first entry of RX_DEVS / TX_DEVS (used for the shaper
 #                  health line of the page, which shows one device per direction)
 #   QTXT SYSNOTE   wording for the counter source strings
-#   WAN_INFO       one line per enabled queue: "iface<TAB>tx_dev<TAB>rx_dev<TAB>
+#   WAN_INFO       one line per shaped WAN device: "iface<TAB>tx_dev<TAB>rx_dev<TAB>
 #                  upload_kbit<TAB>download_kbit" - feeds tc_wan_json() below
 #
 # tc_wan_json() prints a JSON array with one object per configured WAN queue
@@ -50,26 +47,6 @@
 # for a single WAN but blends together very different links in a multi-WAN
 # setup; this lets the page optionally show a per-WAN breakdown instead.
 #
-# tc_read_counters sets:
-#   RX_BYTES TX_BYTES   sum over all devices; EMPTY if nothing could be read
-#   RX_SOURCE TX_SOURCE human readable origin of the numbers
-#
-# Settings (/etc/config/trafficchart, section "global"):
-#   tc_cfg VAR DEFAULT [TYPE]
-#     sets the shell variable VAR from, in this order of priority
-#       1. the environment (VAR already set - mainly for testing)
-#       2. the UCI option named like the variable in lower case
-#          (INTERVAL -> option interval, ATTR_PORTS -> option attr_ports)
-#       3. DEFAULT
-#     TYPE checks the UCI value; an invalid one is logged (logread -e trafficchart)
-#     and DEFAULT is used instead:
-#       int     digits only (0 allowed)         num    digits with an optional decimal point
-#       pint    integer >= 1 (0 is rejected)    ratio  number with 0 < value < 1
-#       list    space separated integers (may be empty)
-#       l2      "auto" or an integer of up to 2 digits
-#       (none)  any text
-#
-# Testing only: TC_SYSNET (/sys/class/net)
 
 SYSNET="${TC_SYSNET:-/sys/class/net}"
 
@@ -208,68 +185,12 @@ tc_qdisc_bytes() {
     echo "$bytes"
 }
 
-# Cumulative dropped-packet and ECN-mark counters of the shaper qdisc on
-# device $1 ("" if the device has none). $2 = backend ("nss" or "generic",
-# from tc_resolve's $BACKEND) selects which qdisc in the "tc -s qdisc show"
-# output holds the numbers we want:
-#   nss      nsstbl (root) has no drops of its own; nssfq_codel (leaf) carries
-#            "dropped" (Sent line) and "ecn_mark" (maxpacket line)
-#   generic  first qdisc is the root (cake, or htb); if there are fq_codel
-#            leaves (htb+fq_codel), their dropped/ecn are summed - cake reports
-#            drops on its own root line instead, so that is used as a fallback
-# Prints "<dropped> <ecn> <backlog bytes>"; prints nothing if the device does not exist.
-# Shared by luci.trafficchart (live shaper panel) and trafficchart-tc (feeds
-# trafficchart-agg, which turns the cumulative numbers into per-bucket deltas
-# for the History tab - see hist_close() there).
-tc_shaper_drops() {
-    local dev="$1" backend="$2"
-    # device missing: print nothing (callers treat that as "not readable")
-    [ -n "$dev" ] && [ -e "$SYSNET/${dev}" ] || return 1
-    tc -s qdisc show dev "$dev" 2>/dev/null | awk -v BACKEND="$backend" '
-        function num(v,   n, u) {
-            n = v + 0; u = v; sub(/^[0-9.]+/, "", u)
-            if (u ~ /^K/) n *= 1024; else if (u ~ /^M/) n *= 1048576; else if (u ~ /^G/) n *= 1073741824
-            return n
-        }
-        /^qdisc / { q++; nm[q] = $2; next }
-        /^ *backlog / { bl[q] = num($2); next }
-        # cake has no single top-level ECN counter like fq_codel'"'"'s "ecn_mark"
-        # field - it only reports marks per traffic-class ("Tin"), as a bare
-        # "marks N" line, so without this a cake root qdisc always showed 0
-        # ECN marks even when it was actively marking. Harmless for other
-        # qdisc types, which do not emit a line matching this.
-        /^[ \t]*marks[ \t]+[0-9]+/ { ecn[q] += $2 + 0; next }
-        /^ *Sent / {
-            l = $0; gsub(/[(),]/, " ", l); n = split(l, f, " ")
-            for (i = 1; i <= n; i++) if (f[i] == "dropped") dr[q] = f[i + 1] + 0
-            next
-        }
-        /maxpacket/ {
-            for (i = 1; i < NF; i++) if ($i == "ecn_mark") ecn[q] = $(i + 1) + 0
-            next
-        }
-        END {
-            D = 0; E = 0; B = 0
-            if (BACKEND == "nss") {
-                for (i = 1; i <= q; i++) if (nm[i] == "nssfq_codel") { D = dr[i]; E = ecn[i] }
-                if (!D) for (i = 1; i <= q; i++) if (nm[i] == "nsstbl") D = dr[i]
-                for (i = 1; i <= q; i++) if (nm[i] == "nssfq_codel" || nm[i] == "nsstbl") B += bl[i]
-            } else {
-                for (i = 1; i <= q; i++) if (nm[i] ~ /fq_codel$/) { D += dr[i]; E += ecn[i] }
-                if (!D && q >= 1) D = dr[1] + 0
-                if (!E && q >= 1) E = ecn[1] + 0
-                B = bl[1] + 0
-            }
-            printf "%d %d %.0f\n", D + 0, E + 0, B + 0
-        }'
-}
-
 # Everything the aggregator needs from ONE device with ONE "tc -s qdisc show"
 # and ONE awk:
 #   "<bytes> <dropped> <ecn> <backlog bytes> <shaper json>"
 # <bytes> = Sent bytes of the root qdisc, or "-" if it cannot be used (noqueue
 # always reports 0: the caller falls back to the sysfs counters). Drops / ECN /
-# backlog follow the same rules as tc_shaper_drops. <shaper json> is the object
+# backlog follow the rules of the nss / generic cases below. <shaper json> is the object
 # the page shows in its shaper line (nsstbl + nssfq_codel for BACKEND nss, the
 # stock shaper otherwise; "{}" if the device has no such qdisc); it never
 # contains a blank, so the line splits into exactly 5 words. $3 = configured SQM
@@ -323,7 +244,7 @@ tc_dev_stats() {
             bytes = "-"
             if (q >= 1 && nm[1] != "noqueue" && (1 in sent) && sent[1] ~ /^[0-9]+$/) bytes = sent[1]
 
-            # ---- drops / ecn / backlog (same rules as tc_shaper_drops)
+            # ---- drops / ecn / backlog
             D = 0; E = 0; B = 0
             if (BACKEND == "nss") {
                 for (i = 1; i <= q; i++) if (nm[i] == "nssfq_codel") { D = dr[i]; E = se[i] }
@@ -641,49 +562,4 @@ tc_set_qtxt() {
         QTXT="tc qdisc"
         SYSNOTE=""
     fi
-}
-
-# sums over all devices of each direction -> RX_BYTES/RX_SOURCE, TX_BYTES/TX_SOURCE
-tc_read_counters() {
-    local d b sum=0 n=0 src=""
-    # download/ingress: the shaper lives on the ifb. Packets only reach it AFTER
-    # being redirected from the WAN device, so its counters are the correct,
-    # already-shaped download rate.
-    for d in $RX_DEVS; do
-        b=$(tc_qdisc_bytes "$d")
-        if [ -n "$b" ]; then
-            src="${src:+$src, }${d} (${QTXT})"
-        else
-            b=$(cat "$SYSNET/${d}/statistics/tx_bytes" 2>/dev/null)
-            case "$b" in ''|*[!0-9]*) continue ;; esac
-            src="${src:+$src, }${d} (sysfs${SYSNOTE})"
-        fi
-        sum=$((sum + b)); n=$((n + 1))
-    done
-    # ingress shaping inactive: this IS the raw/unshaped rate, but it's the best
-    # available signal in that case
-    for d in $RX_RAW; do
-        b=$(cat "$SYSNET/${d}/statistics/rx_bytes" 2>/dev/null)
-        case "$b" in ''|*[!0-9]*) continue ;; esac
-        if [ "$TC_FALLBACK" = 1 ]; then src="${src:+$src, }${d} (raw, no shaper)"
-        else src="${src:+$src, }${d} (raw, ingress shaping inactive)"; fi
-        sum=$((sum + b)); n=$((n + 1))
-    done
-    if [ "$n" -gt 0 ]; then RX_BYTES="$sum"; else RX_BYTES=""; fi
-    RX_SOURCE="$src"
-
-    sum=0; n=0; src=""
-    for d in $TX_DEVS; do
-        b=$(tc_qdisc_bytes "$d")
-        if [ -n "$b" ]; then
-            src="${src:+$src, }${d} (${QTXT})"
-        else
-            b=$(cat "$SYSNET/${d}/statistics/tx_bytes" 2>/dev/null)
-            case "$b" in ''|*[!0-9]*) continue ;; esac
-            src="${src:+$src, }${d} (sysfs${SYSNOTE})"
-        fi
-        sum=$((sum + b)); n=$((n + 1))
-    done
-    if [ "$n" -gt 0 ]; then TX_BYTES="$sum"; else TX_BYTES=""; fi
-    TX_SOURCE="$src"
 }

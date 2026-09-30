@@ -20,9 +20,10 @@
 #  * Only the low byte of the packet/conntrack mark is touched, all other bits
 #    (mwan3 etc.) are preserved.
 #  * NSS offload: flows that are already accelerated never walk the ruleset
-#    again, so their kernel mark stays as it was. The traffic chart applies the
-#    BULK demotion itself (trafficchart-agg), so it may show BULK for a flow
-#    whose kernel mark/DSCP is still WEB.
+#    again, so their kernel mark/DSCP stays as it was (a flow that grows past
+#    bulk_bytes after its acceleration keeps its old class).
+#  * The traffic chart does not use these marks; it reads conntrack and the qdisc
+#    counters only.
 #  * One SQM instance only: nssifb exists once and every instance recreates the
 #    nft table "inet qos_custom". Multi-WAN with NSS is not supported.
 #  * Optional extras, OFF by default, set in /etc/config/trafficchart (section
@@ -31,6 +32,7 @@
 #      dns_redirect_exclude '..' interfaces left out of the redirect (e.g. wg0)
 #      ttl_fix '1'               rewrite TTL/hop limit 63/127 to 64
 #      reset_ct_marks '0'        do not zero the ct marks on (re)start (default 1; needed with mwan3)
+#      bulk_bytes '314572800'    TCP/UDP flows of class WEB/P2P/BE above this size become BULK
 ###############################################################################
 
 . /lib/functions.sh
@@ -99,17 +101,11 @@ check_wan() {
   local tries=0
   local max_tries=24   # 24 * 5s
 
-  # Resolve the actual ubus LOGICAL interface bound to the device this SQM
-  # instance shapes, instead of always asking about the fixed name "wan".
-  # This project explicitly supports multiple SQM queues/multi-WAN
-  # (trafficchart-common enumerates every enabled queue and even builds a
-  # per-WAN breakdown) - a queue configured for e.g. "wanb" or "wan6" was
-  # always waiting on (or trusting the readiness of) the unrelated "wan"
-  # interface here, which could both delay startup unnecessarily and
-  # falsely report ready. Same lookup technique as the PPPoE shadow-device
-  # search in nft_setup() below. Falls back to "wan" if nothing matches
-  # (e.g. ubus/jsonfilter unavailable, or interface not yet registered),
-  # which is exactly the previous behaviour.
+  # Resolve the ubus LOGICAL interface bound to the device this SQM instance shapes, instead of
+  # always asking about the fixed name "wan" (a queue on e.g. "wanb" or "wan6" would otherwise
+  # wait on, or trust the readiness of, the unrelated "wan"). Same lookup technique as the
+  # PPPoE shadow-device search in nft_setup() below. Falls back to "wan" if nothing matches
+  # (ubus/jsonfilter unavailable, or interface not registered yet).
   wan_logical=$(ubus call network.interface dump 2>/dev/null | jsonfilter \
       -e "@.interface[@.device='${IFACE_RAW}' || @.l3_device='${IFACE_RAW}' || @.device='${IFACE}' || @.l3_device='${IFACE}'].interface" 2>/dev/null | head -n1)
   [ -n "${wan_logical}" ] || wan_logical="wan"
@@ -164,14 +160,7 @@ calc_limit() {
 
 # class mark (hex, without 0x) : DSCP
 #
-# This mapping is duplicated in trafficchart-agg (its "cn0"/cname mark-name
-# table, same 17 classes in the same mark order 1-17/0x1-0x11) because
-# nss-rk.qos deliberately does not source trafficchart-common or any other
-# file from the traffic-chart app (it is a standalone SQM shaper script that
-# has to keep working even without that app installed at all). If you add,
-# remove or renumber a class here, make the matching change in
-# trafficchart-agg's cn0 string too - the two are content-verified identical
-# as of 2026-09-27, not just "should be".
+# One DSCP per class; the class marks that share a DSCP are grouped in one nft set below.
 QOS_DSCP="1:ef 2:af41 3:cs4 4:af21 5:af21 6:cs1 7:cs0 8:cs0 9:af31 a:af11 b:cs2 c:cs1 d:af21 e:af21 f:cs2 10:cs0 11:af21"
 
 # Rules of chain qos_dscp: one rule per distinct DSCP and IP family, the class
@@ -254,14 +243,13 @@ nft_setup() {
     # --- BULK: any TCP/UDP flow above this size is demoted to BULK ---
     # 300 MB, deliberately high: with a low value every longer video stream
     # flipped to BULK and the WEB/BULK split depended on connection age.
-    # Configurable: option bulk_bytes in /etc/config/trafficchart (the traffic
-    # chart daemon reads the same option, so both always agree).
+    # Configurable: option bulk_bytes in /etc/config/trafficchart (LuCI: Traffic Chart Settings).
     local BULK_BYTES
     BULK_BYTES=$(uci -q get trafficchart.global.bulk_bytes 2>/dev/null)
     case "${BULK_BYTES}" in ''|*[!0-9]*) BULK_BYTES=314572800 ;; esac
 
     # BULK is class based: only flows already classified WEB (0x4), P2P (0x7)
-    # or BE (0x8) can be demoted (same rule as trafficchart-agg). Every class
+    # or BE (0x8) can be demoted. Every class
     # that is identified by port/protocol stays what it is, so no port
     # exemption lists (and no second copy to keep in sync) are needed. It also
     # covers dynamic ports, e.g. FTP passive data (class 0xc via the helper).
@@ -332,8 +320,7 @@ nft_setup() {
 "
     fi
 
-    # ct bytes (BULK rule) needs conntrack accounting; do not rely on
-    # trafficchart-agg (START=99) having switched it on already
+    # ct bytes (BULK rule) needs conntrack accounting
     [ -w /proc/sys/net/netfilter/nf_conntrack_acct ] && echo 1 > /proc/sys/net/netfilter/nf_conntrack_acct
 
     # One atomic transaction: add + delete + define. Classification never

@@ -7,11 +7,11 @@ supported. Only ONE SQM instance is supported (shared nssifb / nft table).
 Only the low byte (0xff) of the packet/conntrack mark is used; other mark bits
 are preserved.
 
-Optional extras, OFF by default, in /etc/config/trafficchart (section global):
+Options in /etc/config/trafficchart (section global) or LuCI "Traffic Chart Settings";
+the extras are OFF by default:
   option dns_redirect '1'            redirect DNS from all non-WAN interfaces
   option dns_redirect_exclude 'wg0'  interfaces left out of that redirect
   option ttl_fix '1'                 rewrite TTL / hop limit 63,127 -> 64
-  option bulk_bytes '314572800'      flows above this size become BULK
   option reset_ct_marks '0'          keep the ct marks on (re)start (default 1 = zero them
                                      so every flow is classified again; use 0 with mwan3)
 

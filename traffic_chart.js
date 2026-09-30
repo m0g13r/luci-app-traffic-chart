@@ -23,7 +23,7 @@ var callRestart = rpc.declare({
 });
  
 // Separate from "restart": clears cumulative totals + in-RAM history without
-// bouncing the daemon (see the "History reset" comment in trafficchart-agg).
+// bouncing the daemon (see hist_reset() in trafficchart-agg).
 var callResetHistory = rpc.declare({
     object: 'luci.trafficchart',
     method: 'reset_history',
@@ -42,10 +42,11 @@ var R = 118;
 var STROKE_NORMAL = 70;
 var STROKE_HOVER = 82;
 var CIRC = 2 * Math.PI * R;
- 
+
 var UN_SLOT = 'su';
 var UN_MIN_BPS = 5000;
 var UN_MIN_SHARE = 0.04;
+ 
  
 function formatBytes(b) {
     if (!isFinite(b) || b < 0) b = 0;
@@ -195,7 +196,7 @@ return view.extend({
             var currentMeta = null;
             function getMeta(cls) { return (dynamicMeta && currentMeta && currentMeta[cls]) ? currentMeta[cls] : metaOf(cls); }
             var lastUpdateArgs = null;
- 
+
             var tipShown = false;
             function refreshTip() {
                 var m = (dynamicMeta && pinned && currentMeta && panelEl.offsetParent) ? currentMeta[pinned.key] : null;
@@ -244,7 +245,7 @@ return view.extend({
             }, '100.0%');
             var centerLabelEl = E('div', {
                 class: 'qos-center-value',
-                style: 'font-size:9.5px; color:var(--qos-text-muted); letter-spacing:0.4px; text-align:center; max-width:125px;'
+                style: 'font-size:9.5px; line-height:1.2; color:var(--qos-text-muted); letter-spacing:0.4px; text-align:center; width:82%; max-width:96px; box-sizing:border-box; white-space:normal; overflow-wrap:anywhere; word-break:break-word;'
             }, dir.centerLabel);
  
             var activeCountEl = E('div', {
@@ -593,12 +594,7 @@ return view.extend({
                 return nm;
             },
             function(n) { return _('Other (%d devices)').format(n); },
-            function(e) {
-                var t = (e.top || []).slice();
-                if ((e.via_in || 0) + (e.via_out || 0) > 0)
-                    t.push([ _('via router services (proxy, DNS, LuCI ...) - LAN side, not WAN'), e.via_in || 0, e.via_out || 0 ]);
-                return t.length ? t : null;
-            }, _('Top applications'));
+            function(e) { return (e.top && e.top.length) ? e.top : null; }, _('Top applications'));
         var hostsView = makeSlotView(MAX_ROWS - 1, _('Destinations'),
             function(name, e) { return (name === '(other)' && e && e.count) ? _('Other (%d destinations)').format(e.count) : name; },
             function(n) { return _('Other (%d destinations)').format(n); },
@@ -686,7 +682,7 @@ return view.extend({
         }
  
         function makeHistoryView() {
-            var v = { active: false, loadedAt: 0, persist: null, sqm: { down: 0, up: 0 } };
+            var v = { active: false, loadedAt: 0, persist: null, hasShaper: false, sqm: { down: 0, up: 0 } };
             var RANGES = [
                 { id: '24h',  label: _('24 hours'), tier: '5m', span: 86400 },
                 { id: '7d',   label: _('Week'),     tier: '1h', span: 7 * 86400 },
@@ -919,6 +915,7 @@ return view.extend({
                 for (var i = 0; i < dimDefs.length; i++) if (dimDefs[i][0] === st.dim) return dimDefs[i][1];
                 return '';
             }
+            v.setShaper = function(on) { v.hasShaper = !!on; };
             v.setSqm = function(downKbit, upKbit) { v.sqm = { down: downKbit || 0, up: upKbit || 0 }; };
  
             function computeStats(sel, dirKey, shKey) {
@@ -950,10 +947,13 @@ return view.extend({
                     E('th', { 'class': 'th', style: num }, _('Volume')),
                     E('th', { 'class': 'th', style: num, title: _('Volume divided by the time the aggregator was running') }, _('Average')),
                     E('th', { 'class': 'th', style: num, title: _('95% of the time the rate was at or below this value (time-weighted)') }, _('95th percentile')),
-                    E('th', { 'class': 'th', style: num, title: _('Highest bucket average in the period') }, _('Peak')),
-                    E('th', { 'class': 'th', style: num }, _('Shaper drops')),
-                    E('th', { 'class': 'th', style: num }, _('ECN marks')),
-                    E('th', { 'class': 'th', style: num, title: _('Highest momentary queue backlog seen at a poll; in brackets the time the shaper needs to drain it at the configured rate') }, _('Peak backlog')) ]);
+                    E('th', { 'class': 'th', style: num, title: _('Highest bucket average in the period') }, _('Peak')) ]);
+                // shaper columns only when a shaper exists (otherwise they would just show 0 / -)
+                if (v.hasShaper) {
+                    head.appendChild(E('th', { 'class': 'th', style: num }, _('Shaper drops')));
+                    head.appendChild(E('th', { 'class': 'th', style: num }, _('ECN marks')));
+                    head.appendChild(E('th', { 'class': 'th', style: num, title: _('Highest momentary queue backlog seen at a poll; in brackets the time the shaper needs to drain it at the configured rate') }, _('Peak backlog')));
+                }
                 var rows = [ head ];
                 [ [ 'in', _('Download'), 'rx', v.sqm.down * 1000 ], [ 'out', _('Upload'), 'tx', v.sqm.up * 1000 ] ].forEach(function(d) {
                     var x = computeStats(sel, d[0], d[2]), link = d[3];
@@ -961,15 +961,19 @@ return view.extend({
                         var pct = link > 0 ? bps / link * 100 : -1;
                         return formatRate(bps) + (pct >= 0 ? ' (' + pct.toFixed(pct < 10 ? 1 : 0) + ' %)' : '');
                     }
-                    rows.push(E('tr', { 'class': 'tr' }, [
+                    var row = E('tr', { 'class': 'tr' }, [
                         E('td', { 'class': 'td', style: cell + ' font-weight:600;' }, d[1]),
                         E('td', { 'class': 'td', style: num }, formatBytes(x.vol)),
                         E('td', { 'class': 'td', style: num }, rateCell(x.avg)),
                         E('td', { 'class': 'td', style: num }, rateCell(x.p95)),
-                        E('td', { 'class': 'td', style: num, title: x.peakT ? stampLabel(x.peakT, R.span) : '' }, rateCell(x.peak)),
-                        E('td', { 'class': 'td', style: num }, formatCount(x.drops)),
-                        E('td', { 'class': 'td', style: num }, formatCount(x.ecn)),
-                        E('td', { 'class': 'td', style: num }, x.bl > 0 ? backlogTxt(x.bl, link / 1000) : '-') ]));
+                        E('td', { 'class': 'td', style: num, title: x.peakT ? stampLabel(x.peakT, R.span) : '' }, rateCell(x.peak))
+                    ]);
+                    if (v.hasShaper) {
+                        row.appendChild(E('td', { 'class': 'td', style: num }, formatCount(x.drops)));
+                        row.appendChild(E('td', { 'class': 'td', style: num }, formatCount(x.ecn)));
+                        row.appendChild(E('td', { 'class': 'td', style: num }, x.bl > 0 ? backlogTxt(x.bl, link / 1000) : '-'));
+                    }
+                    rows.push(row);
                 });
                 return E('div', { style: 'width:fit-content; max-width:100%; margin:10px auto 0; overflow-x:auto;' }, [
                     E('div', { style: 'font-size:11px; font-weight:700; color:var(--qos-text-strong); margin-bottom:2px;' }, _('Statistics for the shown period')),
@@ -1593,19 +1597,9 @@ return view.extend({
                         st.data[t] = (d && d.buckets) ? d.buckets : [];
                         st.err[t] = false;
                     }).catch(function() {
-                        // Previously this silently left st.data[t] untouched
-                        // via an empty .catch(), which for a FIRST failed load
-                        // (st.data[t] still undefined) rendered as ordinary
-                        // "Loading..." forever, indistinguishable from a slow
-                        // but working request - and for a failure after a
-                        // successful load, whatever was already in st.data[t]
-                        // happened to stay (silently stale) with no error
-                        // shown either way (audit #10). Now: keep whatever
-                        // data is already there (do NOT clear it), and set an
-                        // explicit per-tier error flag render() checks so the
-                        // page can say "history unavailable" instead of
-                        // quietly showing nothing, or quietly showing
-                        // possibly-outdated data with no indication.
+                        // keep whatever data is already there and set an explicit per-tier error
+                        // flag, so render() can say "history unavailable" instead of showing
+                        // nothing (or possibly outdated data) without any indication
                         st.err[t] = true;
                     });
                 })).then(render);
@@ -1621,13 +1615,9 @@ return view.extend({
  
         var shaperEl = E('div', { style: 'font-size:11.5px; color:var(--qos-text-strong); margin:0 0 12px; line-height:18px; font-variant-numeric: tabular-nums; height:40px; min-height:40px; max-height:40px; box-sizing:border-box; overflow:hidden;' });
  
-        // Per-WAN breakdown (audit #12): the main link line above sums every
-        // enabled SQM queue into one rate and one configured-rate figure,
-        // which hides very asymmetric multi-WAN setups (e.g. "1100/120 Mbit/s"
-        // obscuring a 100/20 link and a 1000/100 link). data.wan (from
-        // tc_wan_json() in trafficchart-common) has one entry per queue when
-        // there is more than one; this stays empty and hidden for the common
-        // single-WAN case.
+        // Per-WAN breakdown: the main link line above sums all shaped WAN devices into one rate and
+        // one configured-rate figure, which hides very asymmetric multi-WAN setups. data.wan has one
+        // entry per WAN when there is more than one; it stays empty and hidden for a single WAN.
         var wanEl = E('div', { style: 'display:none; font-size:11px; color:var(--qos-text-muted); margin:0 0 10px; line-height:1.5; font-variant-numeric: tabular-nums; text-align:center;' });
         var prevWan = {};
         function wanUpdate(wan, dt) {
@@ -1689,20 +1679,6 @@ return view.extend({
             return svg;
         }
  
-        var l2El = E('div', { id: 'qos_l2diag', style: 'font-size:11.5px; color:var(--qos-text-strong); margin:-6px 0 12px; line-height:1.55; font-variant-numeric: tabular-nums;' });
-        function l2Update(r) {
-            while (l2El.firstChild) l2El.removeChild(l2El.firstChild);
-            if (!r || r.l2 === undefined || !r.tc) return;
-            var how = r.l2_mode === 2 ? _('measured, %d windows').format(r.l2_n || 0)
-                    : r.l2_mode === 1 ? _('default while measuring: %d of %d windows').format(r.l2_n || 0, r.l2_min || 0)
-                    : _('fixed');
-            l2El.appendChild(E('span', { title: _('Bytes per packet that the shaper counts but conntrack does not (link layer header). They are subtracted before "Not attributed" is computed.') },
-                _('Link header: %d B/packet (%s)').format(r.l2, how)));
-            var extra = (r.l2_mode === 2) ? (r.l2_raw || 0) - r.l2 : 0;
-            if (extra >= 3)
-                l2El.appendChild(E('span', { style: 'color:var(--qos-danger); margin-left:10px;' },
-                    _('⚠ measured %.1f B/packet: about %.0f B/packet more than a link header - traffic that conntrack does not see is probably present (shown as "Not attributed")').format(r.l2_raw, extra)));
-        }
         function shaperUpdate(sh, dt) {
             while (shaperEl.firstChild) shaperEl.removeChild(shaperEl.firstChild);
             [ ['rx', _('Download shaper')], ['tx', _('Upload shaper')] ].forEach(function(def) {
@@ -1738,6 +1714,8 @@ return view.extend({
                 shaperEl.appendChild(lineEl);
             });
             ['rx', 'tx'].forEach(function(d) { prevShaper[d] = (sh && sh[d] && sh[d].sent !== undefined) ? sh[d] : null; });
+            // no shaper -> no health line at all (instead of an empty reserved box)
+            shaperEl.style.display = shaperEl.firstChild ? '' : 'none';
         }
  
         var lastData = null;
@@ -1894,7 +1872,6 @@ return view.extend({
             container.appendChild(staleEl);
             container.appendChild(wanEl);
             container.appendChild(shaperEl);
-            container.appendChild(l2El);
             container.appendChild(toolbar);
             container.appendChild(appPanels);
             container.appendChild(devPanels);
@@ -1932,22 +1909,16 @@ return view.extend({
         }
         var pollInFlight = false;
         var pollRequestId = 0;
-        // Far longer than any normal rpc/ubus timeout - this only exists to
-        // recover if a request NEVER settles at all (should not normally
-        // happen). The previous 8s watchdog unconditionally cleared
-        // pollInFlight, so a request that was merely slow (not actually stuck)
-        // kept running while a second poll started - two get_stats calls in
-        // flight at once (audit #9). This timer instead advances
-        // pollRequestId, so if the abandoned request eventually does resolve,
-        // its response is recognised as stale (myPollId mismatch) and
-        // discarded rather than applied on top of newer data.
+        // Far longer than any normal rpc/ubus timeout - this only exists to recover if a request
+        // NEVER settles at all. It advances pollRequestId, so a response that arrives later is
+        // recognised as stale (myPollId mismatch) and discarded instead of overwriting newer data.
         var POLL_HARD_TIMEOUT = 30000;
  
         var tabHidden = (typeof document.hidden === 'boolean') ? document.hidden : false;
         document.addEventListener('visibilitychange', function() { tabHidden = document.hidden; });
  
-        // The daemon only produces new data every load.interval seconds (4-20 s in the
-        // low-cpu profiles): poll at half of that instead of a fixed 2 s.
+        // The daemon only produces new data every load.interval seconds (4-20 s):
+        // poll at half of that instead of a fixed 2 s.
         var pollSec = 2;
         function adaptPoll(data) {
             var iv = (data && data.load && data.load.interval) || 0;
@@ -1983,8 +1954,7 @@ return view.extend({
                         statusEl.style.color = 'red';
                         statusEl.textContent = data && data.error
                             ? _('Error: %s').format(data.error)
-                            : (data && data.apps ? _('Error: aggregator too old (no rate data) - update trafficchart-agg and restart the service')
-                                                 : _('Error: No data received. Is the trafficchart service running (/etc/init.d/trafficchart start)?'));
+                            : _('Error: No data received. Is the trafficchart service running (/etc/init.d/trafficchart start)?');
                         restartBtn.style.display = '';
                     } else {
                         updateStaleIndicator();
@@ -2020,11 +1990,11 @@ return view.extend({
                 flowsView.update(data.top_flows || [], sqmDownloadKbit, sqmUploadKbit);
                 shaperUpdate(data.shaper, dt);
                 wanUpdate(data.wan, dt);
-                l2Update(rateInfo);
                 lastData = data;
                 tcDiagText = data.tc_diag || '';
                 histView.setPersist(data.persist || null);
                 histView.setSqm(sqmDownloadKbit, sqmUploadKbit);
+                histView.setShaper(!!(data.shaper && ((data.shaper.rx && data.shaper.rx.sent !== undefined) || (data.shaper.tx && data.shaper.tx.sent !== undefined))));
  
                 mountChartOnce(data);
  
