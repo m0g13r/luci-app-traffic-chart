@@ -42,8 +42,19 @@ case "$1" in
             # Buckets already written to a persistent storage path are left
             # alone (only the RAM/UI view is cleared) - delete those files
             # yourself if you also want the on-disk archive gone.
-            mkdir -p "$HIST_DIR" 2>/dev/null
-            : > "${HIST_DIR}/reset.req"
+            umask 077
+            if ! mkdir -p "$HIST_DIR" 2>/dev/null; then
+                echo '{"error":"cannot create runtime directory"}'
+                exit 1
+            fi
+            if ! chmod 700 "$HIST_DIR" 2>/dev/null; then
+                echo '{"error":"cannot set runtime directory permissions"}'
+                exit 1
+            fi
+            if ! : > "${HIST_DIR}/reset.req" 2>/dev/null; then
+                echo '{"error":"cannot create reset request"}'
+                exit 1
+            fi
             echo '{"result": "reset requested"}'
             exit 0
         fi

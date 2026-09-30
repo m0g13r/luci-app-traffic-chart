@@ -323,13 +323,14 @@ nft_setup() {
     # ct bytes (BULK rule) needs conntrack accounting
     [ -w /proc/sys/net/netfilter/nf_conntrack_acct ] && echo 1 > /proc/sys/net/netfilter/nf_conntrack_acct
 
-    # One atomic transaction: add + delete + define. Classification never
-    # disappears between removing the old and loading the new ruleset, and if
-    # loading fails the old table stays in place.
+    # One atomic transaction: if the old table exists, delete it and then add
+    # the complete replacement. nft applies the whole batch transactionally,
+    # so a parse/validation failure rolls the delete back and preserves the
+    # old classification table. On first start there is nothing to delete.
     QOS_NFT_FILE=/tmp/nss-rk-qos.nft
     cat > "${QOS_NFT_FILE}" <<EOF
+$(nft list table inet qos_custom >/dev/null 2>&1 && echo 'delete table inet qos_custom')
 add table inet qos_custom
-delete table inet qos_custom
 table inet qos_custom {
 ${FTP_HELPER_DECL}
 ${NAT_CHAIN}${MSS_CLAMP_CHAIN}

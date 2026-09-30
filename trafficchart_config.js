@@ -110,6 +110,12 @@ return view.extend({
         o.placeholder = 'wg0';
         o.depends('dns_redirect', '1');
 
+        o = s.option(form.Value, 'bulk_bytes', _('Bulk threshold (bytes)'),
+            _('TCP/UDP flows already classified as WEB, P2P or best-effort are moved to BULK after this conntrack byte count. Default: 300 MiB.'));
+        o.datatype = 'uinteger';
+        o.default = '314572800';
+        o.rmempty = false;
+
         o = s.option(form.Flag, 'ttl_fix', _('Normalise TTL / hop limit'),
             _('Rewrites packets with TTL/hop limit 63 or 127 to 64.'));
         o.default = '0';

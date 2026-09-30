@@ -131,7 +131,9 @@ fi
 case "$PERSIST_SEC" in ''|*[!0-9]*) PERSIST_SEC=3600 ;; esac
 [ "$PERSIST_SEC" -ge 60 ] || PERSIST_SEC=60
 
+umask 077
 mkdir -p "$OUT_DIR" || exit 1
+chmod 700 "$OUT_DIR" 2>/dev/null || exit 1
 
 # --- process control: the init script stops us with SIGTERM; the wrapper turns that into
 # a stop request file the daemon polls, so it can flush its history before it exits.
@@ -594,7 +596,7 @@ function load_map(   l, i, r, j, v) {
 }
 
 function app_add(a, lan, d1, d2, q1, q2) {
-    gsub(/["\\]/, "_", a)
+    # app_name() already sanitizes the label; avoid repeating that regex per delta.
     aseen[a] = 1
     if (lan) { aob[a] += d1; aop[a] += q1; aib[a] += d2; aip[a] += q2 }
     else     { aib[a] += d1; aip[a] += q1; aob[a] += d2; aop[a] += q2 }
@@ -750,13 +752,19 @@ function parse_pass(   line, r, h, proto, pp, t, sp, b1, b2, p1, p2,
 
         # original-direction counters, then reply-direction counters
         rsrc = ""
+        src_local = islocal(src)
+        dst_local = islocal(dst)
+        rsrc_local = 0
         if (match(r, /packets=[0-9]+ bytes=[0-9]+/)) {
             t = substr(r, RSTART + 8, RLENGTH - 8); sp = index(t, " ")
             p1 = substr(t, 1, sp - 1) + 0; b1 = substr(t, sp + 7) + 0
             r = substr(r, RSTART + RLENGTH)
             # WAN-initiated flow (port forward): the LAN device is the source
             # of the REPLY tuple
-            if (!islocal(src) && match(r, /src=[^ ]+/)) rsrc = substr(r, RSTART + 4, RLENGTH - 4)
+            if (!src_local && match(r, /src=[^ ]+/)) {
+                rsrc = substr(r, RSTART + 4, RLENGTH - 4)
+                rsrc_local = islocal(rsrc)
+            }
             if (match(r, /packets=[0-9]+ bytes=[0-9]+/)) {
                 t = substr(r, RSTART + 8, RLENGTH - 8); sp = index(t, " ")
                 p2 = substr(t, 1, sp - 1) + 0; b2 = substr(t, sp + 7) + 0
@@ -766,17 +774,17 @@ function parse_pass(   line, r, h, proto, pp, t, sp, b1, b2, p1, p2,
         if (src == "") continue
 
 
-        lan = islocal(src)
+        lan = src_local
         rflow = 0
         # Router-originated WAN flow (e.g. stream proxy upstream): the router is the
         # initiator, so orig direction = upload (otherwise it would be taken for a
         # WAN-initiated port forward: directions swapped, device = remote server).
-        if ((src in rtr) && !islocal(dst)) { rflow = 1; lan = 1 }
+        if ((src in rtr) && !dst_local) { rflow = 1; lan = 1 }
         {
             if (rflow) { }                                                # router -> WAN, counted as device "Router"
             else if (lan && (dst in rtr) && !(src in rtr)) continue       # LAN device -> router itself: not WAN traffic
-            else if (!lan && rsrc != "" && islocal(rsrc) && !(rsrc in rtr)) { }   # WAN-initiated to a LAN host (port forward, IPv6 inbound)
-            else if (!(lan && !islocal(dst))) continue                    # not LAN->WAN
+            else if (!lan && rsrc != "" && rsrc_local && !(rsrc in rtr)) { }   # WAN-initiated to a LAN host (port forward, IPv6 inbound)
+            else if (!(lan && !dst_local)) continue                    # not LAN->WAN
         }
 
         key = proto "|" src "|" dst "|" pp

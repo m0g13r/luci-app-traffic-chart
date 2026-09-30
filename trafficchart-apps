@@ -31,7 +31,9 @@ AWK="${AWK:-awk}"
 SOCAT="${SOCAT:-socat}"
 ONCE="${ONCE:-0}"      # testing: read stdin once instead of the socket loop
 
+umask 077
 mkdir -p "$OUT_DIR" || exit 1
+chmod 700 "$OUT_DIR" 2>/dev/null || exit 1
 
 if [ "$ONCE" != "1" ] && ! command -v "$SOCAT" >/dev/null 2>&1; then
     logger -t trafficchart "socat not installed (opkg install socat) - application names disabled, everything else unaffected"

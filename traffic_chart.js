@@ -73,8 +73,23 @@ function svgEl(tag, attrs) {
     return el;
 }
  
+var previousCleanup = null;
+
 return view.extend({
     render: function() {
+        if (previousCleanup) {
+            previousCleanup();
+            previousCleanup = null;
+        }
+        var cleanupFns = [];
+        previousCleanup = function() {
+            var fn;
+            while ((fn = cleanupFns.pop())) {
+                try { fn(); } catch (e) {}
+            }
+            previousCleanup = null;
+        };
+
         if (!document.getElementById('qos_chart_style')) {
             var styleTag = document.createElement('style');
             styleTag.id = 'qos_chart_style';
@@ -150,11 +165,13 @@ return view.extend({
             if (tipEl.style.display !== 'none') tipPlace();
         }
         var tipScrollY = window.pageYOffset;
-        window.addEventListener('scroll', function() {
+        var tipScrollHandler = function() {
             var y = window.pageYOffset;
             if (tipEl.style.display !== 'none') { tipPos.y -= (y - tipScrollY); tipPlace(); }
             tipScrollY = y;
-        });
+        };
+        window.addEventListener('scroll', tipScrollHandler);
+        cleanupFns.push(function() { window.removeEventListener('scroll', tipScrollHandler); });
         function tipHide() { tipEl.style.display = 'none'; }
         function tipShow(m) {
             while (tipEl.firstChild) tipEl.removeChild(tipEl.firstChild);
@@ -753,15 +770,18 @@ return view.extend({
                 tipHide();
             });
  
-            if (!makeHistoryView._historyPinOutsideHandler) {
-                makeHistoryView._historyPinOutsideHandler = function(ev) {
-                    if (!historyPinned) return;
-                    if (ev.target === tipEl || tipEl.contains(ev.target)) return;
-                    historyPinned = null;
-                    tipHide();
-                };
-                document.addEventListener('click', makeHistoryView._historyPinOutsideHandler);
-            }
+            var historyPinOutsideHandler = function(ev) {
+                if (!historyPinned) return;
+                if (ev.target === tipEl || tipEl.contains(ev.target)) return;
+                historyPinned = null;
+                tipHide();
+            };
+            document.addEventListener('click', historyPinOutsideHandler);
+            cleanupFns.push(function() {
+                document.removeEventListener('click', historyPinOutsideHandler);
+                historyPinned = null;
+                tipHide();
+            });
  
             var chartHost = E('div', { style: 'width:100%;' });
             var persistEl = E('div', { style: 'text-align:center; font-size:10.5px; color:var(--qos-text-muted); margin-top:4px;' });
@@ -1577,10 +1597,15 @@ return view.extend({
             }
             v.render = render;
             var resizeTimer = null;
-            window.addEventListener('resize', function() {
+            var resizeHandler = function() {
                 if (!v.active) return;
                 clearTimeout(resizeTimer);
                 resizeTimer = setTimeout(render, 150);
+            };
+            window.addEventListener('resize', resizeHandler);
+            cleanupFns.push(function() {
+                window.removeEventListener('resize', resizeHandler);
+                clearTimeout(resizeTimer);
             });
             v.stale = function() { return Date.now() - v.loadedAt > REFRESH_MS[rangeDef().tier]; };
             v.clearPinned = function() {
@@ -1915,7 +1940,9 @@ return view.extend({
         var POLL_HARD_TIMEOUT = 30000;
  
         var tabHidden = (typeof document.hidden === 'boolean') ? document.hidden : false;
-        document.addEventListener('visibilitychange', function() { tabHidden = document.hidden; });
+        var visibilityHandler = function() { tabHidden = document.hidden; };
+        document.addEventListener('visibilitychange', visibilityHandler);
+        cleanupFns.push(function() { document.removeEventListener('visibilitychange', visibilityHandler); });
  
         // The daemon only produces new data every load.interval seconds (4-20 s):
         // poll at half of that instead of a fixed 2 s.
@@ -2016,6 +2043,11 @@ return view.extend({
             });
         };
         poll.add(pollFn, pollSec);
+        cleanupFns.push(function() {
+            poll.remove(pollFn);
+            pollInFlight = false;
+            pollRequestId++;
+        });
  
         return m;
     },
