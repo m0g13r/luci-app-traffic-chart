@@ -1,9 +1,11 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
 # trafficchart-hosts - LAN device identity for trafficchart-agg
 #
 # Prints tab separated lines:
 #   I <ip> <mac>     every neighbour (ARP / IPv6 ND) with a link-layer address;
-#                    IPv6 fully expanded like /proc/net/nf_conntrack prints it
+#                    IPv6 fully expanded like /proc/net/nf_conntrack prints it; also the
+#                    addresses of static "config domain" entries that belong to a static host
 #   N <mac> <name>   best known host name for a MAC (DHCP leases first, static
 #                    "config host" entries from /etc/config/dhcp override)
 #

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
 # trafficchart-tc - post-shaping byte counters + shaper drop/ECN counters + backlog for
 # trafficchart-agg, plus everything the chart page needs to know about the shapers
 #
@@ -8,7 +9,7 @@
 # "<rx_bytes> <tx_bytes> <rx_dropped> <rx_ecn> <tx_dropped> <tx_ecn> <rx_backlog> <tx_backlog>"
 #
 # (download / upload byte counters since the shaper qdiscs were created, summed
-# over all enabled SQM queues; and the same qdiscs' cumulative dropped-packet
+# over all shaped devices; and the same qdiscs' cumulative dropped-packet
 # and ECN-mark counters, summed the same way; plus the momentary queue backlog in
 # bytes of those qdiscs). Any field that cannot be determined is printed as "-".
 #
@@ -27,8 +28,8 @@
 # of only being visible live.
 #
 # Which devices are read (nss: download = nssifb, upload = WAN device without
-# VLAN suffix; generic: download = ifb4<wan>, upload = the SQM interface) is
-# decided in trafficchart-common, shared with luci.trafficchart. This runs on
+# VLAN suffix; generic: download = the ifb behind the ingress redirect, upload =
+# the shaped WAN device) is decided in trafficchart-common. This runs on
 # EVERY poll, so it is kept cheap: the device resolution is cached
 # (tc_resolve_cached) and every device costs one "tc" + one "awk"
 # (tc_dev_stats).

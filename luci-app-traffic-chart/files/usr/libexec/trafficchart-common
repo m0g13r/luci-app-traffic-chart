@@ -1,8 +1,10 @@
 #!/bin/sh
-# trafficchart-common - shared shaper/device detection (sourced, not executed)
+# SPDX-License-Identifier: GPL-2.0-or-later
+# trafficchart-common - shared settings (tc_cfg) and shaper/device detection (sourced, not executed)
 #
-# Install as /usr/libexec/trafficchart-common. Sourced by trafficchart-tc (link counters
-# for trafficchart-agg), trafficchart-apps and trafficchart-hosts (tc_cfg for settings).
+# Install as /usr/libexec/trafficchart-common. Sourced by trafficchart-agg and
+# trafficchart-apps (tc_cfg for settings) and by trafficchart-tc (shaper detection, link
+# counters for trafficchart-agg).
 # Shapers are found in the kernel (tc qdisc / tc filter), no sqm / qosmate / ... config is read.
 #
 # Usage:
@@ -14,11 +16,12 @@
 #
 # tc_resolve sets:
 #   BACKEND        nss | generic
-#                    nss     NSS hardware offload: nsstbl/nsfq_codel, download
+#                    nss     NSS hardware offload: nsstbl/nssfq_codel, download
 #                            shaper on nssifb
 #                    generic stock kernel shaper set up by sqm-scripts: cake or
 #                            htb+fq_codel, download shaper on ifb4<wan>
-#                  Auto: "nss" if the nssifb device exists, else "generic". To force one:
+#                  Auto: "nss" if the nssifb device exists and the nss_ifb module is loaded,
+#                  else "generic". To force one:
 #                    touch /etc/config/trafficchart
 #                    uci set trafficchart.global=trafficchart
 #                    uci set trafficchart.global.backend=generic     # or: nss / auto
@@ -52,8 +55,7 @@ SYSNET="${TC_SYSNET:-/sys/class/net}"
 
 # Index of the options that exist in /etc/config/trafficchart (section global),
 # read ONCE per process with a single "uci show". tc_cfg() then only forks
-# "uci get" for options that are really set (before: 2-3 uci forks plus tr/sed
-# for EVERY call, also for the many options that are not set at all).
+# "uci get" for options that are really set.
 tc_load_config() {
     [ -n "$TC_CFG_LOADED" ] && return 0
     TC_CFG_LOADED=1
@@ -160,7 +162,7 @@ tc_detect_backend() {
 
 # ifb device that sqm-scripts or qosmate created for a WAN device:
 # sqm-scripts: ifb4<wan> (name limited to 15 chars)
-# qosmate:     ifb-<wan> (hyphen; confirmed in qosmate's own README)
+# qosmate:     ifb-<wan> (hyphen)
 # else: the only ifb* device, if there is exactly one.
 tc_find_ifb() {
     local wan="$1" cand n found=""

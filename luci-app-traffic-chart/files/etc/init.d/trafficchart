@@ -1,8 +1,10 @@
 #!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: GPL-2.0-or-later
 # /etc/init.d/trafficchart
 #
 # Settings: /etc/config/trafficchart (section "global"). "enabled" and "apps" are read here,
-# "interval" and the persistence options by trafficchart-agg, "sock" by trafficchart-apps.
+# the other options by trafficchart-agg, trafficchart-apps, trafficchart-common (shaper
+# detection) and nss-trafficchart.qos.
 # A "uci commit trafficchart" restarts the service (reload trigger below), so changes apply at
 # once. Restarting resets the cumulative totals, the history survives.
 
@@ -23,7 +25,7 @@ start_service() {
     procd_set_param nice 10
     procd_set_param respawn 3600 5 0
     # on stop the daemon closes its open history buckets and writes them to the
-    # persistent storage (needs a few seconds, more with a slow network share; procd would SIGKILL after 5 s)
+    # persistent storage (needs a few seconds, more with a slow network share; the procd default would SIGKILL after 5 s)
     procd_set_param term_timeout 20
     procd_set_param stdout 1
     procd_set_param stderr 1

@@ -1,13 +1,14 @@
 ###############################################################################
-# nss-rk.qos - SQM shaper for NSS hardware offload (nsstbl + nssfq_codel)
+# SPDX-License-Identifier: GPL-2.0-or-later
+# nss-trafficchart.qos - SQM shaper for NSS hardware offload (nsstbl + nssfq_codel)
 # with port based traffic classes (nftables packet marks + DSCP).
-# version 0.9.3 (20260929)
+# version 0.9.4 (20261001) - renamed from nss-rk.qos
 #
 # Based on simple.qos / nss.qos by ricsc, modified by rickk
 #   https://github.com/rickkdotnet/sqm-scripts-nss
 #   https://github.com/qosmio/sqm-scripts-nss   (ipq807x)
 #
-# Install as /usr/lib/sqm/nss-rk.qos (together with nss-rk.qos.help), then
+# Install as /usr/lib/sqm/nss-trafficchart.qos (together with nss-trafficchart.qos.help), then
 # select "fq_codel" and this script in the LuCI SQM page.
 #
 # Traffic classes = low byte of the packet/conntrack mark:
@@ -26,13 +27,14 @@
 #    counters only.
 #  * One SQM instance only: nssifb exists once and every instance recreates the
 #    nft table "inet qos_custom". Multi-WAN with NSS is not supported.
-#  * Optional extras, OFF by default, set in /etc/config/trafficchart (section
-#    global) or LuCI "Traffic Chart Settings" (restart SQM afterwards):
-#      dns_redirect '1'          redirect DNS (53) from all non-WAN interfaces
-#      dns_redirect_exclude '..' interfaces left out of the redirect (e.g. wg0)
-#      ttl_fix '1'               rewrite TTL/hop limit 63/127 to 64
-#      reset_ct_marks '0'        do not zero the ct marks on (re)start (default 1; needed with mwan3)
-#      bulk_bytes '314572800'    TCP/UDP flows of class WEB/P2P/BE above this size become BULK
+#  * Options in /etc/config/trafficchart (section global) or LuCI "Traffic Chart
+#    Settings" (restart SQM afterwards):
+#      bulk_bytes '314572800'    TCP/UDP flows of class WEB/P2P/BE above this size (300 MiB) become BULK
+#      reset_ct_marks '1'        zero the ct marks on (re)start so every flow is classified again
+#                                (use 0 with mwan3)
+#      dns_redirect '0'          1 = redirect DNS (53) from all non-WAN interfaces (off by default)
+#      dns_redirect_exclude '..' interfaces left out of that redirect (e.g. wg0)
+#      ttl_fix '0'               1 = rewrite TTL/hop limit 63/127 to 64 (off by default)
 ###############################################################################
 
 . /lib/functions.sh
@@ -240,8 +242,8 @@ nft_setup() {
     esac
     sqm_debug "nft_setup: WAN interface match set: { ${IFSET} }"
 
-    # --- BULK: any TCP/UDP flow above this size is demoted to BULK ---
-    # 300 MB, deliberately high: with a low value every longer video stream
+    # --- BULK: TCP/UDP flows of class WEB / P2P / BE above this size are demoted to BULK ---
+    # 300 MiB, deliberately high: with a low value every longer video stream
     # flipped to BULK and the WEB/BULK split depended on connection age.
     # Configurable: option bulk_bytes in /etc/config/trafficchart (LuCI: Traffic Chart Settings).
     local BULK_BYTES
@@ -327,7 +329,7 @@ nft_setup() {
     # the complete replacement. nft applies the whole batch transactionally,
     # so a parse/validation failure rolls the delete back and preserves the
     # old classification table. On first start there is nothing to delete.
-    QOS_NFT_FILE=/tmp/nss-rk-qos.nft
+    QOS_NFT_FILE=/tmp/nss-trafficchart-qos.nft
     cat > "${QOS_NFT_FILE}" <<EOF
 $(nft list table inet qos_custom >/dev/null 2>&1 && echo 'delete table inet qos_custom')
 add table inet qos_custom
@@ -392,8 +394,8 @@ $(qos_ports tcp "{ 53, 853, 42 }" 0x1)
 $(qos_ports udp "{ 3478, 3479, 5060, 5061, 8801-8810 }" 0x2)
 $(qos_ports tcp "{ 5060, 5061, 8801-8810, 2000 }" 0x2)
 
-        # 0x3 GAME: Xbox, PSN, Steam, Battle.net
-$(qos_ports udp "{ 3074, 3478-3480, 27000-27050, 6112-6119 }" 0x3)
+        # 0x3 GAME: Xbox, PSN, Steam, Battle.net (udp 3478/3479 are already VOIP above)
+$(qos_ports udp "{ 3074, 3480, 27000-27050, 6112-6119 }" 0x3)
 $(qos_ports tcp "{ 3478-3480, 6112-6119 }" 0x3)
 
         # 0x9 VPN: WireGuard, OpenVPN, IPsec/IKEv2, L2TP
@@ -457,8 +459,7 @@ EOF
         return 1
     fi
 
-    # reset old marks so every flow is classified again with the new ruleset
-    # (conntrack cannot clear just the low byte: this zeroes the whole ct mark)
+    # reset old marks so every flow is classified again with the new ruleset.
     # conntrack cannot clear just the low byte, this zeroes the WHOLE ct mark. With
     # mwan3 (or anything else that keeps state in the higher bits) that can re-route
     # running flows, so it can be switched off: option reset_ct_marks '0' (default 1).
@@ -533,9 +534,9 @@ add_nssfq_codel() {
 egress() {
   [ -z "$ETARGET" ] && ETARGET="5ms"
 
-  # Without an overhead setting, tc shows 1518 byte packets hitting the shaper
-  # (header added by NSS), so err on the large side: MTU + 18. Set the
-  # overhead to 0 or 14 in the SQM config if you do not like that.
+  # Without an overhead setting (0), tc shows 1518 byte packets hitting the shaper
+  # (header added by NSS), so err on the large side: MTU + 18. Set an overhead
+  # other than 0 (e.g. 14) in the SQM config to change that.
   local MTU=$( get_mtu ${IFACE} )
   [ "${OVERHEAD:-0}" -eq 0 ] && OVERHEAD=18
   let MTU+=OVERHEAD
@@ -586,7 +587,7 @@ sqm_prepare_script() {
     fi
     # one SQM instance only with NSS (see header)
     if [ "$(uci -q show sqm 2>/dev/null | grep -c "\.enabled='1'")" -gt 1 ]; then
-        sqm_warn "sqm_prepare_script: more than one SQM queue is enabled - nss-rk.qos supports a single instance (shared nssifb / nft table)"
+        sqm_warn "sqm_prepare_script: more than one SQM queue is enabled - nss-trafficchart.qos supports a single instance (shared nssifb / nft table)"
     fi
     nft_setup
     return 0
@@ -595,7 +596,7 @@ sqm_prepare_script() {
 # Replaces the stock sqm_start, which calls verify_qdisc and thereby creates
 # (and destroys) ifb interfaces - not wanted with NSS. Same logic otherwise.
 sqm_start() {
-    sqm_debug "sqm_start: Starting sqm_start from nss.qos"
+    sqm_debug "sqm_start: Starting sqm_start from nss-trafficchart.qos"
     [ -n "$IFACE" ] || return
 
     check_wan
@@ -629,8 +630,8 @@ sqm_start() {
     return 0
 }
 
-# Replaces the stock sqm_stop: deleting the ifb and recreating/enabling it
-# crashes nssifb.
+# Replaces the stock sqm_stop: nssifb is only deleted where that is safe (not on
+# kernel 5.10, see DELETENSSIFB).
 sqm_stop() {
     # egress shaper: independent of the download setting (silent, there is
     # nothing to delete if upload shaping was off)

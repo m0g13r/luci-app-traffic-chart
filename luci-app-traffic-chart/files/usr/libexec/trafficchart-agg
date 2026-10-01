@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
 # trafficchart-agg - conntrack aggregator for luci.trafficchart
 #
 # Runs as a procd service (see the init script). Every INTERVAL seconds it walks
@@ -27,11 +28,10 @@
 # subtracting the link layer header (tc counts it, conntrack does not). The header size is
 # measured automatically (option l2_overhead 'auto', or a fixed number of bytes per packet).
 #
-# Settings (/etc/config/trafficchart, section global; the environment wins):
-#   interval (s, default 4)          poll interval, stretches automatically under load
-#   persist_dir / persist_mount / persist_sec / persist_timeout   optional, see the settings page
-# Everything else is fixed below. Environment overrides for testing: CT_FILE OUT_DIR AWK
-# V6HELPER HOSTS_HELPER TC_HELPER TC_COMMON and every constant below.
+# Settings: /etc/config/trafficchart, section global (a variable set in the environment wins).
+# Every tc_cfg line below is a setting (option name = variable name in lower case, see
+# Traffic Chart Settings); the other constants are fixed. Environment overrides for testing:
+# CT_FILE OUT_DIR AWK V6HELPER HOSTS_HELPER TC_HELPER TC_COMMON and every constant below.
 
 TC_COMMON="${TC_COMMON:-/usr/libexec/trafficchart-common}"
 if [ -r "$TC_COMMON" ]; then
@@ -62,7 +62,7 @@ HOSTS_REFRESH_SEC="${HOSTS_REFRESH_SEC:-180}"; GUA_REFRESH_SEC="${GUA_REFRESH_SE
 RATE_WIN="${RATE_WIN:-20}"
 HOUR_SEC="${HOUR_SEC:-3600}"; DAY_SEC="${DAY_SEC:-86400}"
 TBL_IDLE_LONG="${TBL_IDLE_LONG:-3600}"; TBL_IDLE_SHORT="${TBL_IDLE_SHORT:-600}"
-APP_HOLD="${APP_HOLD:-3}"                # polls a new flow waits for its netifyd label
+APP_HOLD="${APP_HOLD:-3}"                # a new flow waits (APP_HOLD-1) intervals for its netifyd label
 BIRTH_MAX="${BIRTH_MAX:-1073741824}"     # bytes: a flow first seen with more than this in ONE poll cannot be new - adopted as baseline
 TOOLTIP_EVERY="${TOOLTIP_EVERY:-2}"; MX_MAX="${MX_MAX:-1000}"; PAIR_MAX="${PAIR_MAX:-500}"   # tooltip tables: rebuild every N polls, size limits
 # "Not attributed" (what the shaper carries but conntrack does not count) and the automatic
@@ -71,7 +71,7 @@ L2_INIT="${L2_INIT:-18}"; L2_CANDIDATES="${L2_CANDIDATES:-0 14 18 22 26}"
 CAL_WIN="${CAL_WIN:-30}"; CAL_KEEP="${CAL_KEEP:-60}"; CAL_MIN="${CAL_MIN:-8}"; CAL_PCTL="${CAL_PCTL:-25}"
 CAL_TOL="${CAL_TOL:-1}"; CAL_MAX_PKT="${CAL_MAX_PKT:-400}"; CAL_MIN_PKTS="${CAL_MIN_PKTS:-500}"
 UN_WIN="${UN_WIN:-30}"; UN_WIN_RX="${UN_WIN_RX:-60}"; UN_WIN_LONG="${UN_WIN_LONG:-300}"
-GONE_GRACE="${GONE_GRACE:-5}"            # polls a flow may be missing (short procfs read) before its state is dropped
+GONE_GRACE="${GONE_GRACE:-5}"            # time (GONE_GRACE intervals) a flow may be missing (short procfs read) before its state is dropped
 
 # link counters: run via sh so a missing execute bit does not disable it silently
 TC_HELPER="${TC_HELPER:-/usr/libexec/trafficchart-tc}"
@@ -102,13 +102,18 @@ fi
 #                   "not attributed")
 case "$L2_OVERHEAD" in auto|[0-9]|[0-9][0-9]) ;; *) L2_OVERHEAD=auto ;; esac
 
-# PERSIST_DIR / PERSIST_MOUNT: persistence is deliberately restricted to external/storage
-# trees. The UI ACL is read-only for normal users, and this second boundary makes the
-# daemon safe even if malformed UCI is supplied by another caller. Targets must be
-# existing directories under /mnt, /media, or /tmp/mnt. Symlinks are resolved before use.
+# PERSIST_DIR / PERSIST_MOUNT: persistence is restricted to storage trees (/mnt, /media,
+# /tmp/mnt), so a malformed UCI value cannot make the daemon write elsewhere. A target that
+# exists is checked after resolving symlinks; one that does not exist yet (share not mounted)
+# is accepted by name and checked the same way by trafficchart-persist-exec once it appears.
 _persist_path_allowed() {
     _p="$1"
-    [ -d "$_p" ] || return 1
+    case "/$_p/" in */../*) return 1 ;; esac
+    case "$_p" in
+        /mnt|/mnt/*|/media|/media/*|/tmp/mnt|/tmp/mnt/*) ;;
+        *) return 1 ;;
+    esac
+    [ -d "$_p" ] || return 0
     command -v readlink >/dev/null 2>&1 || return 1
     _rp=$(readlink -f "$_p" 2>/dev/null) || return 1
     case "$_rp" in
@@ -128,7 +133,7 @@ _clean() {
         if [ -z "$_w2" ]; then
             logger -t trafficchart "config: ignoring invalid persistence path '$_w'" 2>/dev/null
         elif ! _persist_path_allowed "$_w2"; then
-            logger -t trafficchart "config: ignoring persistence path '$_w': must be an existing real directory under /mnt, /media, or /tmp/mnt" 2>/dev/null
+            logger -t trafficchart "config: ignoring persistence path '$_w': must be below /mnt, /media, or /tmp/mnt" 2>/dev/null
         else
             _out="${_out:+$_out }$_w2"
         fi
@@ -249,7 +254,7 @@ function refresh_gua(   rx) {
 # Addresses recorded by dev_key() as "IPv6, no MAC known" that are still
 # recent (V6_STALE_POLLS) and not meanwhile resolved go to OUT_DIR/unresolved_v6,
 # for trafficchart-hosts to actively re-resolve just before the next
-# refresh_hosts() reads "ip neigh show" (see the header comment for why).
+# refresh_hosts() reads "ip neigh show" (see trafficchart-hosts for why).
 function write_unresolved(   k, tmp, wrote) {
     tmp = UNRESOLVED_FILE ".tmp"
     wrote = 0
@@ -289,7 +294,7 @@ function dev_key(lan, src, rsrc,   addr, mac, key, nm) {
     mac = (addr in hmac) ? hmac[addr] : ""
     # No MAC known for this address: if it is IPv6-shaped, remember it so
     # write_unresolved() can hand it to trafficchart-hosts for active
-    # re-resolution (see the header comment above for why this happens).
+    # re-resolution (see trafficchart-hosts).
     if (mac == "" && index(addr, ":") > 0) v6seen[addr] = n
     key = (mac != "") ? mac : addr
     if (!(key in dseen) && ndev >= 256) key = "(other)"
@@ -303,8 +308,7 @@ function dev_key(lan, src, rsrc,   addr, mac, key, nm) {
 }
 
 # Fold a temporarily IPv6-address-keyed device ("old", e.g. a raw address
-# used as the device key because no MAC was known yet - see dev_key() and the
-# NSS-offload comment near v6seen above) into its real MAC-keyed device
+# used as the device key because no MAC was known yet - see dev_key()) into its real MAC-keyed device
 # ("new") once the address resolves. Called from reconcile_v6_devices() right
 # after refresh_hosts() picks up a fresh neighbour-table entry.
 #
@@ -426,10 +430,9 @@ function v6short(a,   n, g, i, out) {
     return out
 }
 
-# Destinations are capped (HOST_MAX distinct names). Before, the 200 slots were used up
-# for good after a while (all later destinations became "(other)" until the next
-# restart). Now, when the table is full, destinations that have been idle for a while
-# are folded into "(other)" and their slot is reused; the totals stay complete.
+# Destinations are capped (HOST_MAX distinct names). When the table is full, destinations
+# that have been idle for a while are folded into "(other)" and their slot is reused;
+# the totals stay complete.
 function host_fold(k,   o, T, sl, ko, kk) {
     o = "(other)"
     if (!(o in hseen)) { hseen[o] = 1; nhost++; hlast[o] = n }
@@ -485,7 +488,7 @@ function tbl_full_log(what) {
     if (!(what in tbl_log_at) || n - tbl_log_at[what] >= TBL_LOG_POLLS) { tbl_log_at[what] = n; glog_msg(what " table full and nothing idle to drop - new entries are skipped") }
 }
 
-# keep the N biggest entries (used by row_keep)
+# keep the N biggest entries (used by row_keep and emit)
 function kt_ins(k, sc, N,   i) {
     if (ktn < N || sc > ktsc[ktn]) {
         if (ktn < N) ktn++
@@ -749,8 +752,8 @@ function app_add(a, lan, d1, d2, q1, q2) {
     else     { aib[a] += d1; aip[a] += q1; aob[a] += d2; aop[a] += q2 }
 }
 
-# one accounting step: application + destination + device x application
-# application names are bounded: beyond APP_MAX distinct ones the rest is summed as "(other)"
+# sanitize an application name (no quotes / backslashes in the JSON); names are bounded:
+# beyond APP_MAX distinct ones the rest is summed as "(other)"
 function app_name(a) {
     gsub(/["\\]/, "_", a)
     if (!(a in aseen)) {
@@ -760,8 +763,7 @@ function app_name(a) {
     return a
 }
 
-# one accounting step: application + destination
-# application names are bounded: beyond APP_MAX distinct ones the rest is summed as "(other)"
+# one accounting step: application + destination (+ the three tooltip tables)
 function acct(dk, a, host, lan, d1, d2, q1, q2,   hk) {
     a = app_name(a)
     if (dk == "router" && lan) { rti[a] += d2; rto[a] += d1; rtip[a] += q2; rtop[a] += q1 }
@@ -847,18 +849,17 @@ function app_account(key, dk, lan, proto, src, dst, pp, d1, d2, q1, q2,   a, hh,
         pdb1[key] += d1; pdb2[key] += d2; pdp1[key] += q1; pdp2[key] += q2
         plan[key] = lan; pcls[key] = proto; pdev[key] = dk; prem[key] = rem; ppk[key] = sv
         # Held for a wall-clock time, not a poll count: with the adaptive
-        # interval a poll count stretches to minutes under load (audit).
+        # interval a poll count would stretch to minutes under load.
         if (!(key in pdfirst)) pdfirst[key] = t0
         pdage[key]++
         if (t0 - pdfirst[key] >= APP_HOLD_SEC) { pend_release(key); giveup[key] = 1 }
     }
 }
 
-# True for the TCP conntrack states that mean a connection is winding down.
-# A real single connections conntrack entry can never transition FROM one
-# of these BACK to an active state (ESTABLISHED/SYN_SENT/SYN_RECV) - only a
-# brand new entry that happens to reuse the same tuple can, which is exactly
-# the tuple-reuse ambiguity parse_pass() uses this for (audit #1).
+# True for the TCP conntrack states that mean a connection is winding down. One
+# connection never goes from one of these back to an active state (ESTABLISHED /
+# SYN_SENT / SYN_RECV); only a new entry reusing the same tuple does, which
+# parse_pass() uses to detect tuple reuse.
 function tcp_state_closing(s) {
     return (s == "TIME_WAIT" || s == "CLOSE" || s == "CLOSE_WAIT" || s == "LAST_ACK" || s == "FIN_WAIT")
 }
@@ -944,16 +945,11 @@ function parse_pass(   line, r, h, proto, pp, t, sp, b1, b2, p1, p2,
             q1 = p1 - pp1[key]; q2 = p2 - pp2[key]
             forced_reset = 0
             if (tcpstate != "" && (key in laststate) && tcp_state_closing(laststate[key]) && !tcp_state_closing(tcpstate)) {
-                # The old entry for this tuple was already winding down
-                # (TIME_WAIT/CLOSE/...) and is now back in an active state -
-                # impossible for one real connection, so this can only be a
-                # brand new connection that reused the tuple. Force the
-                # reset even if the byte/packet deltas happen to look like
-                # ordinary non-negative growth, which is exactly the case
-                # the counter-went-backward check below cannot catch: a
-                # short new connection whose counters, once we finally see
-                # it again (possibly several GONE_GRACE polls later), have
-                # already grown past the old connections last known total.
+                # The old entry was winding down (TIME_WAIT/CLOSE/...) and is active
+                # again: this can only be a new connection that reused the tuple.
+                # Force the reset even if the deltas look like ordinary growth (the
+                # counter-went-backward check below cannot catch a new connection
+                # that already passed the old total).
                 forced_reset = 1
             }
             if (d1 < 0 || d2 < 0 || q1 < 0 || q2 < 0 || forced_reset) {
@@ -1098,14 +1094,14 @@ function rates_update(now,   slot, full, ot, k) {
 }
 
 # post-shaping byte counters of the link (helper prints "<rx> <tx> <rx_drop>
-# <rx_ecn> <tx_drop> <tx_ecn>"), timed with uptime() right after they were
+# <rx_ecn> <tx_drop> <tx_ecn> <rx_backlog> <tx_backlog>"), timed with uptime() right after they were
 # read; a restarted qdisc (counter goes back) is treated as "no growth" for
 # that sample. The drop/ECN fields are optional (older/custom TC_HELPER
 # builds may only print two fields) - shd_rx/she_rx/shd_tx/she_tx simply stay
 # 0 and the history just carries no "sh" data, get_stats keeps working.
 function tc_update(   l, f, fr, rx, tx, rxd, rxe, txd, txe, rxb, txb, T, tnow, dx, dy, dd, de, slot, full, ot, orx, otx, ok) {
     ok = 0; l = ""; rxd = -1; rxe = -1; txd = -1; txe = -1; rxb = -1; txb = -1
-    tcfrag = ""      # JSON members for the page (2nd helper line); empty = luci.trafficchart computes them itself
+    tcfrag = ""      # JSON members for the page (2nd helper line); empty = classes.json carries no link information
     if (TC_HELPER != "") {
         if ((TC_HELPER | getline l) > 0) {
             split(l, f, " ")
@@ -1288,7 +1284,7 @@ function rate_json(   ui, uo) {
                    RATE_WIN, have_tc + 0, tc_rx_rate + 0, tc_tx_rate + 0, ct_rate_in + 0, ct_rate_out + 0, un_rx_rate + 0, un_tx_rate + 0, ui, uo, un_rx_conf + 0, un_tx_conf + 0, l2_now(), l2_mode(), cal_n + 0, CAL_MIN, l2_raw + 0)
 }
 
-# Aggregator-load diagnostics (audit item #2). Reflects the PREVIOUS poll
+# Aggregator-load diagnostics. Reflects the PREVIOUS poll
 # (this poll is still running while emit() builds this string), which is
 # fine for a trend indicator. "saturated" means the interval has been pinned
 # at its ceiling for several consecutive polls while still over its work
@@ -1385,8 +1381,8 @@ function wall_ep(t) { return int(t + wall_off + 0.5) }
 
 # close the open bucket of tier T (covering "elapsed" seconds) and store it.
 # Besides application/device/destination deltas, this also closes out the
-# shaper drop/ECN deltas of the period (see the "Shaper health in the
-# history" header comment) - "sh":{"rx":[dropped,ecn],"tx":[dropped,ecn]}.
+# shaper drop/ECN deltas and the peak queue backlog of the period:
+# "sh":{"rx":[dropped,ecn,backlog],"tx":[dropped,ecn,backlog]}.
 function hist_close(T, elapsed,   di, dov, tin, tout, as, ds, hs, nc, a, k, ep, line, rxdd, rxde, txdd, txde, rxbp, txbp) {
     if (elapsed < 1) return
     tin = 0; tout = 0
@@ -1449,8 +1445,7 @@ function hist_tick(t,   lt, kh, kd) {
     if (kd != hkey[3]) { hist_close(3, t - ht0[3]); ht0[3] = t; hkey[3] = kd }
 }
 
-# ---- history / cumulative-totals reset (reset.req, see the header comment
-# "History reset" above) ----
+# ---- history / cumulative-totals reset (reset.req, written by luci.trafficchart "reset_history") ----
 # Clears everything the page shows as "totals since start" (applications,
 # devices, destinations and
 # the in-RAM history of all three tiers) and resets "since" to now, WITHOUT
@@ -1484,6 +1479,14 @@ function hist_reset(   T, i) {
     shd_rx = 0; she_rx = 0; shd_tx = 0; she_tx = 0
     split("", ssh_rx_d); split("", ssh_rx_e); split("", ssh_tx_d); split("", ssh_tx_e)
     split("", pk_rx); split("", pk_tx)
+    # the totals restart at 0: rates, "not attributed" and the link header calibration
+    # re-baseline too, or they would read the drop of the totals as a huge negative delta
+    rt_init = 0; rn = 0
+    split("", rh_in); split("", rh_out); split("", rt_in); split("", rt_out)
+    ct_tot_in = 0; ct_tot_out = 0; ct_pk_in = 0; ct_pk_out = 0; ct_rate_in = 0; ct_rate_out = 0
+    un_init = 0; un_rx_rate = 0; un_tx_rate = 0
+    split("", unh_n); split("", unh_t); split("", unh_v)
+    cal_init = 0
     tooltip_last = 0
     "date +%s" | getline since
     close("date +%s")
@@ -1666,7 +1669,8 @@ function emit(t,   s, tmp, a, first, k, nm, i, j, sc, nt, tsc, tky, pd, tot, n2,
     tmp = OUT "/classes.json.tmp"
     printf "%s", ("{\"since\":" since ",\"up\":" sprintf("%.2f", t) ",\"flows\":" nflows "," rate_json() "," load_json() "," persist_json() ",\"apps\":{") > tmp
     # tooltip data: top 10 destinations per application, top 10 devices per
-    # destination - only for the 30 biggest of each (that is all the page shows)
+    # destination, top 10 applications per device - applications and destinations only
+    # for the 30 biggest of each
     tooltip_period = (mxcnt > 6000 || npair > 3000) ? 10 : ((mxcnt > 2000 || npair > 1000) ? 5 : 1)
     tooltip_due = (tooltip_last == 0 || (TOOLTIP_EVERY > 0 && n - tooltip_last >= TOOLTIP_EVERY) || (TOOLTIP_EVERY <= 0 && n - tooltip_last >= tooltip_period))
     if (TOOLTIPS && tooltip_due) {
@@ -1814,8 +1818,6 @@ BEGIN {
     if (CAL_KEEP < 4) CAL_KEEP = 4
     if (CAL_MIN > CAL_KEEP) CAL_MIN = CAL_KEEP
     CAL_K = int(CAL_WIN / INTERVAL + 0.5); if (CAL_K < 2) CAL_K = 2
-    HOUR_SEC += 0; DAY_SEC += 0
-    if (HOUR_SEC < 1) HOUR_SEC = 3600; if (DAY_SEC < 1) DAY_SEC = 86400   # divisors in hist_tick()
     APP_MAX += 0; MX_MAX += 0; PAIR_MAX += 0; TOOLTIPS += 0; TOOLTIP_EVERY += 0
     IDLE_LONG_P = int(TBL_IDLE_LONG / INTERVAL) + 5
     IDLE_SHORT_P = int(TBL_IDLE_SHORT / INTERVAL) + 5
@@ -1837,7 +1839,7 @@ BEGIN {
     tname[1] = "5m"; tname[2] = "1h"; tname[3] = "1d"
     hkeep[1] = HIST_KEEP + 0; hkeep[2] = HIST_HOUR_KEEP + 0; hkeep[3] = HIST_DAY_KEEP + 0
     hfile[1] = OUT "/history.json"; hfile[2] = OUT "/history_1h.json"; hfile[3] = OUT "/history_1d.json"
-    HOUR_SEC += 0; DAY_SEC += 0; PERSIST_SEC += 0
+    PERSIST_SEC += 0
     last_t = 0; wall_off = 0; tzoff = 0; wall_ok = 0; wall_at = -1000
     shd_rx = 0; she_rx = 0; shd_tx = 0; she_tx = 0; sh_have_prev = 0
     # persistence targets; a target under one of the PERSIST_MOUNT paths is only used while that path is mounted
@@ -1877,13 +1879,8 @@ BEGIN {
             poll_interval += 1
         else if (work_elapsed < poll_interval * ADAPT_BUDGET * 0.5 && poll_interval > INTERVAL)
             poll_interval -= 1
-        # Diagnostics for audit item #2: the adaptive interval protects
-        # responsiveness but does not solve the underlying scaling limit of a
-        # full conntrack-table walk every poll. Rather than silently letting
-        # the daemon become a continuously-running parser under heavy load,
-        # track how often it is pinned at the interval ceiling while still
-        # over budget, log it once it has been sustained, and expose it (plus
-        # entries-parsed-per-poll) in the JSON so the page/operator can see it.
+        # Load diagnostics: count the polls pinned at the interval ceiling while still
+        # over budget, log it once sustained and expose it (see load_json()).
         load_work_ms = work_elapsed * 1000
         load_interval = poll_interval
         if (poll_interval >= INTERVAL_MAX && work_elapsed > poll_interval * ADAPT_BUDGET)
@@ -1899,7 +1896,7 @@ BEGIN {
         if ((getline sl < STOPFILE) >= 0) { close(STOPFILE); hist_final(uptime()); exit 0 }
         close(STOPFILE)
         # reset request (luci.trafficchart "reset_history"): clear totals/history
-        # and keep running - see hist_reset() and the header comment above
+        # and keep running - see hist_reset()
         if ((getline rl < RESETFILE) >= 0) {
             close(RESETFILE)
             system("rm -f " RESETFILE)

@@ -6,7 +6,7 @@ return view.extend({
     render: function() {
         var m, s, o;
 
-        m = new form.Map('trafficchart', _('Traffic Chart'),
+        m = new form.Map('trafficchart', _('Traffic Chart Settings'),
             _('Settings for the traffic-chart aggregator (trafficchart-agg). ' +
               'Saving restarts the aggregator (cumulative totals reset, the history survives).'));
 
@@ -21,7 +21,7 @@ return view.extend({
         o.depends('enabled', '1');
 
         o = s.option(form.ListValue, 'backend', _('Shaper backend'),
-            _('Auto detects NSS hardware offload (nssifb) automatically.'));
+            _('Auto selects NSS hardware offload if the nssifb device exists and the nss_ifb module is loaded, otherwise the generic reader.'));
         o.value('auto', _('Auto'));
         o.value('nss', _('NSS hardware offload'));
         o.value('generic', _('Generic (cake / htb+fq_codel / any other qdisc)'));
@@ -46,6 +46,10 @@ return view.extend({
             _('Bytes per packet the shaper counts but conntrack does not (used for "Not attributed"). "auto" measures it; ' +
               'or a fixed number: 14 Ethernet, 18 +VLAN, 22 +PPPoE, 26 +PPPoE+VLAN, 0 = no correction.'));
         o.placeholder = 'auto';
+        o.validate = function(section_id, value) {
+            if (value === null || value === '') return true;
+            return /^(auto|[0-9]{1,2})$/.test(value) ? true : _('"auto" or a number of bytes (0-99).');
+        };
 
         o = s.option(form.Flag, 'attr_totals', _('Router proxy attribution'),
             _('Tries to attribute the router\'s own WAN traffic (e.g. a stream proxy) to the LAN device it served, ' +
@@ -141,8 +145,8 @@ return view.extend({
 
         o = s.option(form.Value, 'persist_dir', _('Storage path(s)'),
             _('Directory (or several, separated by spaces) the history is saved to and reloaded from after a reboot; empty = RAM only. ' +
-              'Targets must already exist below /mnt, /media or /tmp/mnt; symlinks outside those storage trees are rejected by the daemon. ' +
-              'All available targets are written (mirrors); a missing one is caught up when it is back. About 1 MB per day. ' +
+              'Targets must be below /mnt, /media or /tmp/mnt; symlinks leading outside those trees are rejected by the daemon. ' +
+              'All available targets are written (mirrors); a missing one is caught up when it is back. ' +
               'The router mounts nothing itself.'));
         o.placeholder = '/mnt/nas/traffic /mnt/sda1/trafficchart';
         o.rmempty = true;
@@ -182,15 +186,15 @@ return view.extend({
         o = s.option(form.Value, 'hist_hour_keep', _('Hourly buckets kept'),
             _('Week and month view. Default: 744 = 31 days.'));
         o.datatype = 'min(1)';
-        o.placeholder = '192';
+        o.placeholder = '744';
 
         o = s.option(form.Value, 'hist_day_keep', _('Daily buckets kept'),
             _('Year view. Default: 400 days.'));
         o.datatype = 'min(1)';
         o.placeholder = '400';
 
-        s = m.section(form.NamedSection, 'global', 'trafficchart', _('SQM classifier (nss-rk.qos)'),
-            _('Optional extras of the nss-rk.qos nftables classifier (not used by the chart). All OFF by default. Restart SQM after changing them.'));
+        s = m.section(form.NamedSection, 'global', 'trafficchart', _('SQM classifier (nss-trafficchart.qos)'),
+            _('Options of the nss-trafficchart.qos nftables classifier (not used by the chart). DNS redirect and TTL rewrite are off by default. Restart SQM after changing them.'));
 
         o = s.option(form.Flag, 'dns_redirect', _('Redirect DNS to the router'),
             _('Redirects DNS (port 53, UDP and TCP) coming from every non-WAN interface to the router\'s own resolver. ' +

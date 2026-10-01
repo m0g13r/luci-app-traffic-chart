@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
 # trafficchart-apps - netifyd JSON stream -> "flow tuple -> application" map
 #
 # Connects to netifyd's JSON socket (see [socket] listen_path in
@@ -13,11 +14,11 @@
 # their first packets. netifyd names the flow from its first packets (DNS
 # cache hit / SNI / QUIC initial), so the label arrives in time anyway.
 #
-# Needs: socat (opkg install socat), netifyd with a [socket] listen_path.
+# Needs: socat, netifyd with a [socket] listen_path.
 # Environment: SOCK OUT_DIR AWK SOCAT TC_COMMON
 
 # Settings: /etc/config/trafficchart option "sock" (or the environment variable SOCK),
-# see trafficchart.config. Needs trafficchart-common (tc_cfg).
+# see Traffic Chart Settings. Needs trafficchart-common (tc_cfg).
 . "${TC_COMMON:-/usr/libexec/trafficchart-common}" || exit 1
 tc_cfg SOCK /var/run/netifyd/netifyd.sock sock
 # Minimum time between two writes of apps.map (ms). A new flow's label has to reach the
@@ -36,7 +37,7 @@ mkdir -p "$OUT_DIR" || exit 1
 chmod 700 "$OUT_DIR" 2>/dev/null || exit 1
 
 if [ "$ONCE" != "1" ] && ! command -v "$SOCAT" >/dev/null 2>&1; then
-    logger -t trafficchart "socat not installed (opkg install socat) - application names disabled, everything else unaffected"
+    logger -t trafficchart "socat not installed - application names disabled, everything else unaffected"
     while true; do sleep 3600; done
 fi
 
@@ -44,16 +45,8 @@ run_reader() {
     # TMPID: private temp file name per instance, so two instances (or a stale
     # one after a restart) can never move each other's temp file away
     exec $AWK -v MAP="$OUT_DIR/apps.map" -v TMPID="$$" -v FLUSH_MS="$FLUSH_MS" '
-    # extract "key":"value" / "key":123 from a one-line JSON object.
-    # The naive [^"]* pattern used before stopped at the first quote,
-    # including an ESCAPED one (\"), so a value like
-    #   "detected_application_name":"Foo \"Bar\""
-    # got truncated to "Foo \". This pattern instead allows any escaped pair
-    # (\\.) or any character that is not a bare quote/backslash, so it walks
-    # correctly through escaped content to the real closing quote, and
-    # unescape() below turns \" \\ \/ \n \t \r back into plain characters
-    # (the caller sanitizes non ASCII-ish characters afterwards anyway, so a
-    # simple unescape - not full \uXXXX decoding - is enough here).
+    # unescape a JSON string value: \" \\ \/ become the plain character, \n \t \r a blank.
+    # \uXXXX is not decoded (the callers sanitize the result anyway).
     function unescape(s,   out, i, n, c) {
         n = length(s); out = ""
         for (i = 1; i <= n; i++) {
@@ -69,6 +62,8 @@ run_reader() {
         }
         return out
     }
+    # extract "key":"value" / "key":123 from a one-line JSON object; the pattern walks over
+    # escaped pairs, so an escaped quote does not end the value
     function jstr(l, k) {
         if (match(l, "\"" k "\":\"(\\\\.|[^\"\\\\])*\""))
             return unescape(substr(l, RSTART + length(k) + 4, RLENGTH - length(k) - 5))
@@ -123,12 +118,8 @@ run_reader() {
             if (now - dead[k] > 30000) { delete dead[k]; delete map[k]; dirty = 1 }
             else nd++
         }
-        # Digest-less flows (see on_flow()) never get an authoritative purge
-        # event to key off of, so they cannot feed the dead[] table directly
-        # the normal way - without this they would sit in map[] forever once
-        # traffic on them stopped (a leak, and a permanently stale label).
-        # Once one has not been re-confirmed by a fresh "flow" line for 30s,
-        # hand it to the normal dead[]/grace-period path above instead.
+        # Flows without digest never get a purge event: once one has not been
+        # confirmed by a flow line for 30 s, hand it to the dead[] grace-period path above.
         for (k in nodig_last) {
             if (now - nodig_last[k] > 30000) {
                 delete nodig_last[k]
@@ -154,13 +145,9 @@ run_reader() {
         if (lip == "" || oip == "" || lp < 0 || op < 0) return
         key = proto "|" v6full(lip) "|" v6full(oip) "|" lp "|" op
         dg = jstr(l, "digest")
-        # An empty/missing digest cannot identify a flow uniquely - if
-        # netifyd ever emits several flows without one, they would all
-        # collide on dg2key[""] and silently corrupt the purge reference
-        # count and application mapping of each other. Track
-        # those separately by last-sighting time instead (nodig_last[],
-        # swept in flush()) rather than through the digest-keyed
-        # dg2key/kref tables.
+        # A flow without digest cannot go through dg2key/kref (all of them would collide
+        # on the empty key): it is tracked by last sighting instead (nodig_last[],
+        # swept in flush()).
         if (dg != "") {
             if (!(dg in dg2key)) kref[key]++
             dg2key[dg] = key

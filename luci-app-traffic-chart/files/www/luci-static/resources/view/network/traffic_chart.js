@@ -2,39 +2,51 @@
 'require view';
 'require rpc';
 'require poll';
- 
+
 var callTrafficStats = rpc.declare({
     object: 'luci.trafficchart',
     method: 'get_stats',
     expect: { '': {} }
 });
- 
+
 var callHistory = rpc.declare({
     object: 'luci.trafficchart',
     method: 'get_stats',
     params: [ 'history', 'tier', 'dim' ],
     expect: { '': {} }
 });
- 
+
 var callRestart = rpc.declare({
     object: 'luci.trafficchart',
     method: 'restart',
     expect: { '': {} }
 });
- 
+
 // Separate from "restart": clears cumulative totals + in-RAM history without
 // bouncing the daemon (see hist_reset() in trafficchart-agg).
+// ubus ACL check of the current session: the write actions are only offered when allowed
+var callAccess = rpc.declare({
+    object: 'session',
+    method: 'access',
+    params: [ 'scope', 'object', 'function' ],
+    expect: { 'access': false }
+});
+
+function canCall(method) {
+    return callAccess('ubus', 'luci.trafficchart', method).catch(function() { return false; });
+}
+
 var callResetHistory = rpc.declare({
     object: 'luci.trafficchart',
     method: 'reset_history',
     expect: { '': {} }
 });
- 
+
 var DIRECTIONS = [
     { suffix: '_in',  title: _('Incoming (Download)'), centerLabel: _('INCOMING SHARE') },
     { suffix: '_out', title: _('Outgoing (Upload)'),    centerLabel: _('OUTGOING SHARE') }
 ];
- 
+
 var SVG_SIZE = 360;
 var CX = SVG_SIZE / 2;
 var CY = SVG_SIZE / 2;
@@ -46,8 +58,8 @@ var CIRC = 2 * Math.PI * R;
 var UN_SLOT = 'su';
 var UN_MIN_BPS = 5000;
 var UN_MIN_SHARE = 0.04;
- 
- 
+
+
 function formatBytes(b) {
     if (!isFinite(b) || b < 0) b = 0;
     if (b >= 1073741824) return (b / 1073741824).toFixed(2) + ' GB';
@@ -66,17 +78,22 @@ function formatRate(bitsPerSec) {
     if (bitsPerSec >= 1e3) return (bitsPerSec / 1e3).toFixed(1) + ' kbit/s';
     return Math.round(bitsPerSec) + ' bit/s';
 }
- 
+
 function svgEl(tag, attrs) {
     var el = document.createElementNS('http://www.w3.org/2000/svg', tag);
     for (var k in attrs) el.setAttribute(k, attrs[k]);
     return el;
 }
- 
+
 var previousCleanup = null;
 
 return view.extend({
-    render: function() {
+    load: function() {
+        return Promise.all([ canCall('restart'), canCall('reset_history') ]);
+    },
+
+    render: function(perm) {
+        var canRestart = !!(perm && perm[0]), canReset = !!(perm && perm[1]);
         if (previousCleanup) {
             previousCleanup();
             previousCleanup = null;
@@ -120,7 +137,7 @@ return view.extend({
                 '.qos-legend-row:hover .qos-swatch { transform: scale(1.15); }';
             document.head.appendChild(styleTag);
         }
- 
+
         var tipOld = document.getElementById('qos_tip_style');
         if (tipOld) tipOld.parentNode.removeChild(tipOld);
         var tipStyle = document.createElement('style');
@@ -202,9 +219,9 @@ return view.extend({
             tipEl.style.display = 'block';
             tipPlace();
         }
- 
+
         var tcDiagText = '';
- 
+
         function buildDirectionPanel(dir, order, metaOf, dynamicMeta, noun) {
             var refs = { classes: {}, segEls: {} };
             var lastValues = { total: '100.0%', classes: {}, counters: {} };
@@ -220,7 +237,7 @@ return view.extend({
                 if (m && m.details && m.details.length) { tipShow(m); tipShown = true; }
                 else if (tipShown) { tipHide(); tipShown = false; }
             }
- 
+
             function setPinned(newPinned) {
                 var wasPinned = !!pinned;
                 pinned = newPinned;
@@ -229,7 +246,7 @@ return view.extend({
                     applyUpdate.apply(null, lastUpdateArgs);
                 }
             }
- 
+
             var svg = svgEl('svg', {
                 viewBox: '0 0 ' + SVG_SIZE + ' ' + SVG_SIZE,
                 width: '100%',
@@ -237,7 +254,7 @@ return view.extend({
                 style: 'display:block; background:transparent !important; filter: drop-shadow(0 14px 30px rgba(15,23,42,0.16));'
             });
             svg.appendChild(svgEl('circle', { cx: CX, cy: CY, r: R, fill: 'none', stroke: 'rgba(0,0,0,0.055)', 'stroke-width': STROKE_NORMAL }));
- 
+
             var segGroup = svgEl('g', { transform: 'rotate(-90 ' + CX + ' ' + CY + ')' });
             order.forEach(function(cls) {
                 var seg = svgEl('circle', {
@@ -255,7 +272,7 @@ return view.extend({
                 segGroup.appendChild(seg);
             });
             svg.appendChild(segGroup);
- 
+
             var centerPctEl = E('div', {
                 class: 'qos-center-value',
                 style: 'font-size:19px; font-weight:800; color:var(--qos-text-strong); font-variant-numeric: tabular-nums; min-width:95px; text-align:center;'
@@ -264,15 +281,15 @@ return view.extend({
                 class: 'qos-center-value',
                 style: 'font-size:9.5px; line-height:1.2; color:var(--qos-text-muted); letter-spacing:0.4px; text-align:center; width:82%; max-width:96px; box-sizing:border-box; white-space:normal; overflow-wrap:anywhere; word-break:break-word;'
             }, dir.centerLabel);
- 
+
             var activeCountEl = E('div', {
                 style: 'font-size:11px; color:var(--qos-text-muted); text-transform:uppercase; letter-spacing:0.7px; margin-bottom:2px;'
             }, noun || '');
- 
+
             var legendChildren = [];
             order.forEach(function(cls) {
                 refs.classes[cls] = {};
- 
+
                 var liveBarEl = E('div', {
                     style: 'position:absolute; left:0; top:0; bottom:0; width:0%; border-radius:6px; opacity:0.25; background:' + metaOf(cls).color + '; transition:width 0.4s ease;'
                 });
@@ -282,7 +299,7 @@ return view.extend({
                 var livePctEl = E('div', {
                     style: 'position:relative; display:inline-flex; align-items:center; justify-content:flex-end; padding:2px 8px; border-radius:6px; background:rgba(0,0,0,0.04); min-width:85px; overflow:hidden;'
                 }, [ liveBarEl, liveTextEl ]);
- 
+
                 var sigmaBytesEl = E('span', { style: 'color:var(--qos-text);' }, '0 B');
                 var sigmaPacketsEl = E('span', { style: 'color:var(--qos-text);' }, '0');
                 var sigmaSuffixWordEl = E('span', { style: 'color:var(--qos-text);' }, ' packets');
@@ -300,10 +317,10 @@ return view.extend({
                 refs.classes[cls].sigmaPackets = sigmaPacketsEl;
                 refs.classes[cls].sigmaSuffixTime = sigmaSuffixTimeEl;
                 refs.classes[cls].totalPct = totalPctEl;
- 
+
                 var labelEl = E('span', { style: 'font-size:11.5px; color:var(--qos-text-strong); font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;' }, metaOf(cls).label);
                 var swatch = E('span', { class: 'qos-swatch', style: 'width:11px; height:11px; background:' + metaOf(cls).color + '; border-radius:3px; display:inline-block; flex-shrink:0; box-shadow:0 2px 5px rgba(0,0,0,0.15);' });
- 
+
                 var headerRow = E('div', {
                     class: 'qos-legend-row',
                     style: 'display:flex; align-items:center; justify-content:space-between; gap:8px; padding:0px 1px;'
@@ -314,18 +331,18 @@ return view.extend({
                     ]),
                     E('div', { style: 'text-align:right; min-width:85px; flex-shrink:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:11px;' }, [ livePctEl ])
                 ]);
- 
+
                 headerRow.addEventListener('mouseenter', function() { hovered = { type: 'class', key: cls }; applyHighlight(); });
                 headerRow.addEventListener('mouseleave', function() { hovered = null; applyHighlight(); });
                 headerRow.addEventListener('click', function(ev) {
                     tipTrack(ev);
                     setPinned((pinned && pinned.type === 'class' && pinned.key === cls) ? null : { type: 'class', key: cls });
                 });
- 
+
                 refs.classes[cls].headerRow = headerRow;
                 refs.classes[cls].labelEl = labelEl;
                 refs.classes[cls].swatchEl = swatch;
- 
+
                 var rowEl = E('div', {
                     style: 'padding:0px 0; border-bottom:1px solid rgba(165,173,175,0.25); display:none;'
                 }, [
@@ -335,14 +352,14 @@ return view.extend({
                     }, [ sigmaEl, totalPctEl ])
                 ]);
                 refs.classes[cls].rowEl = rowEl;
- 
+
                 legendChildren.push(rowEl);
             });
- 
+
             function applyHighlight() {
                 var active = hovered || pinned;
                 refreshTip();
- 
+
                 order.forEach(function(cls) {
                     var seg = refs.segEls[cls];
                     var match = !active || active.key === cls;
@@ -350,7 +367,7 @@ return view.extend({
                     seg.classList.toggle('active', !!active && match);
                     refs.classes[cls].headerRow.classList.toggle('dimmed', !!active && !match);
                 });
- 
+
                 if (!active) {
                     centerPctEl.textContent = lastValues.total;
                     centerLabelEl.textContent = dir.centerLabel;
@@ -360,11 +377,11 @@ return view.extend({
                     centerLabelEl.textContent = getMeta(active.key).label;
                 }
             }
- 
+
             var legendGrid = E('div', {
                 style: 'display:grid; grid-template-columns:repeat(auto-fit, minmax(250px, 1fr)); gap:0 32px; align-content:start;'
             }, legendChildren);
- 
+
             var card = E('div', { class: 'qos-card' }, [
                 E('div', {
                     class: 'qos-donut-wrap',
@@ -377,24 +394,24 @@ return view.extend({
                 ]),
                 E('div', { style: 'width:100%; max-width:760px; min-width:280px; flex:1 1 520px; box-sizing:border-box;' }, [ activeCountEl, legendGrid ])
             ]);
- 
+
             var linkStatsBar = E('div', { style: 'position:absolute; left:0; top:0; bottom:0; width:0%; background:var(--qos-text-muted); opacity:0.15; transition:width 0.4s ease; border-radius:6px; pointer-events:none;' });
             var linkStatsText = E('span', { style: 'position:relative; z-index:1; font-weight:600;' }, _('Measuring real interface throughput...'));
             var linkStatsEl = E('div', {
                 style: 'position:relative; display:inline-block; font-size:11.5px; color:var(--qos-text-strong); margin-bottom:8px; font-variant-numeric: tabular-nums; text-align:center; padding:4px 12px; border-radius:6px; background:rgba(0,0,0,0.03); overflow:hidden; min-width:60%;'
             }, [ linkStatsBar, linkStatsText ]);
- 
+
             var diagEl = E('div', {
                 style: 'font-size:9.5px; color:var(--qos-text-muted); margin-bottom:6px; font-variant-numeric: tabular-nums; text-align:center;'
             }, '');
- 
+
             var panelEl = E('div', { class: 'qos-panel' }, [
                 E('div', { class: 'qos-panel-title' }, dir.title),
                 E('div', { style: 'width:100%; display:flex; justify-content:center;' }, [ linkStatsEl ]),
                 diagEl,
                 card
             ]);
- 
+
             function refreshMeta() {
                 order.forEach(function(cls) {
                     var m = getMeta(cls);
@@ -405,12 +422,12 @@ return view.extend({
                         refs.classes[cls].liveBar.style.background = m.color;
                 });
             }
- 
+
             function applyUpdate(classBytes, classPackets, classRate, ifaceRateBps, configuredKbit, ifaceSourceName, baselineLabel, metaSnapshot) {
                 if (dynamicMeta) { if (metaSnapshot) currentMeta = metaSnapshot; refreshMeta(); }
                 var rawTotal = order.reduce(function(s, cls) { return s + classRate[cls]; }, 0);
                 var totalBytesSum = order.reduce(function(s, cls) { return s + classBytes[cls]; }, 0);
- 
+
                 var MIN_SLICE_FRACTION = 0.002;
                 var displayRates = {};
                 order.forEach(function(cls) {
@@ -423,7 +440,7 @@ return view.extend({
                     }
                 });
                 var displayTotal = order.reduce(function(s, cls) { return s + displayRates[cls]; }, 0);
- 
+
                 var offsetSoFar = 0;
                 order.forEach(function(cls) {
                     var frac = displayTotal > 0 ? (displayRates[cls] / displayTotal) : 0;
@@ -433,18 +450,18 @@ return view.extend({
                     seg.setAttribute('stroke-dashoffset', (-offsetSoFar).toFixed(2));
                     offsetSoFar += segLen;
                 });
- 
+
                 lastValues.total = rawTotal > 0 ? '100.0%' : '0.0%';
                 var activeClassCount = order.filter(function(cls) {
                     return classRate[cls] > 0 && cls !== UN_SLOT;
                 }).length;
                 activeCountEl.textContent = _('%s (%d active)').format(noun, activeClassCount);
- 
+
                 var sourceTxt = ifaceSourceName ? ' [via ' + ifaceSourceName + ']' : '';
                 var configuredMbit = (configuredKbit || 0) / 1000;
                 var configuredBps = (configuredKbit || 0) * 1000;
                 var totalPct = 0;
-                
+
                 var diagTxt = tcDiagText ? ' - ' + tcDiagText : '';
                 if (ifaceRateBps === null || ifaceRateBps === undefined) {
                     linkStatsText.textContent = _('Link rate not available (no tc counters)') + diagTxt + sourceTxt;
@@ -460,60 +477,60 @@ return view.extend({
                 }
                 linkStatsText.title = tcDiagText || '';
                 linkStatsBar.style.width = totalPct.toFixed(1) + '%';
- 
+
                 order.forEach(function(cls) {
                     var classFrac = rawTotal > 0 ? (classRate[cls] / rawTotal) : 0;
                     var classRateBits = classRate[cls] * 8;
                     var livePct = rawTotal > 0 ? (classFrac * 100).toFixed(1) : '0.0';
                     var tPct = totalBytesSum > 0 ? ((classBytes[cls] / totalBytesSum) * 100).toFixed(1) : '0.0';
- 
+
                     refs.classes[cls].livePct.textContent = formatRate(classRateBits);
-                    
+
                     var barPct = 0;
                     if (configuredBps > 0) {
                         barPct = Math.min(100, (classRateBits / configuredBps) * 100);
                     } else if (rawTotal > 0) {
                         barPct = classFrac * 100;
                     }
- 
+
                     if (refs.classes[cls].liveBar)
                         refs.classes[cls].liveBar.style.width = barPct.toFixed(1) + '%';
- 
+
                     refs.classes[cls].sigmaBytes.textContent = formatBytes(classBytes[cls]);
                     refs.classes[cls].sigmaPackets.textContent = formatCount(classPackets[cls]);
                     refs.classes[cls].sigmaSuffixTime.textContent = ' (' + (baselineLabel || _('since start')) + ')';
                     refs.classes[cls].sigma.title = _('Total %s - %s packets (%s)')
                         .format(formatBytes(classBytes[cls]), formatCount(classPackets[cls]), baselineLabel || _('since start'));
                     refs.classes[cls].totalPct.textContent = 'total: ' + tPct + '%';
- 
+
                     lastValues.classes[cls] = { pct: livePct + '%' };
                     refs.classes[cls].rowEl.style.display = classBytes[cls] > 0 ? '' : 'none';
                 });
- 
+
                 if (!pinned && !hovered) {
                     centerPctEl.textContent = lastValues.total;
                 }
             }
- 
+
             function update() {
                 lastUpdateArgs = arguments;
                 if (pinned) return;
                 applyUpdate.apply(null, arguments);
             }
- 
+
             function clearPinned() {
                 if (pinned) { setPinned(null); }
             }
- 
+
             return { el: panelEl, update: update, clearPinned: clearPinned };
         }
- 
+
         function slotHue(name) {
             var h = 7;
             for (var i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) % 360;
             return h;
         }
- 
+
         function makeSlotView(top, noun, labelOf, otherLabelOf, detailsOf, detailTitle) {
             var slots = [];
             for (var i = 0; i <= top; i++) slots.push('s' + i);
@@ -523,7 +540,7 @@ return view.extend({
             var RANK_MARGIN = 1.25;
             v.panelIn = buildDirectionPanel(DIRECTIONS[0], slots, function() { return emptyMeta; }, true, noun);
             v.panelOut = buildDirectionPanel(DIRECTIONS[1], slots, function() { return emptyMeta; }, true, noun);
- 
+
             function rankNames(d, items) {
                 var all = Object.keys(items), seen = {}, arr = [], sc = {}, fresh;
                 all.forEach(function(n) {
@@ -552,7 +569,7 @@ return view.extend({
                 v.order[d] = arr;
                 return arr;
             }
- 
+
             v.render = function(items, ifaceRate, sqmDownKbit, sqmUpKbit, iface, baselineLabel, rateInfo) {
                 var link = ifaceRate || { rx: null, tx: null };
                 var res = { meta: { 'in': {}, 'out': {} },
@@ -597,7 +614,7 @@ return view.extend({
             };
             return v;
         }
- 
+
         var MAX_ROWS = 22;
         var appsView = makeSlotView(MAX_ROWS - 1, _('Applications'),
             function(name) { return name; },
@@ -622,7 +639,7 @@ return view.extend({
             function(n) { return _('Other (%d destinations)').format(n); },
             function(e) { return (e.top && e.top.length) ? e.top : null; }, _('Top devices'));
         var slotViews = [ appsView, devicesView, hostsView ];
- 
+
         function makeFlowsView() {
             var v = {};
             var flowRows = [], emptyRow;
@@ -668,27 +685,27 @@ return view.extend({
                     return;
                 }
                 if (emptyRow) emptyRow.style.display = 'none';
-                
+
                 var maxIn = 0, maxOut = 0;
                 flows.forEach(function(f) {
                     if ((f.in_bps || 0) > maxIn) maxIn = f.in_bps;
                     if ((f.out_bps || 0) > maxOut) maxOut = f.out_bps;
                 });
- 
+
                 var downLimitBps = (sqmDownKbit || 0) * 1000;
                 var upLimitBps = (sqmUpKbit || 0) * 1000;
- 
+
                 flows.forEach(function(f, i) {
                     var row = flowRows[i] || (flowRows[i] = makeFlowRow());
                     var dest = f.host || f.dst;
                     var dev = (f.ip && f.ip !== f.dev) ? f.dev + ' (' + f.ip + ')' : f.dev;
-                    
+
                     var inBits = (f.in_bps || 0) * 8;
                     var outBits = (f.out_bps || 0) * 8;
- 
+
                     var pctIn = downLimitBps > 0 ? Math.min(100, (inBits / downLimitBps) * 100) : (maxIn > 0 ? ((f.in_bps || 0) / maxIn * 100) : 0);
                     var pctOut = upLimitBps > 0 ? Math.min(100, (outBits / upLimitBps) * 100) : (maxOut > 0 ? ((f.out_bps || 0) / maxOut * 100) : 0);
-                    
+
                     row.el.style.display = '';
                     row.cells[0].textContent = dev; row.cells[0].title = dev;
                     row.cells[1].textContent = f.app; row.cells[1].title = f.app;
@@ -702,7 +719,7 @@ return view.extend({
             };
             return v;
         }
- 
+
         function makeHistoryView() {
             var v = { active: false, loadedAt: 0, persist: null, hasShaper: false, sqm: { down: 0, up: 0 } };
             var RANGES = [
@@ -716,57 +733,41 @@ return view.extend({
             var TIER_ORDER = [ '5m', '1h', '1d' ];   // finest first
             var st = { dim: 'a', dir: 'both', range: '24h', data: {}, cmp: false, hidden: {} };
             var historyPinned = null;
- 
+
             function historyTipKey(type, a, b, c) {
                 return type + ':' + String(a) + ':' + String(b || '') + ':' + String(c || '');
             }
- 
+
             function historyTipHover(info, ev) {
                 if (historyPinned) return;
                 tipTrack(ev);
                 tipShow(info);
             }
- 
+
             function historyTipMove(ev) {
                 if (!historyPinned) tipTrack(ev);
             }
- 
+
             function historyTipLeave() {
                 if (!historyPinned) tipHide();
             }
- 
+
             function historyTipClick(info, ev, key) {
                 ev.stopPropagation();
- 
-                /*
-                 * Use the actual DOM element as the identity of the pin.
-                 * This makes unpinning reliable even when the same history
-                 * item is redrawn and receives a new/generated key.
-                 */
-                var target = ev.currentTarget || ev.target;
- 
-                /*
-                 * History bars normally have one DOM target per item. The
-                 * accessibility/large-hit overlay is intentionally shared
-                 * by the whole panel, so DOM-target equality would make a
-                 * click on any other bucket toggle the existing pin off.
-                 * The stable logical key is the actual identity here.
-                 */
+
+                /* The logical key is the identity of the pin: all buckets of a panel share one overlay element. */
                 if (historyPinned && historyPinned.key === key) {
                     historyPinned = null;
                     tipHide();
                     return;
                 }
- 
-                historyPinned = {
-                    key: key,
-                    target: target
-                };
- 
+
+                historyPinned = { key: key };
+
                 tipTrack(ev);
                 tipShow(info);
             }
- 
+
             /* Clicking the pinned tooltip itself releases the pin. */
             tipEl.addEventListener('click', function(ev) {
                 if (!historyPinned) return;
@@ -774,7 +775,7 @@ return view.extend({
                 historyPinned = null;
                 tipHide();
             });
- 
+
             var historyPinOutsideHandler = function(ev) {
                 if (!historyPinned) return;
                 if (ev.target === tipEl || tipEl.contains(ev.target)) return;
@@ -787,7 +788,7 @@ return view.extend({
                 historyPinned = null;
                 tipHide();
             });
- 
+
             var chartHost = E('div', { style: 'width:100%;' });
             var persistEl = E('div', { style: 'text-align:center; font-size:10.5px; color:var(--qos-text-muted); margin-top:4px;' });
             var btnStyle = 'margin-right:6px;';
@@ -823,8 +824,9 @@ return view.extend({
                 b.addEventListener('click', function(e) { e.stopPropagation(); st.dir = d[0]; mark(); render(); });
                 dirBtns.push(b);
             });
- 
+
             var resetBtn = E('button', { type: 'button', style: btnStyle + 'margin-left:18px; color:var(--qos-danger);' }, _('Clear history'));
+            if (!canReset) resetBtn.style.display = 'none';
             resetBtn.title = _('Resets the cumulative application/device/destination totals and the stored history, without restarting the service. Buckets already written to a storage path (if configured) are kept.');
             resetBtn.addEventListener('click', function(e) {
                 e.stopPropagation();
@@ -837,12 +839,12 @@ return view.extend({
                     v.load();
                 }).catch(function() {}).then(function() { resetBtn.disabled = false; });
             });
- 
+
             v.el = E('div', { style: 'width:100%; display:none;' }, [
                 E('div', { style: 'display:flex; gap:24px; flex-wrap:wrap; justify-content:center; align-items:center; margin-bottom:10px;' }, [
                     E('div', {}, rangeBtns), E('div', {}, dimBtns), E('div', {}, dirBtns.concat([ cmpBtn ])), resetBtn ]),
                 chartHost, persistEl ]);
- 
+
             function colorOf(k) {
                 if (k === '(other)') return 'hsl(210,8%,62%)';
                 return 'hsl(' + slotHue(k) + ',58%,46%)';
@@ -889,7 +891,7 @@ return view.extend({
                 var a = B.map(function(b) { return b.dt || 0; }).filter(function(x) { return x > 0; }).sort(function(x, y) { return x - y; });
                 return a.length ? a[Math.floor(a.length / 2)] : 0;
             }
- 
+
             function persistLines() {
                 var p = v.persist, out = [];
                 if (!p) return out;
@@ -916,7 +918,7 @@ return view.extend({
                     persistEl.appendChild(E('div', { style: bad ? 'color:var(--qos-danger);' : '' }, l));
                 });
             };
- 
+
             function localDayStart(epoch) {
                 var d = new Date(epoch * 1000);
                 return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime() / 1000;
@@ -968,7 +970,7 @@ return view.extend({
             }
             v.setShaper = function(on) { v.hasShaper = !!on; };
             v.setSqm = function(downKbit, upKbit) { v.sqm = { down: downKbit || 0, up: upKbit || 0 }; };
- 
+
             function computeStats(sel, dirKey, shKey) {
                 var vol = 0, dt = 0, peak = 0, peakT = 0, drops = 0, ecn = 0, bl = 0, rates = [];
                 sel.forEach(function(b) {
@@ -989,7 +991,7 @@ return view.extend({
                 }
                 return { vol: vol, avg: dt > 0 ? vol * 8 / dt : 0, p95: p95, peak: peak, peakT: peakT, drops: drops, ecn: ecn, bl: bl };
             }
- 
+
             function statsTable(sel, R, bl) {
                 var cell = 'padding:1px 10px; font-size:11px; line-height:1.5; height:auto;';
                 var num = cell + ' text-align:right; font-variant-numeric: tabular-nums; white-space:nowrap;';
@@ -1033,13 +1035,7 @@ return view.extend({
                         _('Computed from the stored buckets (%s each), so short bursts inside a bucket are averaged out.').format(durTxt(bl)) +
                         (v.sqm.down > 0 || v.sqm.up > 0 ? ' ' + _('Percentages refer to the configured SQM rate.') : '')) ]);
             }
- 
-            function rangeData() {
-                var R = rangeDef(), B = st.data[R.tier];
-                if (!B || !B.length) return null;
-                var w = windowOf(B, R);
-                return { R: R, sel: w.sel, start: w.start, end: w.end };
-            }
+
             function historyExportData() {
                 var R = rangeDef(), B = st.data[R.tier];
                 if (!B || !B.length) return null;
@@ -1092,7 +1088,7 @@ return view.extend({
                 });
                 saveFile('trafficchart-history-' + d.R.id + '-' + stamp() + '.csv', 'text/csv', lines.join('\n') + '\n');
             };
- 
+
             function render() {
                 while (chartHost.firstChild) chartHost.removeChild(chartHost.firstChild);
                 tipHide();
@@ -1117,20 +1113,20 @@ return view.extend({
                                         : _('No data for this range yet - hourly buckets are closed at the full hour, daily buckets at midnight (and when the service is stopped).')));
                     return;
                 }
- 
+
                 var dirs = st.dir === 'both' ? [ 'in', 'out' ] : [ st.dir ];
                 var idx = dirs.map(function(d) { return d === 'in' ? 0 : 1; });
                 function val(e) { var t = 0; idx.forEach(function(i) { t += e[i] || 0; }); return t; }
- 
+
                 var win = windowOf(B, R), end = win.end, start = win.start, sel = win.sel;
- 
+
                 var W = Math.max(360, Math.round(chartHost.clientWidth || 900));
                 var PANEL_H = 210, pl = 84, pr = 10, pt = 10, pb = 10;
                 var DROP_H = 7;
                 var AXIS_H = 26;
                 var PANEL_GAP = 28;
                 var pw = W - pl - pr, ph = PANEL_H - pt - pb;
- 
+
                 var bl = medianDt(sel) || TIER_SEC[R.tier];
                 var maxCols = Math.max(20, Math.floor(pw / (win.axisDays ? 2.5 : 3)));
                 var m = Math.max(1, Math.ceil(((end - start) / maxCols) / bl - 0.01));
@@ -1171,7 +1167,7 @@ return view.extend({
                         }
                     }
                 });
- 
+
                 var totals = {}, names = {};
                 sel.forEach(function(b) {
                     var src = b[st.dim] || {};
@@ -1186,7 +1182,7 @@ return view.extend({
                 var series = shown.slice();
                 if (rest.length) series.push('__rest');
                 series = series.filter(function(k) { return !hiddenSet[k]; });
- 
+
                 cols.forEach(function(c) {
                     c.byDir = {};
                     dirs.forEach(function(d) {
@@ -1202,7 +1198,7 @@ return view.extend({
                         c.byDir[d] = { v: out, total: tot };
                     });
                 });
- 
+
                 // Previous period: the same length of time right before the shown window. The shown tier only
                 // reaches back as far as its keep limit (24 h of 5 min buckets, for example, has nothing before it),
                 // so the finest tier that covers most of that time is used, and every bucket is spread over the
@@ -1232,14 +1228,14 @@ return view.extend({
                 });
                 mark();
                 var drawPrev = st.cmp && prevAny;
- 
+
                 var maxvByDir = {};
                 dirs.forEach(function(d) {
                     var t = cols.map(function(c) { return c.byDir[d].total; });
                     if (drawPrev) pcols.forEach(function(pc) { if (pc.dt > 0) t.push(pc.b[d === 'in' ? 0 : 1] * 8 / pc.dt / 1e6); });
                     maxvByDir[d] = niceMax(Math.max.apply(null, t.concat([0.001])));
                 });
- 
+
                 var maxDropRate = 0;
                 cols.forEach(function(c) {
                     if (c.dt <= 0) return;
@@ -1247,10 +1243,10 @@ return view.extend({
                     if (dirs.indexOf('out') >= 0) maxDropRate = Math.max(maxDropRate, c.drop.tx / c.dt);
                 });
                 var showDrops = maxDropRate > 0;
- 
+
                 var totalH = dirs.length * PANEL_H + (showDrops ? dirs.length * DROP_H : 0) + (dirs.length - 1) * PANEL_GAP + AXIS_H;
                 var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + totalH, width: '100%', style: 'display:block;' });
- 
+
                 function dropTip(c, ci, d, rate, ecnRate) {
                     var di = d === 'in' ? 0 : 1;
                     var rows = Object.keys(c.src).map(function(k) {
@@ -1265,12 +1261,12 @@ return view.extend({
                         detailTitle: dimLabel()
                     };
                 }
- 
+
                 function historyTip(c, ci, k, vv, d) {
                     var timeStr = stampLabel(t0 + ci * colw, R.span) + ' - ' + stampLabel(t0 + (ci + 1) * colw, R.span);
                     var name = k === '__rest' ? _('Other (%d)').format(rest.length) : (st.dim === 'd' ? (names[k] || k) : k);
                     var colColor = k === '__rest' ? 'hsl(210,8%,62%)' : colorOf(k);
- 
+
                     var details = [];
                     if (c && c.src) {
                         Object.keys(c.src).forEach(function(key) {
@@ -1282,7 +1278,7 @@ return view.extend({
                             return ((b[1] + b[2]) - (a[1] + a[2]));
                         });
                     }
- 
+
                     return {
                         label: timeStr,
                         sub: name + (dirs.length > 1 ? ' (' + (d === 'in' ? _('Download') : _('Upload')) + ')' : '') + ' \u2022 ' + formatRate(vv * 1e6),
@@ -1291,7 +1287,7 @@ return view.extend({
                         details: details.slice(0, 8)
                     };
                 }
- 
+
                 var gapRuns = [], gFirst = -1, gLast = -1, gs = -1;
                 cols.forEach(function(c, ci) { if (c.dt > 0) { if (gFirst < 0) gFirst = ci; gLast = ci; } });
                 cols.forEach(function(c, ci) {
@@ -1306,10 +1302,10 @@ return view.extend({
                     defs.appendChild(pat);
                     svg.appendChild(defs);
                 }
- 
+
                 var bw = pw / cols.length;
                 var gap = bw >= 6 ? bw * 0.1 : (bw >= 3 ? 0.4 : 0);
- 
+
                 var yCursor = 0;
                 dirs.forEach(function(d) {
                     var panelTop = yCursor;
@@ -1328,12 +1324,12 @@ return view.extend({
                         dirLabel.textContent = (d === 'in' ? _('Download') : _('Upload'));
                         svg.appendChild(dirLabel);
                     }
- 
+
                     gapRuns.forEach(function(gr) {
                         var gx = svgEl('rect', { x: pl + gr[0] * bw, y: panelTop + pt, width: (gr[1] - gr[0]) * bw, height: ph, fill: 'url(#qos_gap_pat)', style: 'pointer-events:none;' });
                         svg.appendChild(gx);
                     });
- 
+
                     cols.forEach(function(c, ci) {
                         var acc = 0, bd = c.byDir[d];
                         series.forEach(function(k) {
@@ -1351,12 +1347,12 @@ return view.extend({
                                 fill: k === '__rest' ? 'hsl(210,8%,62%)' : colorOf(k),
                                 style: 'pointer-events:none;'
                             });
- 
+
                             svg.appendChild(r);
                             acc += vv;
                         });
                     });
- 
+
                     /*
                      * Independent interaction layer.
                      *
@@ -1367,7 +1363,7 @@ return view.extend({
                      */
                     (function() {
                         var HIT_MIN_H = 10;
- 
+
                         function svgPoint(ev) {
                             var rr = svg.getBoundingClientRect();
                             var vb = svg.viewBox && svg.viewBox.baseVal;
@@ -1378,11 +1374,11 @@ return view.extend({
                                 y: (ev.clientY - rr.top) * sy + (vb ? vb.y : 0)
                             };
                         }
- 
+
                         function clamp(v, lo, hi) {
                             return Math.max(lo, Math.min(hi, v));
                         }
- 
+
                         function gapAt(ci) {
                             for (var gi = 0; gi < gapRuns.length; gi++) {
                                 if (ci >= gapRuns[gi][0] && ci < gapRuns[gi][1])
@@ -1390,14 +1386,14 @@ return view.extend({
                             }
                             return null;
                         }
- 
+
                         function pickSegment(c, ci, py) {
                             var bd = c.byDir[d];
                             if (!bd || !bd.v) return null;
- 
+
                             var items = [];
                             var acc = 0;
- 
+
                             /*
                              * IMPORTANT: hit testing follows the exact same
                              * transformed geometry as the visible bars.
@@ -1408,12 +1404,12 @@ return view.extend({
                             series.forEach(function(k) {
                                 var v = Number(bd.v[k]) || 0;
                                 if (v <= 0) return;
- 
+
                                 var y0 = scaleY(acc, dmax);
                                 var y1 = scaleY(acc + v, dmax);
                                 var top = panelTop + pt + ph - ph * y1;
                                 var bottom = panelTop + pt + ph - ph * y0;
- 
+
                                 items.push({
                                     k: k,
                                     v: v,
@@ -1424,9 +1420,9 @@ return view.extend({
                                 });
                                 acc += v;
                             });
- 
+
                             if (!items.length) return null;
- 
+
                             /* Pass 1: exact visual hit.  Never let a virtual
                              * target steal a mouse position that is actually
                              * inside another visible segment. */
@@ -1435,7 +1431,7 @@ return view.extend({
                                 if (py >= exact.top && py <= exact.bottom)
                                     return exact;
                             }
- 
+
                             /*
                              * Pass 2: the pointer is in empty space because
                              * the segment is sub-pixel or above the stack.
@@ -1448,11 +1444,11 @@ return view.extend({
                             var best = null;
                             var bestDist = Infinity;
                             var maxVirtual = 8;
- 
+
                             for (var j = 0; j < items.length; j++) {
                                 var item = items[j];
                                 var half = Math.max(item.realH / 2, HIT_MIN_H / 2);
- 
+
                                 /* Limit expansion to the nearest neighbouring
                                  * real segment center. */
                                 if (j > 0) {
@@ -1463,16 +1459,16 @@ return view.extend({
                                     var dNext = Math.abs(items[j + 1].center - item.center);
                                     half = Math.min(half, dNext / 2);
                                 }
- 
+
                                 half = Math.min(half, maxVirtual);
- 
+
                                 var dist = Math.abs(py - item.center);
                                 if (dist <= half && dist < bestDist) {
                                     bestDist = dist;
                                     best = item;
                                 }
                             }
- 
+
                             /* Above/below the actual stack: make selection easy
                              * without making a distant tiny series steal the
                              * whole panel. */
@@ -1490,15 +1486,15 @@ return view.extend({
                                 if (nearestDist <= maxVirtual)
                                     best = nearest;
                             }
- 
+
                             return best;
                         }
- 
+
                         function hitInfo(ev) {
                             var p = svgPoint(ev);
                             var ci = Math.floor((p.x - pl) / bw);
                             ci = clamp(ci, 0, cols.length - 1);
- 
+
                             var gr = gapAt(ci);
                             if (gr) {
                                 return {
@@ -1513,19 +1509,19 @@ return view.extend({
                                     key: historyTipKey('gap', gr[0], gr[1], d)
                                 };
                             }
- 
+
                             var c = cols[ci];
                             if (!c || !c.dt || c.dt <= 0) return null;
- 
+
                             var picked = pickSegment(c, ci, p.y);
                             if (!picked) return null;
- 
+
                             return {
                                 info: historyTip(c, ci, picked.k, picked.v, d),
                                 key: historyTipKey('hit', ci, picked.k, d)
                             };
                         }
- 
+
                         var overlay = svgEl('rect', {
                             x: pl,
                             y: panelTop + pt,
@@ -1533,34 +1529,34 @@ return view.extend({
                             height: Math.max(ph, 1),
                             fill: 'rgba(0,0,0,0)'
                         });
- 
+
                         function update(ev) {
                             /* A pinned tooltip must stay where it was pinned.
                              * Do not retarget or move it while the mouse moves. */
                             if (historyPinned) return;
- 
+
                             var hit = hitInfo(ev);
                             if (!hit) {
                                 historyTipLeave();
                                 return;
                             }
- 
+
                             historyTipHover(hit.info, ev);
                         }
- 
+
                         overlay.addEventListener('mouseenter', update);
                         overlay.addEventListener('mousemove', update);
                         overlay.addEventListener('mouseleave', historyTipLeave);
- 
+
                         overlay.addEventListener('click', function(ev) {
                             var hit = hitInfo(ev);
                             if (!hit) return;
                             historyTipClick(hit.info, ev, hit.key);
                         });
- 
+
                         svg.appendChild(overlay);
                     })();
- 
+
                     if (drawPrev) {
                         var pd = '', pen = false;
                         pcols.forEach(function(pc, ci) {
@@ -1572,9 +1568,9 @@ return view.extend({
                         var pline = svgEl('path', { d: pd, style: 'fill:none; stroke:var(--qos-text-strong); stroke-width:1.4; stroke-dasharray:4 3; opacity:0.8; pointer-events:none;' });
                         svg.appendChild(pline);
                     }
- 
+
                     yCursor += PANEL_H;
- 
+
                     if (showDrops) {
                         var dropTop = yCursor;
                         cols.forEach(function(c, ci) {
@@ -1606,7 +1602,7 @@ return view.extend({
                     }
                     if (d !== dirs[dirs.length - 1]) yCursor += PANEL_GAP;
                 });
- 
+
                 var ticks = [], spanT = end - t0;
                 if (win.axisDays) {
                     /* labels per local day (week, month) or per month (year), placed at the
@@ -1656,7 +1652,7 @@ return view.extend({
                     svg.appendChild(tx);
                 });
                 chartHost.appendChild(svg);
- 
+
                 var legend = E('div', { style: 'display:flex; flex-wrap:wrap; gap:4px 18px; justify-content:center; margin-top:8px; font-size:11.5px;' });
                 function legendItem(k, swatchColor, text) {
                     var off = !!hiddenSet[k];
@@ -1676,7 +1672,7 @@ return view.extend({
                 if (showDrops) legend.appendChild(E('span', {}, [
                     E('span', { style: 'display:inline-block; width:11px; height:11px; border-radius:3px; margin-right:5px; background:rgba(220,38,38,0.4);' }), _('Shaper drops (strip opacity = intensity relative to the worst column shown)') ]));
                 chartHost.appendChild(legend);
- 
+
                 var colTxt = colw >= 86400 ? _('%.1f days').format(colw / 86400) : colw >= 3600 ? _('%.1f h').format(colw / 3600) : _('%d min').format(Math.round(colw / 60));
                 chartHost.appendChild(E('div', { style: 'text-align:center; font-size:10.5px; color:var(--qos-text-muted); margin-top:6px;' },
                     _('Average rate per column (%s), %s - %s.').format(colTxt, new Date(t0 * 1000).toLocaleString(), new Date(end * 1000).toLocaleString())));
@@ -1721,12 +1717,12 @@ return view.extend({
             v.setPersist(null);
             return v;
         }
- 
+
         var flowsView = makeFlowsView();
         var histView = makeHistoryView();
- 
+
         var shaperEl = E('div', { style: 'font-size:11.5px; color:var(--qos-text-strong); margin:0 0 12px; line-height:18px; font-variant-numeric: tabular-nums; height:40px; min-height:40px; max-height:40px; box-sizing:border-box; overflow:hidden;' });
- 
+
         // Per-WAN breakdown: the main link line above sums all shaped WAN devices into one rate and
         // one configured-rate figure, which hides very asymmetric multi-WAN setups. data.wan has one
         // entry per WAN when there is more than one; it stays empty and hidden for a single WAN.
@@ -1790,7 +1786,7 @@ return view.extend({
             });
             return svg;
         }
- 
+
         function shaperUpdate(sh, dt) {
             while (shaperEl.firstChild) shaperEl.removeChild(shaperEl.firstChild);
             [ ['rx', _('Download shaper')], ['tx', _('Upload shaper')] ].forEach(function(def) {
@@ -1799,37 +1795,37 @@ return view.extend({
                 var dr = prev ? Math.max(0, (cur.dropped || 0) - (prev.dropped || 0)) / dt : 0;
                 var er = prev ? Math.max(0, (cur.ecn || 0) - (prev.ecn || 0)) / dt : 0;
                 var pct = cur.pkts > 0 ? (cur.dropped / cur.pkts * 100) : 0;
- 
+
                 var hist = liveDropHist[def[0]];
                 hist.d.push(dr); hist.e.push(er);
                 if (hist.d.length > LIVE_DROP_LEN) { hist.d.shift(); hist.e.shift(); }
- 
+
                 var instMax = 0;
                 for (var hi = 0; hi < hist.d.length; hi++) instMax = Math.max(instMax, (hist.d[hi] || 0) + (hist.e[hi] || 0));
                 hist.scale = Math.max(instMax, hist.scale * 0.9);
                 var drawMax = hist.scale > 0 ? hist.scale : 0.0001;
- 
+
                 var prefix = def[1] + ' (' + (cur.rate || '?') + ', target ' + (cur.target || '?') + ', limit ' + (cur.limit || '?') + '): ' + _('drops') + ' ' + dr.toFixed(1) + '/s';
                 var suffix = '(' + formatCount(cur.dropped || 0) + ' ' + _('total') + ', ' + pct.toFixed(3) + ' %) · ECN ' + er.toFixed(1) + '/s (' + formatCount(cur.ecn || 0) + ') · ' +
                     _('backlog') + ' ' + formatBytes(cur.backlog_b || 0) + ' / ' + (cur.backlog_p || 0) + ' pkt · ' +
                     _('limit hits') + ' ' + (cur.drop_overlimit || 0) + ' · ' + _('active flows') + ' ' + ((cur.flows_new || 0) + (cur.flows_old || 0));
- 
+
                 var spark = liveSparkline(hist.d, hist.e, drawMax); spark.style.flex = '0 0 auto'; spark.style.display = 'inline-block';
                 spark.setAttribute('title', _('Recent drop rate (red) / ECN rate (amber), roughly the last %d polls.').format(LIVE_DROP_LEN));
- 
+
                 var lineEl = E('div', {
                     style: 'display:flex; align-items:center; flex-wrap:nowrap; gap:5px; margin-bottom:2px; height:18px; min-height:18px; max-height:18px; overflow:hidden; white-space:nowrap;',
                     title: _('Drops are normal codel behaviour under load. "Limit hits" > 0 mean the queue limit was exceeded (limit too small for the link speed).')
                 }, [ prefix, spark, suffix ]);
                 if ((cur.drop_overlimit || 0) > 0 && prev && cur.drop_overlimit > (prev.drop_overlimit || 0)) lineEl.style.color = 'var(--qos-danger)';
- 
+
                 shaperEl.appendChild(lineEl);
             });
             ['rx', 'tx'].forEach(function(d) { prevShaper[d] = (sh && sh[d] && sh[d].sent !== undefined) ? sh[d] : null; });
             // no shaper -> no health line at all (instead of an empty reserved box)
             shaperEl.style.display = shaperEl.firstChild ? '' : 'none';
         }
- 
+
         var lastData = null;
         // Only the visible one of the three live views (applications / devices /
         // destinations) is rendered; the others catch up when their tab is opened.
@@ -1881,9 +1877,9 @@ return view.extend({
             if (!lastData) return;
             saveFile('trafficchart-' + stamp() + '.json', 'application/json', JSON.stringify(lastData, null, 2));
         }
- 
+
         var statusEl = E('span', { style: 'color:var(--qos-text-muted);' }, _('Querying conntrack via ubus...'));
- 
+
         var restartBusy = false;
         var restartBtn = E('button', {
             type: 'button', class: 'btn cbi-button cbi-button-remove',
@@ -1907,34 +1903,34 @@ return view.extend({
                 restartBtn.textContent = _('Restart service');
             });
         });
- 
+
         var staleEl = E('div', {
             style: 'display:none; color:var(--qos-danger); font-size:11.5px; text-align:center; margin-bottom:8px;'
         }, [ E('span', { id: 'qos_stale_text' }, '') ]);
- 
+
         var container = E('div', {
             id: 'qos_container',
             style: 'background: var(--qos-surface); border: 1px solid var(--qos-text-muted); border-radius: .50em; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3); padding:28px 32px; max-width:1700px; margin:0 auto;'
         }, [ statusEl, restartBtn, staleEl ]);
- 
+
         container.addEventListener('click', function(e) {
             if (e.target.closest && e.target.closest('.qos-seg, .qos-legend-row')) return;
             slotViews.forEach(function(sv) { sv.panelIn.clearPinned(); sv.panelOut.clearPinned(); });
         });
- 
+
         var m = E('div', { class: 'cbi-map' }, [
-            E('h2', {}, 'Live Traffic Chart'),
+            E('h2', {}, _('Live Traffic Chart')),
             E('div', { class: 'cbi-section' }, [ container ])
         ]);
- 
+
         var chartMounted = false;
         function mountChartOnce(data) {
             if (chartMounted) return;
             container.innerHTML = '';
-            
+
             container.style.position = 'relative';
-            container.style.paddingBottom = '40px'; 
-            
+            container.style.paddingBottom = '40px';
+
             var appPanels = E('div', { class: 'qos-panels', style: 'margin-bottom: 40px; display:none;' }, [ appsView.panelIn.el, appsView.panelOut.el ]);
             var devPanels = E('div', { class: 'qos-panels', style: 'margin-bottom: 40px; display:none;' }, [ devicesView.panelIn.el, devicesView.panelOut.el ]);
             var hostPanels = E('div', { class: 'qos-panels', style: 'margin-bottom: 40px; display:none;' }, [ hostsView.panelIn.el, hostsView.panelOut.el ]);
@@ -1973,14 +1969,14 @@ return view.extend({
             exportTitles();
             var toolbar = E('div', { style: 'display:flex; align-items:flex-start; justify-content:space-between; gap:12px; flex-wrap:wrap;' }, [
                 tabs, E('div', { style: 'display:flex; gap:6px; margin-bottom:1em;' }, [ btnJson, btnCsv ]) ]);
- 
+
             var hintText = _('* Note: rates are the mean of the last %d s, measured by the trafficchart-agg daemon on its own clock (bytes per application, device and destination from /proc/net/nf_conntrack, application names from netifyd). The link rate comes from the tc qdisc counters read in the same instant. "Not attributed" is what the shaper carries but conntrack does not count (after subtracting the link layer header): e.g. traffic to router services, dropped inbound packets, multicast.').format((data && data.rate && data.rate.win) || 0);
             if (data && data.backend === 'nss')
                 hintText += ' ' + _('NSS hardware offload bypasses nftables for accelerated flows; conntrack byte counters keep advancing under offload, which is why they are used.');
             var hintEl = E('div', {
                 style: 'margin-top: 40px; margin-left: 40px; margin-right: 40px; font-size: 11px; color: var(--qos-text-muted);'
             }, hintText);
- 
+
             container.appendChild(staleEl);
             container.appendChild(wanEl);
             container.appendChild(shaperEl);
@@ -1993,13 +1989,13 @@ return view.extend({
             container.appendChild(hintEl);
             chartMounted = true;
         }
- 
+
         var lastTime = Date.now();
         var lastSrvUp = null;
         var haveRenderedOnce = false;
         var lastSuccessTime = Date.now();
         var consecutiveFailures = 0;
- 
+
         function updateStaleIndicator() {
             if (!haveRenderedOnce) return;
             if (consecutiveFailures === 0) {
@@ -2012,9 +2008,9 @@ return view.extend({
             if (textEl) textEl.textContent = _('⚠ No update for %ds (last successful read: %s) - retrying automatically...')
                 .format(secsAgo, new Date(lastSuccessTime).toLocaleTimeString());
             staleEl.style.display = 'block';
-            restartBtn.style.display = '';
+            restartBtn.style.display = canRestart ? '' : 'none';
         }
- 
+
         var baselineTime = null;
         function baselineLabelText() {
             return baselineTime ? (_('since %s').format(baselineTime.toLocaleString())) : _('since start');
@@ -2025,12 +2021,12 @@ return view.extend({
         // NEVER settles at all. It advances pollRequestId, so a response that arrives later is
         // recognised as stale (myPollId mismatch) and discarded instead of overwriting newer data.
         var POLL_HARD_TIMEOUT = 30000;
- 
+
         var tabHidden = (typeof document.hidden === 'boolean') ? document.hidden : false;
         var visibilityHandler = function() { tabHidden = document.hidden; };
         document.addEventListener('visibilitychange', visibilityHandler);
         cleanupFns.push(function() { document.removeEventListener('visibilitychange', visibilityHandler); });
- 
+
         // The daemon only produces new data every load.interval seconds (4-20 s):
         // poll at half of that instead of a fixed 2 s.
         var pollSec = 2;
@@ -2042,26 +2038,26 @@ return view.extend({
             // not inside the running poll iteration
             setTimeout(function() { poll.remove(pollFn); poll.add(pollFn, pollSec); }, 0);
         }
- 
+
         var pollFn = function() {
             if (tabHidden) return Promise.resolve();
             if (pollInFlight) return Promise.resolve();
             pollInFlight = true;
             var myPollId = ++pollRequestId;
- 
+
             if (histView.active && histView.stale()) histView.load();
- 
+
             var hardTimer = setTimeout(function() {
                 if (pollRequestId === myPollId) { pollRequestId++; pollInFlight = false; }
             }, POLL_HARD_TIMEOUT);
- 
+
             return callTrafficStats().then(function(data) {
                 clearTimeout(hardTimer);
                 var stale = (pollRequestId !== myPollId);
                 pollInFlight = false;
                 if (stale) return;   // superseded by the hard-timeout fallback above
                 if (!document.getElementById('qos_container')) return;
- 
+
                 if (data.error || !data.apps || !data.rate) {
                     consecutiveFailures++;
                     if (!haveRenderedOnce) {
@@ -2069,17 +2065,17 @@ return view.extend({
                         statusEl.textContent = data && data.error
                             ? _('Error: %s').format(data.error)
                             : _('Error: No data received. Is the trafficchart service running (/etc/init.d/trafficchart start)?');
-                        restartBtn.style.display = '';
+                        restartBtn.style.display = canRestart ? '' : 'none';
                     } else {
                         updateStaleIndicator();
                     }
                     return;
                 }
- 
+
                 var now = Date.now();
                 var dt = (now - lastTime) / 1000;
                 if (dt <= 0) dt = 1;
- 
+
                 var srvUp = (typeof data.up === 'number') ? data.up : null;
                 if (haveRenderedOnce && srvUp !== null && lastSrvUp !== null && srvUp <= lastSrvUp && lastSrvUp - srvUp < 30) {
                     lastSuccessTime = Date.now();
@@ -2087,20 +2083,18 @@ return view.extend({
                     updateStaleIndicator();
                     return;
                 }
- 
-                var rateInfo = data.rate;
-                var ifaceRate = rateInfo.tc ? { rx: rateInfo.rx_bps || 0, tx: rateInfo.tx_bps || 0 } : null;
+
                 var sqmDownloadKbit = data.sqm ? (data.sqm.download_kbit || 0) : 0;
                 var sqmUploadKbit = data.sqm ? (data.sqm.upload_kbit || 0) : 0;
- 
+
                 lastTime = now;
                 lastSrvUp = srvUp;
                 if (!baselineTime) baselineTime = (data.since ? new Date(data.since * 1000) : new Date(now));
- 
+
                 lastSuccessTime = Date.now();
                 consecutiveFailures = 0;
                 updateStaleIndicator();
- 
+
                 flowsView.update(data.top_flows || [], sqmDownloadKbit, sqmUploadKbit);
                 shaperUpdate(data.shaper, dt);
                 wanUpdate(data.wan, dt);
@@ -2109,13 +2103,11 @@ return view.extend({
                 histView.setPersist(data.persist || null);
                 histView.setSqm(sqmDownloadKbit, sqmUploadKbit);
                 histView.setShaper(!!(data.shaper && ((data.shaper.rx && data.shaper.rx.sent !== undefined) || (data.shaper.tx && data.shaper.tx.sent !== undefined))));
- 
+
                 mountChartOnce(data);
- 
-                var baselineLabel = baselineLabelText();
- 
+
                 renderTab(activeTab);
- 
+
                 haveRenderedOnce = true;
                 adaptPoll(data);
             }).catch(function(err) {
@@ -2135,7 +2127,7 @@ return view.extend({
             pollInFlight = false;
             pollRequestId++;
         });
- 
+
         return m;
     },
     handleSave: null,
