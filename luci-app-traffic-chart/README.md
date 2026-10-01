@@ -88,7 +88,7 @@ Classes (low byte of the mark): 0x1 PRIO, 0x2 VOIP, 0x3 GAME, 0x4 WEB, 0x5 STREA
 0x40 router originated traffic. The order of the rules is the priority.
 
 The script is derived from simple.qos / nss.qos (ricsc, qosmio sqm-scripts-nss) and was formerly named
-`nss-rk.qos`. The chart does not use the marks.
+`nss-trafficchart.qos`. The chart does not use the marks.
 
 ### Upgrading from nss-rk.qos
 The package postinstall runs `/usr/libexec/trafficchart-migrate`: it changes `script 'nss-rk.qos'` to
@@ -108,8 +108,8 @@ when convenient.
 `sh -n` on all scripts, awk programs parse (busybox), JSON valid, LuCI JS syntax, generated nft ruleset passes
 `nft -c` (default, PPPoE, FTP helper, DNS redirect, TTL fix), migration script tested with a stub `uci`.
 
-how it works ...
 
+### how it works
 With hardware flow offloading, packets in an established connection can bypass most of the normal Linux forwarding path. So something like:
 
 LAN client
