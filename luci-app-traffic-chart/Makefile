@@ -13,7 +13,7 @@ define Package/luci-app-traffic-chart
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
   TITLE:=Live traffic chart (conntrack + shaper counters) with NSS SQM classifier
-  DEPENDS:=+luci-base +rpcd +jsonfilter +ip-full +tc-tiny
+  DEPENDS:=+luci-base +rpcd +jsonfilter +ip-full +tc
   PKGARCH:=all
 endef
 
