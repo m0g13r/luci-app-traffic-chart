@@ -1,4 +1,4 @@
-# luci-app-traffic-chart 1.1.0-r12
+# luci-app-traffic-chart 1.1.0-r21
 
 Live traffic chart for OpenWrt (LuCI). Shows traffic per application, device and destination,
 the busiest flows, shaper health (drops, ECN marks, queue backlog) and a history
