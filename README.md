@@ -8,7 +8,7 @@ Maintainer: m0g13r <155771712+m0g13r@users.noreply.github.com> - License: GPL-2.
 
 | Package | Version |
 |---|---|
-| [luci-app-traffic-chart](luci-app-traffic-chart/) | 1.1.0-r12 |
+| [luci-app-traffic-chart](luci-app-traffic-chart/) | 1.1.0-r21 |
 
 Details, settings and troubleshooting: [luci-app-traffic-chart/README.md](luci-app-traffic-chart/README.md),
 changes: [CHANGELOG](luci-app-traffic-chart/CHANGELOG.md).
