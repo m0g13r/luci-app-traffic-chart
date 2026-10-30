@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_VERSION:=1.1.0
-PKG_RELEASE:=12
+PKG_RELEASE:=21
 PKG_LICENSE:=GPL-2.0-or-later
 
 LUCI_NAME:=luci-app-traffic-chart
