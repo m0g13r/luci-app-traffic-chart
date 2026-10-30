@@ -24,11 +24,10 @@ Maintainer: m0g13r <155771712+m0g13r@users.noreply.github.com> - License: GPL-2.
 Install the package, then open **Network -> Traffic Chart** (and **Traffic Chart Settings**) in LuCI.
 The postinstall script enables and starts the `trafficchart` service and reloads rpcd.
 
-Required: `luci-base`, `rpcd`, `jsonfilter`, `ip-full`, `tc-tiny` (pulled in automatically).
+Required dependencies: `luci-base`, `rpcd`, `sqm-scripts`, `conntrack`, `jsonfilter`, `tc`, `gawk`, `ip`, `tcpdump`, `uclient-fetch` and `ca-bundle`.
 Optional:
 - `socat` + `netifyd` (with a `[socket] listen_path` in `/etc/netifyd.conf`): application names.
   Without them flows are named `[proto/port]`.
-- `conntrack` and `sqm-scripts`: only for `nss-trafficchart.qos`.
 
 ## Components
 | Part | Installed as |

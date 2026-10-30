@@ -7,11 +7,10 @@ PKG_LICENSE:=GPL-2.0-or-later
 LUCI_NAME:=luci-app-traffic-chart
 LUCI_MAINTAINER:=m0g13r <155771712+m0g13r@users.noreply.github.com>
 LUCI_TITLE:=Live traffic chart (conntrack + shaper counters) with NSS SQM classifier
-LUCI_DESCRIPTION:=Live and historical traffic chart per application, device and destination. \\
-\tReads conntrack and the qdisc counters, independent of the shaper in use. \\
-\tOptional: socat + netifyd (application names), conntrack (nss-trafficchart.qos), \\
-\tsqm-scripts (nss-trafficchart.qos itself).
-LUCI_DEPENDS:=+luci-base +rpcd +jsonfilter +ip-full +tc
+LUCI_DESCRIPTION:=Live and historical traffic chart per application, device and destination. \
+	Reads conntrack and qdisc counters, independent of the shaper in use; includes an NSS SQM classifier. \
+	Optional: socat + netifyd for application names.
+LUCI_DEPENDS:=+luci-base +rpcd +sqm-scripts +conntrack +jsonfilter +tc +gawk +ip +tcpdump +uclient-fetch +ca-bundle
 
 include $(TOPDIR)/feeds/luci/luci.mk
 
